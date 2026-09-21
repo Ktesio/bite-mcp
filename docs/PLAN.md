@@ -90,7 +90,9 @@ Prompts: `plan-my-week`, `triage-inbox`, `daily-brief`.
 5. **Mail + Notes** (dynamic ScriptingBridge, markdown↔HTML) ✓
 6. **Contacts + Messages** (Contacts.framework; chat.db FDA fallback) ✓
 7. **Marketplace plugin + skill** ✓
-8. **Release engineering** (workflows; secrets noted in release.yml) ✓
+8. **Release engineering** ✓ — source-only releases: tag → build + test →
+   GitHub Release notes → crates.io publish. Notarized prebuilts deliberately
+   deferred (Apple Developer Program would be required; ROADMAP).
 9. **Hardening** — error-actionability, scan caps with honest `truncated`
    flags, watchdogs on Apple Event calls ✓
 

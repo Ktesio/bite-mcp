@@ -58,5 +58,7 @@ stable:
 2. If you switch terminals/agent CLIs, the first Apple Events call from the
    new parent prompts once.
 
-`codesign` ad-hoc signature is applied on every install; notarized release
-binaries carry a real Developer ID signature.
+`codesign` ad-hoc signature is applied on every install. bite ships
+source-only (compilation happens on the user's machine), so Gatekeeper never
+stands between users and the helper; a notarized prebuilt channel is a
+considered Phase 2 addition (ROADMAP).

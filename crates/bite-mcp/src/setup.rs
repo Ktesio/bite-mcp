@@ -14,7 +14,7 @@ pub fn run(all_clients: bool, yes: bool) -> Result<i32, bite_core::BiteError> {
         Err(e) => {
             println!();
             eprintln!("error: {}", bite_core::BiteError(e).render());
-            eprintln!("hint: run `xcode-select --install` and retry, or download a prebuilt helper from the releases page.");
+            eprintln!("hint: run `xcode-select --install` and retry.");
             return Ok(1);
         }
     }

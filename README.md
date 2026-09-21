@@ -83,7 +83,6 @@ bite-helper (Swift, installed once at a stable path):
 | crates.io (source) | `cargo install bite-mcp` | Xcode Command Line Tools (compiles the Swift helper) |
 | marketplace (Claude/ZCode) | `/plugin marketplace add ktesio/bite-mcp` | `bite` on PATH first |
 | other agent CLIs | `bite setup` (writes their MCP config) | `bite` on PATH |
-| release binaries | download from GitHub Releases | nothing (notarized universal2) |
 
 ## First run
 
