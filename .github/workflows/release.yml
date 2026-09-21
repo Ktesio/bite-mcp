@@ -37,9 +37,16 @@ jobs:
       - name: Publish to crates.io
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        # deps must be live on crates.io before dependents resolve, so publish
+        # in dependency order with a retry against index-propagation lag
         run: |
-          cargo publish -p bite-bridge
-          sleep 20
-          cargo publish -p bite-core
-          sleep 20
-          cargo publish -p bite-mcp
+          set -e
+          for pkg in bite-bridge bite-core bite-mcp; do
+            ok=""
+            for attempt in 1 2 3; do
+              if cargo publish -p "$pkg"; then ok=1; break; fi
+              echo "publish $pkg attempt $attempt failed; retrying in 30s"
+              sleep 30
+            done
+            [ -n "$ok" ] || { echo "publishing $pkg failed after 3 attempts"; exit 1; }
+          done

@@ -5,18 +5,20 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-readme = "../../README.md"
+readme = "README.md"
 keywords = ["mcp", "macos", "eventkit", "apple", "calendar"]
 categories = ["command-line-utilities"]
-include = ["src/**", "swift/**", "build.rs", "tests/**"]
+# swift/Sources + Tests only: `include` overrides .gitignore, so spelling the
+# tree out keeps SwiftPM scratch dirs (.build) out of the published crate.
+include = ["src/**", "build.rs", "tests/**", "README.md", "swift/Package.swift", "swift/Sources/**", "swift/Tests/**"]
 
 [[bin]]
 name = "bite"
 path = "src/main.rs"
 
 [dependencies]
-bite-bridge = { path = "../bite-bridge" }
-bite-core = { path = "../bite-core" }
+bite-bridge = { path = "../bite-bridge", version = "0.1.0" }
+bite-core = { path = "../bite-core", version = "0.1.0" }
 clap = { version = "4", features = ["derive"] }
 serde.workspace = true
 serde_json.workspace = true
