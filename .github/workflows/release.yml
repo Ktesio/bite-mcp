@@ -1,0 +1,87 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build release (compiles universal-ready helper via build.rs)
+        run: cargo build --release --workspace
+
+      - name: Build universal Swift helper
+        run: |
+          swift build -c release --package-path crates/bite-mcp/swift \
+            --scratch-path .universal-swift --arch arm64 --arch x86_64
+          BIN=$(swift build -c release --package-path crates/bite-mcp/swift \
+            --scratch-path .universal-swift --show-bin-path)
+          cp "$BIN/bite-helper" bite-helper-universal
+          mkdir -p dist
+          tar -czf dist/bite-helper-macos-universal.tar.gz bite-helper-universal
+
+      - name: Universal bite binary
+        run: |
+          rustup target add x86_64-apple-darwin
+          cargo build --release -p bite-mcp --target x86_64-apple-darwin
+          lipo -create \
+            target/release/bite \
+            target/x86_64-apple-darwin/release/bite \
+            -output dist/bite
+          chmod +x dist/bite
+
+      - name: Codesign (Developer ID) and notarize
+        env:
+          MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
+          MACOS_CERTIFICATE_PWD: ${{ secrets.MACOS_CERTIFICATE_PWD }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -e
+          CERT_PATH=cert.p12
+          echo "$MACOS_CERTIFICATE" | base64 --decode > "$CERT_PATH"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" build.keychain
+          security default-keychain -s build.keychain
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" build.keychain
+          security import "$CERT_PATH" -k build.keychain -P "$MACOS_CERTIFICATE_PWD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASSWORD" build.keychain
+          for f in dist/bite bite-helper-universal; do
+            codesign --force --options runtime --timestamp \
+              --sign "Developer ID Application" "$f"
+          done
+          for f in dist/bite bite-helper-universal; do
+            zip -qj "$f.zip" "$f"
+            xcrun notarytool submit "$f.zip" \
+              --apple-id "$APPLE_ID" --password "$APPLE_PASSWORD" --team-id "$APPLE_TEAM_ID" --wait
+            xcrun stapler staple "$f"
+            xcrun stapler staple "$f.zip" 2>/dev/null || true
+          done
+
+      - name: GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/bite
+            dist/bite-helper-macos-universal.tar.gz
+          generate_release_notes: true
+
+      - name: Publish to crates.io
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          cargo publish -p bite-bridge
+          cargo publish -p bite-core
+          sleep 10
+          cargo publish -p bite-mcp

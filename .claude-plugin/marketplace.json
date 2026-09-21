@@ -1,0 +1,26 @@
+{
+  "name": "bite-mcp",
+  "owner": {
+    "name": "ktesio",
+    "url": "https://github.com/ktesio"
+  },
+  "metadata": {
+    "description": "bite — native Apple apps (Calendar, Reminders, Mail, Notes, Contacts, Messages) for AI agents",
+    "version": "0.1.0"
+  },
+  "plugins": [
+    {
+      "name": "bite",
+      "source": "./plugin",
+      "description": "Native Apple apps for agents: 38 MCP tools over Calendar, Reminders, Mail, Notes, Contacts and Messages. Rust control plane + native Swift EventKit/ScriptingBridge helper. Requires `bite` on PATH (cargo install bite-mcp).",
+      "version": "0.1.0",
+      "author": {
+        "name": "imagdy"
+      },
+      "commands": [],
+      "skills": [
+        "./skills/bite"
+      ]
+    }
+  ]
+}

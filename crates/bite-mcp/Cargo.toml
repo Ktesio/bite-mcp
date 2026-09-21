@@ -1,0 +1,27 @@
+[package]
+name = "bite-mcp"
+description = "bite — native Apple apps (Calendar, Reminders, Mail, Notes, Contacts, Messages) for AI agents: MCP server + CLI. Rust control plane, native Swift EventKit/ScriptingBridge helper."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "../../README.md"
+keywords = ["mcp", "macos", "eventkit", "apple", "calendar"]
+categories = ["command-line-utilities"]
+include = ["src/**", "swift/**", "build.rs", "tests/**"]
+
+[[bin]]
+name = "bite"
+path = "src/main.rs"
+
+[dependencies]
+bite-bridge = { path = "../bite-bridge" }
+bite-core = { path = "../bite-core" }
+clap = { version = "4", features = ["derive"] }
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+dirs = "6"
+toml_edit = "0.23"
+
+[build-dependencies]

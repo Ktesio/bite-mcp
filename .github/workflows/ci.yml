@@ -1,0 +1,58 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  rust:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Swift tests (helper logic)
+        run: swift test --package-path crates/bite-mcp/swift
+
+      - name: Rust tests (builds Swift helper via build.rs)
+        run: cargo test --workspace
+
+  mcp-inspector:
+    runs-on: macos-14
+    needs: rust
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build bite
+        run: cargo build --workspace
+
+      - name: Install MCP Inspector and smoke-run the server
+        run: |
+          set -e
+          npm install -g @modelcontextprotocol/inspector
+          npx @modelcontextprotocol/inspector --cli ./target/debug/bite mcp --method tools/list | tee tools.json
+          python3 - <<'EOF'
+          import json, sys
+          data = json.load(open('tools.json'))
+          names = [t['name'] for t in data['tools']]
+          assert len(names) >= 38, f"expected >= 38 tools, got {len(names)}"
+          for required in ("calendar_event_create", "mail_send", "reminders_search", "messages_history"):
+              assert required in names, f"missing {required}"
+          print(f"MCP inspector: {len(names)} tools OK")
+          EOF

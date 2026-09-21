@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "bite": {
+      "command": "bite",
+      "args": ["mcp"]
+    }
+  }
+}
