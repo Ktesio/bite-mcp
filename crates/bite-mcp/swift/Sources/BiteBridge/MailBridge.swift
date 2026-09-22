@@ -248,14 +248,28 @@ enum MailBridge {
                 var out: [[String: Any]] = []
                 var scanned = 0
                 var exhausted = false
-                var index = messages.count  // newest → oldest
-                while index >= 1, out.count < limit, scanned < maxScan {
-                    guard let msg = sbAt(messages, index) else { index -= 1; continue }
+                let total = messages.count
+
+                // Mailbox ordering is not guaranteed (iCloud INBOX is
+                // newest-first, most local mailboxes oldest-first). Detect it
+                // by sampling the two ends, then walk newest → oldest.
+                let firstDate = sbAt(messages, 1).flatMap { sbDate($0, "dateSent") } ?? .distantPast
+                let lastDate = total > 1 ? (sbAt(messages, total).flatMap { sbDate($0, "dateSent") } ?? .distantPast) : firstDate
+                let newestFirst = firstDate >= lastDate
+                var steps = 0
+                while steps < total, out.count < limit, scanned < maxScan {
+                    steps += 1
+                    let position = newestFirst ? steps : (total - steps + 1)
+                    guard let msg = sbAt(messages, position) else { continue }
                     scanned += 1
-                    index -= 1
                     let date = sbDate(msg, "dateSent") ?? .distantPast
-                    if let since, date < since { exhausted = true; break }  // walking backwards
-                    if let until, date > until { continue }
+                    if newestFirst {
+                        if let since, date < since { exhausted = true; break }
+                        if let until, date > until { continue }
+                    } else {
+                        if let until, date > until { continue }
+                        if let since, date < since { exhausted = true; break }
+                    }
                     if let unread, (sbBool(msg, "readStatus") ?? true) == unread { continue }
                     if let flagged, (sbBool(msg, "flaggedStatus") ?? false) != flagged { continue }
                     if let wantFrom, !sbStr(msg, "sender").lowercased().contains(wantFrom) { continue }
@@ -264,8 +278,14 @@ enum MailBridge {
                     if let wantBody, !sbStr(msg, "content").lowercased().contains(wantBody) { continue }
                     out.append(summary(msg, mailboxName: resolved))
                 }
-                let truncated = !exhausted && (index >= 1 || scanned >= maxScan)
-                return ["messages": out, "scanned": scanned, "truncated": truncated]
+                let truncated = !exhausted && (steps < total || scanned >= maxScan)
+                return [
+                    "messages": out,
+                    "scanned": scanned,
+                    "truncated": truncated,
+                    "count": total,
+                    "order": newestFirst ? "newest_first" : "oldest_first",
+                ]
             }
         }
 

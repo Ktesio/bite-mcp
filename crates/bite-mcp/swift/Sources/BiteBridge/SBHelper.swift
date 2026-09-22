@@ -13,7 +13,11 @@ func sbApp(bundleID: String, name: String) throws -> SBApplication {
     guard let app = SBApplication(bundleIdentifier: bundleID) else {
         throw BridgeError.appNotRunning(name)
     }
-    app.timeout = 60  // bound Apple Event hangs instead of blocking forever
+    // SBApplication.timeout is in TICKS (1/60 s), not seconds: 3600 = 60 s.
+    // A small value silently zeroes out slow Apple Event queries (e.g.
+    // `count of messages` on a large mailbox) instead of erroring — this was
+    // the root cause of mail searches returning empty results.
+    app.timeout = 3600
     return app
 }
 
