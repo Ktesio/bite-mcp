@@ -104,7 +104,9 @@ enum MailBridge {
             "read": sbBool(msg, "readStatus") ?? false,
             "flagged": sbBool(msg, "flaggedStatus") ?? false,
         ]
-        if let snippet = snippet(sbStr(msg, "content")) { d["snippet"] = snippet }
+        // NOTE: no `content` read here — fetching bodies of un-cached IMAP
+        // messages is the slowest Apple Event Mail answers; full content is
+        // only read by mail_message_get.
         let to = recipients(msg, "toRecipients")
         if !to.isEmpty { d["to"] = to }
         return d
@@ -226,7 +228,7 @@ enum MailBridge {
         }
 
         d.register("mail.messages_search") { req in
-            try withWatchdog(90) {
+            try withWatchdog(240) {
                 let app = try mailApp()
                 let mailboxName = J.optStr(req.params, "mailbox") ?? "INBOX"
                 let (box, resolved) = try findMailbox(app, account: J.optStr(req.params, "account"), name: mailboxName)
@@ -245,47 +247,88 @@ enum MailBridge {
                 let limit = J.optInt(req.params, "limit") ?? 20
                 let maxScan = J.optInt(req.params, "max_scan") ?? 400
 
+                // Element accessor that does NOT touch `count` — counting a
+                // large mailbox is the single slowest Apple Event Mail
+                // answers (tens of seconds when Mail is busy), so the hot
+                // path must avoid it. Out-of-range positions return a lazy
+                // proxy whose property reads come back empty; we detect the
+                // end of the mailbox that way.
+                func message(at position: Int) -> SBObject? {
+                    guard position >= 1 else { return nil }
+                    let raw = messages.object(at: position - 1)
+                    guard let msg = raw as? SBObject else { return nil }
+                    // a real message answers its id; proxies past the end do not
+                    return sbGet(msg, "id") != nil ? msg : nil
+                }
+
+                func matches(_ msg: SBObject, date: Date?) -> Bool {
+                    let d = date ?? .distantPast
+                    if let since, d < since { return false }
+                    if let until, d > until { return false }
+                    if let unread, (sbBool(msg, "readStatus") ?? true) == unread { return false }
+                    if let flagged, (sbBool(msg, "flaggedStatus") ?? false) != flagged { return false }
+                    if let wantFrom, !sbStr(msg, "sender").lowercased().contains(wantFrom) { return false }
+                    if let wantSubject, !sbStr(msg, "subject").lowercased().contains(wantSubject) { return false }
+                    if let wantTo, !recipients(msg, "toRecipients").joined(separator: " ").lowercased().contains(wantTo) { return false }
+                    if let wantBody, !sbStr(msg, "content").lowercased().contains(wantBody) { return false }
+                    return true
+                }
+
                 var out: [[String: Any]] = []
                 var scanned = 0
-                var exhausted = false
-                let total = messages.count
+                var exhausted = false      // walked off the end of the mailbox
+                var windowClosed = false   // walked past `since` — older messages irrelevant
 
-                // Mailbox ordering is not guaranteed (iCloud INBOX is
-                // newest-first, most local mailboxes oldest-first). Detect it
-                // by sampling the two ends, then walk newest → oldest.
-                let firstDate = sbAt(messages, 1).flatMap { sbDate($0, "dateSent") } ?? .distantPast
-                let lastDate = total > 1 ? (sbAt(messages, total).flatMap { sbDate($0, "dateSent") } ?? .distantPast) : firstDate
-                let newestFirst = firstDate >= lastDate
-                var steps = 0
-                while steps < total, out.count < limit, scanned < maxScan {
-                    steps += 1
-                    let position = newestFirst ? steps : (total - steps + 1)
-                    guard let msg = sbAt(messages, position) else { continue }
+                // Pass 1: assume newest-first (index 1 = newest; true for
+                // INBOX/inbox-like mailboxes) and walk forward. Verify the
+                // assumption on the first two dated samples.
+                var prevDate: Date?
+                var ascending = false
+                for position in 1...maxScan {
+                    guard let msg = message(at: position) else { exhausted = true; break }
                     scanned += 1
-                    let date = sbDate(msg, "dateSent") ?? .distantPast
-                    if newestFirst {
-                        if let since, date < since { exhausted = true; break }
-                        if let until, date > until { continue }
-                    } else {
-                        if let until, date > until { continue }
-                        if let since, date < since { exhausted = true; break }
+                    let date = sbDate(msg, "dateSent")
+                    if let d = date, let prev = prevDate, d > prev, position == 2 {
+                        ascending = true  // oldest-first mailbox: wrong end
+                        break
                     }
-                    if let unread, (sbBool(msg, "readStatus") ?? true) == unread { continue }
-                    if let flagged, (sbBool(msg, "flaggedStatus") ?? false) != flagged { continue }
-                    if let wantFrom, !sbStr(msg, "sender").lowercased().contains(wantFrom) { continue }
-                    if let wantSubject, !sbStr(msg, "subject").lowercased().contains(wantSubject) { continue }
-                    if let wantTo, !recipients(msg, "toRecipients").joined(separator: " ").lowercased().contains(wantTo) { continue }
-                    if let wantBody, !sbStr(msg, "content").lowercased().contains(wantBody) { continue }
-                    out.append(summary(msg, mailboxName: resolved))
+                    if let d = date { prevDate = d }
+                    if let since, let d = date, d < since { windowClosed = true; break }
+                    if matches(msg, date: date) {
+                        out.append(summary(msg, mailboxName: resolved))
+                        if out.count >= limit { break }
+                    }
                 }
-                let truncated = !exhausted && (steps < total || scanned >= maxScan)
-                return [
+
+                // Pass 2 (oldest-first mailboxes only): pay for `count` once
+                // and walk down from the far end.
+                var total: Int?
+                if ascending {
+                    out.removeAll(keepingCapacity: true)
+                    total = messages.count
+                    for offset in 0..<maxScan {
+                        let position = (total ?? 0) - offset
+                        guard position >= 1, let msg = message(at: position) else { continue }
+                        scanned += 1
+                        let date = sbDate(msg, "dateSent")
+                        if let until, let d = date, d > until { continue }
+                        if let since, let d = date, d < since { windowClosed = true; break }
+                        if matches(msg, date: date) {
+                            out.append(summary(msg, mailboxName: resolved))
+                            if out.count >= limit { break }
+                        }
+                    }
+                }
+
+                let truncated = !exhausted && !windowClosed && out.count >= limit
+                var result: [String: Any] = [
                     "messages": out,
                     "scanned": scanned,
                     "truncated": truncated,
-                    "count": total,
-                    "order": newestFirst ? "newest_first" : "oldest_first",
+                    "order": ascending ? "oldest_first" : "newest_first",
                 ]
+                if let total { result["count"] = total }
+                return result
             }
         }
 

@@ -197,7 +197,7 @@ pub enum RemindersCmd {
         list: Option<String>,
         #[arg(long)]
         text: Option<String>,
-        #[arg(long)]
+        #[arg(long, num_args = 0..=1, default_missing_value = "true")]
         completed: Option<bool>,
         #[arg(long)]
         due_within_days: Option<i64>,
@@ -225,7 +225,7 @@ pub enum RemindersCmd {
         title: Option<String>,
         #[arg(long)]
         due: Option<String>,
-        #[arg(long)]
+        #[arg(long, num_args = 0..=1, default_missing_value = "true")]
         completed: Option<bool>,
         #[arg(long)]
         list: Option<String>,
@@ -261,9 +261,9 @@ pub enum MailCmd {
         subject: Option<String>,
         #[arg(long)]
         body: Option<String>,
-        #[arg(long)]
+        #[arg(long, num_args = 0..=1, default_missing_value = "true")]
         unread: Option<bool>,
-        #[arg(long)]
+        #[arg(long, num_args = 0..=1, default_missing_value = "true")]
         flagged: Option<bool>,
         #[arg(long)]
         since: Option<String>,
@@ -340,11 +340,11 @@ pub enum MailCmd {
         id: String,
         #[arg(long)]
         mailbox: Option<String>,
-        #[arg(long)]
+        #[arg(long, num_args = 0..=1, default_missing_value = "true")]
         read: Option<bool>,
-        #[arg(long)]
+        #[arg(long, num_args = 0..=1, default_missing_value = "true")]
         flagged: Option<bool>,
-        #[arg(long)]
+        #[arg(long, num_args = 0..=1, default_missing_value = "true")]
         junk: Option<bool>,
     },
     /// Delete a message (asks for --yes)

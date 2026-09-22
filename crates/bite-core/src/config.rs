@@ -50,7 +50,9 @@ impl Config {
     }
 
     pub fn timeout(&self) -> std::time::Duration {
-        std::time::Duration::from_secs(self.timeout_secs.unwrap_or(120))
+        // generous ceiling: slow Apple Event queries on large mailboxes can
+        // legitimately take a while when Mail is busy indexing
+        std::time::Duration::from_secs(self.timeout_secs.unwrap_or(300))
     }
 }
 
