@@ -7,7 +7,8 @@ use bite_core::{ops, BiteError};
 use serde_json::{json, Map, Value};
 
 use crate::cli::{
-    CalendarCmd, Cmd, ConfigCmd, ContactsCmd, MailCmd, MessagesCmd, NotesCmd, RemindersCmd,
+    CalendarCmd, Cmd, ConfigCmd, ContactsCmd, IndexCmd, MailBulkCmd, MailCmd, MessagesCmd,
+    NotesCmd, RemindersCmd,
 };
 use crate::helper::BridgeHandle;
 use crate::{doctor, mcp, setup};
@@ -277,6 +278,10 @@ fn dispatch(cli: crate::cli::Cli) -> Result<i32, BiteError> {
                     insert_date(&mut p, "until", until)?;
                     insert_opt(&mut p, "limit", limit);
                     insert_opt(&mut p, "max_scan", max_scan);
+                    // fast path: entity index when populated (no helper spawn)
+                    if let Some(Ok(v)) = crate::index::try_search_local(&Value::Object(p.clone())) {
+                        return finish(v);
+                    }
                     finish(call(&mut h, "mail_messages_search", Value::Object(p))?)
                 }
                 MailCmd::Get {
@@ -503,6 +508,87 @@ fn dispatch(cli: crate::cli::Cli) -> Result<i32, BiteError> {
             }
         }
 
+        Cmd::Search { query, app, limit } => {
+            let mut p = Map::new();
+            p.insert("query".into(), json!(query));
+            insert_opt(&mut p, "app", app);
+            insert_opt(&mut p, "limit", limit);
+            finish(crate::index::run_local_unwrapped(
+                "search",
+                &Value::Object(p),
+                None,
+            )?)
+        }
+        Cmd::MailBulk { cmd } => {
+            let mut h = BridgeHandle::new();
+            let (tool, p) = match cmd {
+                MailBulkCmd::Mark {
+                    mailbox,
+                    read,
+                    flagged,
+                    junk,
+                    unread,
+                    older_than_days,
+                    account,
+                    yes,
+                } => {
+                    let mut p = Map::new();
+                    p.insert("mailbox".into(), json!(mailbox));
+                    insert_opt(&mut p, "read", read);
+                    insert_opt(&mut p, "flagged", flagged);
+                    insert_opt(&mut p, "junk", junk);
+                    if unread {
+                        p.insert("unread".into(), json!(true));
+                    }
+                    insert_opt(&mut p, "older_than_days", older_than_days);
+                    insert_opt(&mut p, "account", account);
+                    p.insert("confirm".into(), json!(yes));
+                    ("mail_bulk_mark", p)
+                }
+                MailBulkCmd::Move {
+                    mailbox,
+                    to_mailbox,
+                    unread,
+                    older_than_days,
+                    account,
+                    yes,
+                } => {
+                    let mut p = Map::new();
+                    p.insert("mailbox".into(), json!(mailbox));
+                    p.insert("to_mailbox".into(), json!(to_mailbox));
+                    if unread {
+                        p.insert("unread".into(), json!(true));
+                    }
+                    insert_opt(&mut p, "older_than_days", older_than_days);
+                    insert_opt(&mut p, "account", account);
+                    p.insert("confirm".into(), json!(yes));
+                    ("mail_bulk_move", p)
+                }
+                MailBulkCmd::Delete {
+                    mailbox,
+                    unread,
+                    older_than_days,
+                    account,
+                    yes,
+                } => {
+                    let mut p = Map::new();
+                    p.insert("mailbox".into(), json!(mailbox));
+                    if unread {
+                        p.insert("unread".into(), json!(true));
+                    }
+                    insert_opt(&mut p, "older_than_days", older_than_days);
+                    insert_opt(&mut p, "account", account);
+                    p.insert("confirm".into(), json!(yes));
+                    ("mail_bulk_delete", p)
+                }
+            };
+            finish(crate::index::run_local_unwrapped(
+                tool,
+                &Value::Object(p),
+                Some(&mut h),
+            )?)
+        }
+
         Cmd::Index { cmd } => {
             let mut h = crate::helper::BridgeHandle::new();
             match cmd {
@@ -519,17 +605,17 @@ fn dispatch(cli: crate::cli::Cli) -> Result<i32, BiteError> {
                         Some(&mut h),
                     )?)
                 }
-                crate::cli::IndexCmd::Status => finish(crate::index::run_local_unwrapped(
+                IndexCmd::Status => finish(crate::index::run_local_unwrapped(
                     "index_status",
                     &json!({}),
                     Some(&mut h),
                 )?),
-                crate::cli::IndexCmd::Cancel => finish(crate::index::run_local_unwrapped(
+                IndexCmd::Cancel => finish(crate::index::run_local_unwrapped(
                     "index_crawl_cancel",
                     &json!({}),
                     Some(&mut h),
                 )?),
-                crate::cli::IndexCmd::Wipe { yes } => finish(crate::index::wipe(yes)?),
+                IndexCmd::Wipe { yes } => finish(crate::index::wipe(yes)?),
             }
         }
 

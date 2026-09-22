@@ -92,6 +92,70 @@ pub enum Cmd {
         #[command(subcommand)]
         cmd: IndexCmd,
     },
+    // ── Unified cross-app search ──
+    Search {
+        query: String,
+        #[arg(long)]
+        app: Option<String>,
+        #[arg(long)]
+        limit: Option<i64>,
+    },
+    // ── Bulk Mail ops ──
+    MailBulk {
+        #[command(subcommand)]
+        cmd: MailBulkCmd,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum MailBulkCmd {
+    /// Mark messages (whole mailbox or filtered)
+    Mark {
+        #[arg(long, default_value = "INBOX")]
+        mailbox: String,
+        #[arg(long)]
+        read: Option<bool>,
+        #[arg(long)]
+        flagged: Option<bool>,
+        #[arg(long)]
+        junk: Option<bool>,
+        #[arg(long)]
+        unread: bool,
+        #[arg(long)]
+        older_than_days: Option<i64>,
+        #[arg(long)]
+        account: Option<String>,
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Move messages (whole mailbox or filtered)
+    Move {
+        #[arg(long, default_value = "INBOX")]
+        mailbox: String,
+        #[arg(long)]
+        to_mailbox: String,
+        #[arg(long)]
+        unread: bool,
+        #[arg(long)]
+        older_than_days: Option<i64>,
+        #[arg(long)]
+        account: Option<String>,
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Delete messages — Mail moves them to Trash (recoverable)
+    Delete {
+        #[arg(long, default_value = "INBOX")]
+        mailbox: String,
+        #[arg(long)]
+        unread: bool,
+        #[arg(long)]
+        older_than_days: Option<i64>,
+        #[arg(long)]
+        account: Option<String>,
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]

@@ -77,6 +77,12 @@ pub struct SearchQuery {
     pub since_ms: Option<i64>,
     pub until_ms: Option<i64>,
     pub limit: usize,
+    /// SQL LIKE pattern against participants (e.g. "%sender@example.com%")
+    pub participant_like: Option<String>,
+    /// SQL LIKE pattern against title
+    pub title_like: Option<String>,
+    /// SQL LIKE pattern against content
+    pub content_like: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]

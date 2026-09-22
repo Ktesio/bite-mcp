@@ -588,7 +588,7 @@ dependencies = [
 
 [[package]]
 name = "bite-bridge"
-version = "0.1.1"
+version = "0.3.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -597,7 +597,7 @@ dependencies = [
 
 [[package]]
 name = "bite-core"
-version = "0.1.1"
+version = "0.3.0"
 dependencies = [
  "bite-bridge",
  "chrono",
@@ -610,7 +610,7 @@ dependencies = [
 
 [[package]]
 name = "bite-index"
-version = "0.1.1"
+version = "0.3.0"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -627,7 +627,7 @@ dependencies = [
 
 [[package]]
 name = "bite-mcp"
-version = "0.1.1"
+version = "0.3.0"
 dependencies = [
  "bite-bridge",
  "bite-core",

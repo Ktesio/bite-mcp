@@ -163,6 +163,12 @@ fn parse_clock(s: &str) -> Option<(u32, u32)> {
     Some((h, m))
 }
 
+/// RFC3339/relaxed date string → epoch milliseconds (dates parse as local
+/// midnight). Used by the index layer for range filters.
+pub fn parse_to_epoch_ms(s: &str) -> Option<i64> {
+    parse(s).ok().map(|dt| dt.timestamp_millis())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

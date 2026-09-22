@@ -18,6 +18,9 @@ pub struct Config {
     /// GitHub repo for prebuilt helper downloads (`owner/repo`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub release_repo: Option<String>,
+    /// Entity-index auto-refresh threshold in hours (default 24).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_refresh_hours: Option<u64>,
 }
 
 pub fn data_dir() -> PathBuf {

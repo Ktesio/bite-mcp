@@ -97,7 +97,7 @@ public enum MailCrawler {
     /// Methods the crawl process implements (conformance-checked by CI).
     public static let supportedIndexMethods = ["index.crawl", "index.crawl_cancel", "index.crawl_status"]
 
-    static func writeBatch(staging: URL, jobID: String, seq: Int, records: [CrawlRecord]) {
+    public static func writeBatch(staging: URL, jobID: String, seq: Int, records: [CrawlRecord]) {
         let path = staging.appendingPathComponent("\(jobID)-\(seq).jsonl")
         var lines = ""
         for r in records {
