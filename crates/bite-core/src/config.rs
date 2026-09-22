@@ -43,10 +43,7 @@ impl Config {
 
     pub fn save(&self) -> std::io::Result<()> {
         let path = config_path();
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::write(path, toml::to_string_pretty(self).unwrap_or_default())
+        crate::fsops::write_private(&path, toml::to_string_pretty(self).unwrap_or_default().as_bytes())
     }
 
     pub fn timeout(&self) -> std::time::Duration {

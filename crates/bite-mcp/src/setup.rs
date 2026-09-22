@@ -6,6 +6,9 @@ pub fn run(all_clients: bool, yes: bool) -> Result<i32, bite_core::BiteError> {
     println!("bite setup — native Apple apps for agents");
     println!("{}", "─".repeat(48));
 
+    // harden data dir first (0700/0600), including on older installs
+    let _ = bite_core::fsops::enforce_private_data_dir(&bite_core::config::data_dir());
+
     // 1. helper
     print!("installing native helper… ");
     std::io::Write::flush(&mut std::io::stdout()).ok();

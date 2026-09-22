@@ -71,7 +71,7 @@ fn newer(a: &std::path::Path, b: &std::path::Path) -> bool {
 
 fn install_from(src: &PathBuf, stable: &PathBuf) -> Result<PathBuf, BridgeError> {
     if let Some(parent) = stable.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| BridgeError::spawn(e.to_string()))?;
+        bite_core::fsops::ensure_private_dir(parent).map_err(|e| BridgeError::spawn(e.to_string()))?;
     }
     std::fs::copy(src, stable).map_err(|e| BridgeError::spawn(format!("copy helper: {e}")))?;
     set_exec(stable);
