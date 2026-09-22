@@ -503,6 +503,36 @@ fn dispatch(cli: crate::cli::Cli) -> Result<i32, BiteError> {
             }
         }
 
+        Cmd::Index { cmd } => {
+            let mut h = crate::helper::BridgeHandle::new();
+            match cmd {
+                crate::cli::IndexCmd::Rebuild {
+                    window_days,
+                    mailbox,
+                } => {
+                    let mut p = Map::new();
+                    insert_opt(&mut p, "window_days", window_days);
+                    insert_opt(&mut p, "mailbox", mailbox);
+                    finish(crate::index::run_local_unwrapped(
+                        "index_rebuild",
+                        &Value::Object(p),
+                        Some(&mut h),
+                    )?)
+                }
+                crate::cli::IndexCmd::Status => finish(crate::index::run_local_unwrapped(
+                    "index_status",
+                    &json!({}),
+                    Some(&mut h),
+                )?),
+                crate::cli::IndexCmd::Cancel => finish(crate::index::run_local_unwrapped(
+                    "index_crawl_cancel",
+                    &json!({}),
+                    Some(&mut h),
+                )?),
+                crate::cli::IndexCmd::Wipe { yes } => finish(crate::index::wipe(yes)?),
+            }
+        }
+
         Cmd::Messages { cmd } => {
             let mut h = BridgeHandle::new();
             match cmd {

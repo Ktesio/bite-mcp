@@ -53,12 +53,13 @@ fn main() {
     let mut times = Vec::new();
     for q in ["invoice 4242", "quarter 3 payments", "zebra"] {
         let t = Instant::now();
-        let res = idx.search(&SearchQuery {
-            text: Some(q.into()),
-            limit: 20,
-            ..Default::default()
-        })
-        .unwrap();
+        let res = idx
+            .search(&SearchQuery {
+                text: Some(q.into()),
+                limit: 20,
+                ..Default::default()
+            })
+            .unwrap();
         times.push((q, t.elapsed(), res.hits.len()));
     }
     for (q, d, hits) in &times {

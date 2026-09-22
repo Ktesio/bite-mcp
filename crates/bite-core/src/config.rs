@@ -43,7 +43,10 @@ impl Config {
 
     pub fn save(&self) -> std::io::Result<()> {
         let path = config_path();
-        crate::fsops::write_private(&path, toml::to_string_pretty(self).unwrap_or_default().as_bytes())
+        crate::fsops::write_private(
+            &path,
+            toml::to_string_pretty(self).unwrap_or_default().as_bytes(),
+        )
     }
 
     pub fn timeout(&self) -> std::time::Duration {

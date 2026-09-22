@@ -46,6 +46,7 @@ pub enum App {
     Notes,
     Contacts,
     Messages,
+    Index,
 }
 
 impl App {
@@ -57,6 +58,7 @@ impl App {
             App::Notes => "notes",
             App::Contacts => "contacts",
             App::Messages => "messages",
+            App::Index => "index",
         }
     }
 }
@@ -401,6 +403,20 @@ pub static TOOLS: &[Tool] = &[
         ]),
     t("contacts_groups", App::Contacts, "contacts.groups", "List contact groups with member counts.", &[]),
 
+    // ─── Entity index ───────────────────────────────────────────────────────
+    t("index_rebuild", App::Index, "index.crawl",
+        "Rebuild/refresh the bite entity index for Mail: crawls a 30-day window first, then 10-day backfill batches in the background. Poll index_status for progress. Fast local search serves from the index once populated.",
+        ps![
+            ParamSpec::opt("window_days", ParamKind::Int, "initial window in days (default 30; backfill continues in 10-day batches)"),
+            ParamSpec::opt("mailbox", ParamKind::Str, "restrict crawl to one mailbox name"),
+        ]),
+    t("index_status", App::Index, "index.crawl_status",
+        "Entity index state: rows per app, freshness, FTS index, pending crawl batches.",
+        &[]),
+    t("index_crawl_cancel", App::Index, "index.crawl_cancel",
+        "Cancel a running index crawl.",
+        &[]),
+
     // ─── Messages ───────────────────────────────────────────────────────────
     t("messages_send", App::Messages, "messages.send",
         "Send an iMessage/SMS. The recipient must be reachable in Messages (have a conversation history) — routing is automatic.",
@@ -491,6 +507,7 @@ mod tests {
                 App::Notes => "notes",
                 App::Contacts => "contacts",
                 App::Messages => "messages",
+                App::Index => "index",
             };
             assert_eq!(ns, expected_ns, "method {} has wrong namespace", t.method);
         }

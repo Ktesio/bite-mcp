@@ -73,7 +73,11 @@ pub fn private_report(data_dir: &Path) -> Vec<(std::path::PathBuf, bool, bool)> 
     let mut check = |path: &Path, want_dir: bool| {
         if let Ok(meta) = std::fs::metadata(path) {
             let mode = meta.permissions().mode() & 0o777;
-            let ok = if want_dir { mode == 0o700 } else { mode == 0o600 };
+            let ok = if want_dir {
+                mode == 0o700
+            } else {
+                mode == 0o600
+            };
             report.push((path.to_path_buf(), ok, meta.is_dir()));
         }
     };

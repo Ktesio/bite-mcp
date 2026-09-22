@@ -43,6 +43,10 @@ fn main() {
             let baked = baked.trim();
             if saved == format!("{hash}\n{}", bin_path.display()) && PathBuf::from(baked).exists() {
                 println!("cargo:rustc-env=BITE_HELPER_BUILT={baked}");
+                println!(
+                    "cargo:rustc-env=BITE_CRAWL_BUILT={}",
+                    PathBuf::from(baked).with_file_name("bite-crawl").display()
+                );
                 return;
             }
         }
@@ -90,6 +94,10 @@ fn main() {
                     let _ = std::fs::write(&bin_path, format!("{}\n", helper.display()));
                     let _ = std::fs::write(&fp_file, format!("{hash}\n{}", bin_path.display()));
                     println!("cargo:rustc-env=BITE_HELPER_BUILT={}", helper.display());
+                    println!(
+                        "cargo:rustc-env=BITE_CRAWL_BUILT={}",
+                        helper.with_file_name("bite-crawl").display()
+                    );
                 }
             }
         }

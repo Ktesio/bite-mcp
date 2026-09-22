@@ -8,6 +8,9 @@ use std::sync::mpsc::{sync_channel, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+/// Callback invoked (reader thread) for every helper notification.
+pub type NotificationHandler = Arc<dyn Fn(&str, &Value) + Send + Sync>;
+
 use serde_json::Value;
 
 use crate::protocol::{
@@ -23,12 +26,15 @@ struct Inner {
     pending: Mutex<HashMap<i64, SyncSender<Result<Value, BridgeError>>>>,
     next_id: std::sync::atomic::AtomicI64,
     hello: Mutex<Option<Hello>>,
+    on_notification: Mutex<Option<NotificationHandler>>,
 }
 
 pub struct Bridge {
     inner: Arc<Inner>,
     child: Arc<Mutex<Option<Child>>>,
     pub helper_path: String,
+    /// Called (from the reader thread) for every helper notification.
+    pub on_notification: Option<NotificationHandler>,
 }
 
 impl Bridge {
@@ -66,11 +72,13 @@ impl Bridge {
             .map_err(|e| BridgeError::spawn(e.to_string()))?;
 
         let bridge = Bridge {
+            on_notification: None,
             inner: Arc::new(Inner {
                 stdin: Mutex::new(Some(BufWriter::new(stdin))),
                 pending: Mutex::new(HashMap::new()),
                 next_id: std::sync::atomic::AtomicI64::new(1),
                 hello: Mutex::new(None),
+                on_notification: Mutex::new(None),
             }),
             child: Arc::new(Mutex::new(Some(child))),
             helper_path: path,
@@ -99,6 +107,9 @@ impl Bridge {
                             }
                         }
                         Ok(Some(FromHelper::Notification { method, params })) => {
+                            if let Some(cb) = inner.on_notification.lock().unwrap().as_ref() {
+                                cb(&method, &params);
+                            }
                             let msg = params.get("message").and_then(|m| m.as_str()).unwrap_or("");
                             eprintln!("[bite-helper:{method}] {msg}");
                         }
@@ -151,6 +162,11 @@ impl Bridge {
 
     pub fn capabilities(&self) -> Vec<String> {
         self.hello().map(|h| h.capabilities).unwrap_or_default()
+    }
+
+    /// Register a notification handler (job progress, batch-ready, …).
+    pub fn set_notification_handler(&self, cb: NotificationHandler) {
+        *self.inner.on_notification.lock().unwrap() = Some(cb);
     }
 
     pub fn is_alive(&self) -> bool {

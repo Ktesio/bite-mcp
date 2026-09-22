@@ -71,11 +71,22 @@ fn newer(a: &std::path::Path, b: &std::path::Path) -> bool {
 
 fn install_from(src: &PathBuf, stable: &PathBuf) -> Result<PathBuf, BridgeError> {
     if let Some(parent) = stable.parent() {
-        bite_core::fsops::ensure_private_dir(parent).map_err(|e| BridgeError::spawn(e.to_string()))?;
+        bite_core::fsops::ensure_private_dir(parent)
+            .map_err(|e| BridgeError::spawn(e.to_string()))?;
     }
     std::fs::copy(src, stable).map_err(|e| BridgeError::spawn(format!("copy helper: {e}")))?;
     set_exec(stable);
     adhoc_sign(stable);
+    // the crawler binary ships alongside the helper
+    if let Some(crawl_src) = src.parent().map(|d| d.join("bite-crawl")) {
+        if crawl_src.exists() {
+            let crawl_dst = stable.with_file_name("bite-crawl");
+            std::fs::copy(&crawl_src, &crawl_dst)
+                .map_err(|e| BridgeError::spawn(format!("copy crawl binary: {e}")))?;
+            set_exec(&crawl_dst);
+            adhoc_sign(&crawl_dst);
+        }
+    }
     Ok(stable.clone())
 }
 
@@ -179,6 +190,13 @@ impl BridgeHandle {
         if self.bridge.is_none() {
             let path = ensure_helper()?;
             let bridge = Bridge::spawn(path.to_string_lossy().to_string())?;
+            bridge.set_notification_handler(std::sync::Arc::new(|method, params| {
+                crate::jobs::handle_notification(method, params);
+                if method == "job_progress" {
+                    // opportunistically ingest staged batches while a crawl runs
+                    let _ = crate::index::ingest_pending();
+                }
+            }));
             self.bridge = Some(bridge);
         }
         Ok(self.bridge.as_ref().unwrap())

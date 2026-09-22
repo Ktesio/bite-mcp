@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use arrow_array::{
     builder::{BooleanBuilder, Int32Builder, Int64Builder, StringBuilder},
-    Array, BooleanArray, Int64Array, RecordBatch, RecordBatchReader, StringArray,
+    Array, BooleanArray, Int64Array, RecordBatch, StringArray,
 };
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use lancedb::index::scalar::FullTextSearchQuery;
@@ -190,9 +190,9 @@ impl EntityIndex {
             .truncate(false)
             .write(true)
             .open(&lock_path)?;
-        fs2::FileExt::try_lock_exclusive(&lock_file).map_err(|e| IndexError::Other(format!(
-            "another bite process is writing the index ({e})"
-        )))?;
+        fs2::FileExt::try_lock_exclusive(&lock_file).map_err(|e| {
+            IndexError::Other(format!("another bite process is writing the index ({e})"))
+        })?;
         bite_core::fsops::tighten_file(&lock_path).ok();
 
         let rt = tokio::runtime::Builder::new_multi_thread()
@@ -202,7 +202,12 @@ impl EntityIndex {
         let dir_str = dir.to_string_lossy().to_string();
         let conn = rt.block_on(async { lancedb::connect(dir_str.as_str()).execute().await })?;
 
-        let index = Self { dir: dir.to_path_buf(), rt, _lock: lock_file, conn };
+        let index = Self {
+            dir: dir.to_path_buf(),
+            rt,
+            _lock: lock_file,
+            conn,
+        };
         index.rt.block_on(async { index.ensure_table().await })?;
         Ok(index)
     }
@@ -236,8 +241,7 @@ impl EntityIndex {
             let mut updated_rows: usize = 0;
             for chunk in records.chunks(512) {
                 let batch = record_batch(chunk)?;
-                let reader =
-                    arrow_array::RecordBatchIterator::new(vec![Ok(batch)], schema());
+                let reader = arrow_array::RecordBatchIterator::new(vec![Ok(batch)], schema());
                 let mut mi = table.merge_insert(&["app", "id"]);
                 mi.when_matched_update_all(None)
                     .when_not_matched_insert_all();
@@ -296,7 +300,9 @@ impl EntityIndex {
     pub fn count(&self, filter: Option<&str>) -> Result<usize, IndexError> {
         self.rt.block_on(async {
             let table = self.table().await?;
-            Ok(table.count_rows(filter.as_ref().map(|f| f.to_string())).await?)
+            Ok(table
+                .count_rows(filter.as_ref().map(|f| f.to_string()))
+                .await?)
         })
     }
 
@@ -309,7 +315,11 @@ impl EntityIndex {
 
             let mut total = None;
             if q.text.is_none() {
-                total = Some(table.count_rows(filter.as_ref().map(|f| f.to_string())).await?);
+                total = Some(
+                    table
+                        .count_rows(filter.as_ref().map(|f| f.to_string()))
+                        .await?,
+                );
             }
 
             let mut builder = table.query();
@@ -336,7 +346,14 @@ impl EntityIndex {
             let total = table.count_rows(None).await?;
             let mut per_app = Vec::new();
             let mut newest = None;
-            for app in ["mail", "calendar", "reminders", "contacts", "notes", "messages"] {
+            for app in [
+                "mail",
+                "calendar",
+                "reminders",
+                "contacts",
+                "notes",
+                "messages",
+            ] {
                 let n = table
                     .count_rows(Some(format!("app = {}", sql_str(app))))
                     .await?;
@@ -358,13 +375,18 @@ impl EntityIndex {
                 let batch = batch.map_err(IndexError::from)?;
                 let col = batch.column(0);
                 if let Some(arr) = col.as_any().downcast_ref::<Int64Array>() {
-                    if arr.len() > 0 && !arr.is_null(0) {
+                    if !arr.is_empty() && !arr.is_null(0) {
                         newest = Some(arr.value(0));
                     }
                 }
             }
             let fts_indexed = self.has_fts().await?;
-            Ok(IndexStats { total, per_app, newest_updated_ms: newest, fts_indexed })
+            Ok(IndexStats {
+                total,
+                per_app,
+                newest_updated_ms: newest,
+                fts_indexed,
+            })
         })
     }
 
@@ -414,7 +436,11 @@ fn filter_sql(q: &SearchQuery) -> Option<String> {
     if let Some(v) = q.until_ms {
         parts.push(format!("start_ms < {v}"));
     }
-    if parts.is_empty() { None } else { Some(parts.join(" AND ")) }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join(" AND "))
+    }
 }
 
 fn record_batch(records: &[Record]) -> Result<RecordBatch, IndexError> {
@@ -502,48 +528,59 @@ async fn hits_from_stream(
             None => break,
         };
         {
-        let n = batch.num_rows();
-        let col = |name: &str| -> Option<&dyn Array> {
-            batch.schema().index_of(name).ok().map(|i| batch.column(i).as_ref())
-        };
-        let as_str = |name: &str, i: usize| -> Option<String> {
-            col(name).and_then(|a| a.as_any().downcast_ref::<StringArray>())
-                .filter(|a| !a.is_null(i))
-                .map(|a| a.value(i).to_string())
-        };
-        let as_bool = |name: &str, i: usize| -> Option<bool> {
-            col(name).and_then(|a| a.as_any().downcast_ref::<BooleanArray>())
-                .filter(|a| !a.is_null(i))
-                .map(|a| a.value(i))
-        };
-        let as_i64 = |name: &str, i: usize| -> Option<i64> {
-            col(name).and_then(|a| a.as_any().downcast_ref::<Int64Array>())
-                .filter(|a| !a.is_null(i))
-                .map(|a| a.value(i))
-        };
-        for i in 0..n {
-            let content = as_str("content", i);
-            let snippet = content.as_ref().map(|c| {
-                let t = c.trim();
-                if t.chars().count() <= 200 { t.to_string() } else { format!("{}…", t.chars().take(200).collect::<String>()) }
-            });
-            hits.push(Hit {
-                app: as_str("app", i).unwrap_or_default(),
-                id: as_str("id", i).unwrap_or_default(),
-                account: as_str("account", i),
-                container: as_str("container", i),
-                title: as_str("title", i),
-                snippet,
-                participants: as_str("participants", i),
-                start_ms: as_i64("start_ms", i),
-                updated_ms: as_i64("updated_ms", i),
-                read: as_bool("read", i),
-                flagged: as_bool("flagged", i),
-                junk: as_bool("junk", i),
-                completed: as_bool("completed", i),
-                score: None, // BM25 _score available via Select::Dynamic when needed
-            });
-        }
+            let n = batch.num_rows();
+            let col = |name: &str| -> Option<&dyn Array> {
+                batch
+                    .schema()
+                    .index_of(name)
+                    .ok()
+                    .map(|i| batch.column(i).as_ref())
+            };
+            let as_str = |name: &str, i: usize| -> Option<String> {
+                col(name)
+                    .and_then(|a| a.as_any().downcast_ref::<StringArray>())
+                    .filter(|a| !a.is_null(i))
+                    .map(|a| a.value(i).to_string())
+            };
+            let as_bool = |name: &str, i: usize| -> Option<bool> {
+                col(name)
+                    .and_then(|a| a.as_any().downcast_ref::<BooleanArray>())
+                    .filter(|a| !a.is_null(i))
+                    .map(|a| a.value(i))
+            };
+            let as_i64 = |name: &str, i: usize| -> Option<i64> {
+                col(name)
+                    .and_then(|a| a.as_any().downcast_ref::<Int64Array>())
+                    .filter(|a| !a.is_null(i))
+                    .map(|a| a.value(i))
+            };
+            for i in 0..n {
+                let content = as_str("content", i);
+                let snippet = content.as_ref().map(|c| {
+                    let t = c.trim();
+                    if t.chars().count() <= 200 {
+                        t.to_string()
+                    } else {
+                        format!("{}…", t.chars().take(200).collect::<String>())
+                    }
+                });
+                hits.push(Hit {
+                    app: as_str("app", i).unwrap_or_default(),
+                    id: as_str("id", i).unwrap_or_default(),
+                    account: as_str("account", i),
+                    container: as_str("container", i),
+                    title: as_str("title", i),
+                    snippet,
+                    participants: as_str("participants", i),
+                    start_ms: as_i64("start_ms", i),
+                    updated_ms: as_i64("updated_ms", i),
+                    read: as_bool("read", i),
+                    flagged: as_bool("flagged", i),
+                    junk: as_bool("junk", i),
+                    completed: as_bool("completed", i),
+                    score: None, // BM25 _score available via Select::Dynamic when needed
+                });
+            }
         }
     }
     Ok(hits)
@@ -557,9 +594,10 @@ pub fn parse_jsonl(path: &Path) -> Result<Vec<Record>, IndexError> {
         if line.trim().is_empty() {
             continue;
         }
-        records.push(serde_json::from_str::<Record>(line).map_err(|e| {
-            IndexError::Other(format!("{}:{}: {e}", path.display(), i + 1))
-        })?);
+        records.push(
+            serde_json::from_str::<Record>(line)
+                .map_err(|e| IndexError::Other(format!("{}:{}: {e}", path.display(), i + 1)))?,
+        );
     }
     Ok(records)
 }
@@ -608,44 +646,72 @@ mod tests {
         let idx = EntityIndex::open(&dir).unwrap();
 
         idx.ingest(&[
-            record("mail", "m1", "Invoice from Acme", "your invoice for March is attached", Some(false)),
+            record(
+                "mail",
+                "m1",
+                "Invoice from Acme",
+                "your invoice for March is attached",
+                Some(false),
+            ),
             record("mail", "m2", "Hello", "plain greeting body", Some(true)),
             record("calendar", "c1", "Dentist", "appointment notes", None),
         ])
         .unwrap();
 
         // filter-only search: exact total
-        let res = idx.search(&SearchQuery {
-            app: Some("mail".into()),
-            read: Some(false),
-            limit: 10,
-            ..Default::default()
-        })
-        .unwrap();
+        let res = idx
+            .search(&SearchQuery {
+                app: Some("mail".into()),
+                read: Some(false),
+                limit: 10,
+                ..Default::default()
+            })
+            .unwrap();
         assert_eq!(res.total, Some(1));
         assert_eq!(res.hits[0].title.as_deref(), Some("Invoice from Acme"));
 
         // full-text search hits body text
         let res = idx
-            .search(&SearchQuery { text: Some("invoice".into()), limit: 10, ..Default::default() })
+            .search(&SearchQuery {
+                text: Some("invoice".into()),
+                limit: 10,
+                ..Default::default()
+            })
             .unwrap();
         assert!(res.hits.iter().any(|h| h.id == "m1"), "fts should hit m1");
 
         // cross-app scope
         let res = idx
-            .search(&SearchQuery { app: Some("calendar".into()), limit: 10, ..Default::default() })
+            .search(&SearchQuery {
+                app: Some("calendar".into()),
+                limit: 10,
+                ..Default::default()
+            })
             .unwrap();
         assert_eq!(res.hits.len(), 1);
         assert_eq!(res.hits[0].app, "calendar");
 
         // upsert: same (app, id) updates, does not duplicate
-        idx.ingest(&[record("mail", "m2", "Hello (edited)", "plain greeting body", Some(true))])
-            .unwrap();
+        idx.ingest(&[record(
+            "mail",
+            "m2",
+            "Hello (edited)",
+            "plain greeting body",
+            Some(true),
+        )])
+        .unwrap();
         assert_eq!(idx.count(Some("app = 'mail'")).unwrap(), 2);
         let res = idx
-            .search(&SearchQuery { app: Some("mail".into()), limit: 10, ..Default::default() })
+            .search(&SearchQuery {
+                app: Some("mail".into()),
+                limit: 10,
+                ..Default::default()
+            })
             .unwrap();
-        assert!(res.hits.iter().any(|h| h.title.as_deref() == Some("Hello (edited)")));
+        assert!(res
+            .hits
+            .iter()
+            .any(|h| h.title.as_deref() == Some("Hello (edited)")));
 
         // delete_where for cache invalidation
         idx.delete_where("app = 'calendar'").unwrap();
@@ -661,16 +727,32 @@ mod tests {
     fn fts_sees_rows_added_after_index_creation() {
         let dir = temp_dir("fts");
         let idx = EntityIndex::open(&dir).unwrap();
-        idx.ingest(&[record("mail", "a1", "first", "original body text", Some(true))])
-            .unwrap();
+        idx.ingest(&[record(
+            "mail",
+            "a1",
+            "first",
+            "original body text",
+            Some(true),
+        )])
+        .unwrap();
         idx.refresh_fts().unwrap();
 
         // new rows arriving after the FTS index was built must still be found
-        idx.ingest(&[record("mail", "a2", "second", "zebra unicorn query term", Some(false))])
-            .unwrap();
+        idx.ingest(&[record(
+            "mail",
+            "a2",
+            "second",
+            "zebra unicorn query term",
+            Some(false),
+        )])
+        .unwrap();
 
         let res = idx
-            .search(&SearchQuery { text: Some("zebra".into()), limit: 10, ..Default::default() })
+            .search(&SearchQuery {
+                text: Some("zebra".into()),
+                limit: 10,
+                ..Default::default()
+            })
             .unwrap();
         assert!(
             res.hits.iter().any(|h| h.id == "a2"),
@@ -684,8 +766,11 @@ mod tests {
         let dir = temp_dir("jsonl");
         let idx = EntityIndex::open(&dir).unwrap();
         let batch = dir.join("batch-1.jsonl");
-        let line1 = serde_json::to_string(&record("notes", "n1", "Groceries", "milk eggs", None)).unwrap();
-        let line2 = serde_json::to_string(&record("notes", "n2", "Ideas", "startup idea: bite", None)).unwrap();
+        let line1 =
+            serde_json::to_string(&record("notes", "n1", "Groceries", "milk eggs", None)).unwrap();
+        let line2 =
+            serde_json::to_string(&record("notes", "n2", "Ideas", "startup idea: bite", None))
+                .unwrap();
         std::fs::write(&batch, format!("{line1}\n{line2}\n")).unwrap();
 
         let records = parse_jsonl(&batch).unwrap();

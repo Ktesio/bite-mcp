@@ -87,6 +87,31 @@ pub enum Cmd {
         #[command(subcommand)]
         cmd: MessagesCmd,
     },
+    // ── Entity index ──
+    Index {
+        #[command(subcommand)]
+        cmd: IndexCmd,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum IndexCmd {
+    /// Rebuild/refresh the entity index (30-day window + background backfill)
+    Rebuild {
+        #[arg(long)]
+        window_days: Option<i64>,
+        #[arg(long)]
+        mailbox: Option<String>,
+    },
+    /// Index state: rows, freshness, pending crawl batches
+    Status,
+    /// Cancel a running crawl
+    Cancel,
+    /// Destroy the entity index (requires --yes)
+    Wipe {
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]
