@@ -313,7 +313,7 @@ pub static TOOLS: &[Tool] = &[
             ParamSpec::opt("account", ParamKind::Str, "account name"),
             ParamSpec::opt("confirm", ParamKind::Bool, "true to perform the deletion"),
         ]),
-    td("mail_bulk_mark", App::Mail, "index.bulk_mark",
+    td("mail_bulk_mark", App::Index, "index.bulk_mark",
         "Bulk-set read/flagged/junk on a whole mailbox or a filtered selection (unread only, older than N days). Preview without confirm; executes via Mail internally in one Apple Event — no per-message loops.",
         ps![
             ParamSpec::req("mailbox", ParamKind::Str, "mailbox name (default INBOX)"),
@@ -325,7 +325,7 @@ pub static TOOLS: &[Tool] = &[
             ParamSpec::opt("account", ParamKind::Str, "account name"),
             ParamSpec::opt("confirm", ParamKind::Bool, "true to execute (preview without it)"),
         ]),
-    td("mail_bulk_move", App::Mail, "index.bulk_move",
+    td("mail_bulk_move", App::Index, "index.bulk_move",
         "Bulk-move messages from one mailbox to another (whole mailbox or filtered selection). Executed via Mail internally in one Apple Event.",
         ps![
             ParamSpec::req("mailbox", ParamKind::Str, "source mailbox name"),
@@ -335,7 +335,7 @@ pub static TOOLS: &[Tool] = &[
             ParamSpec::opt("account", ParamKind::Str, "account name"),
             ParamSpec::opt("confirm", ParamKind::Bool, "true to execute (preview without it)"),
         ]),
-    td("mail_bulk_delete", App::Mail, "index.bulk_delete",
+    td("mail_bulk_delete", App::Index, "index.bulk_delete",
         "Bulk-delete messages from a mailbox (whole mailbox or filtered selection) — Mail moves them to Trash (recoverable). Preview without confirm.",
         ps![
             ParamSpec::req("mailbox", ParamKind::Str, "mailbox name"),
