@@ -17,8 +17,9 @@ name = "bite"
 path = "src/main.rs"
 
 [dependencies]
-bite-bridge = { path = "../bite-bridge", version = "0.1.1" }
-bite-core = { path = "../bite-core", version = "0.1.1" }
+bite-bridge = { path = "../bite-bridge", version = "0.3.0" }
+bite-core = { path = "../bite-core", version = "0.3.0" }
+bite-index = { path = "../bite-index", version = "0.3.0" }
 clap = { version = "4", features = ["derive"] }
 serde.workspace = true
 serde_json.workspace = true

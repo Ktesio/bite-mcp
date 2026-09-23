@@ -46,6 +46,7 @@ pub enum App {
     Notes,
     Contacts,
     Messages,
+    Index,
 }
 
 impl App {
@@ -57,6 +58,7 @@ impl App {
             App::Notes => "notes",
             App::Contacts => "contacts",
             App::Messages => "messages",
+            App::Index => "index",
         }
     }
 }
@@ -311,6 +313,37 @@ pub static TOOLS: &[Tool] = &[
             ParamSpec::opt("account", ParamKind::Str, "account name"),
             ParamSpec::opt("confirm", ParamKind::Bool, "true to perform the deletion"),
         ]),
+    td("mail_bulk_mark", App::Index, "index.bulk_mark",
+        "Bulk-set read/flagged/junk on a whole mailbox or a filtered selection (unread only, older than N days). Preview without confirm; executes via Mail internally in one Apple Event — no per-message loops.",
+        ps![
+            ParamSpec::req("mailbox", ParamKind::Str, "mailbox name (default INBOX)"),
+            ParamSpec::opt("read", ParamKind::Bool, "set read status to this value on all selected"),
+            ParamSpec::opt("flagged", ParamKind::Bool, "set flagged status to this value"),
+            ParamSpec::opt("junk", ParamKind::Bool, "set junk status to this value"),
+            ParamSpec::opt("unread", ParamKind::Bool, "selection: only unread messages"),
+            ParamSpec::opt("older_than_days", ParamKind::Int, "selection: only messages older than N days"),
+            ParamSpec::opt("account", ParamKind::Str, "account name"),
+            ParamSpec::opt("confirm", ParamKind::Bool, "true to execute (preview without it)"),
+        ]),
+    td("mail_bulk_move", App::Index, "index.bulk_move",
+        "Bulk-move messages from one mailbox to another (whole mailbox or filtered selection). Executed via Mail internally in one Apple Event.",
+        ps![
+            ParamSpec::req("mailbox", ParamKind::Str, "source mailbox name"),
+            ParamSpec::req("to_mailbox", ParamKind::Str, "destination mailbox name"),
+            ParamSpec::opt("unread", ParamKind::Bool, "selection: only unread messages"),
+            ParamSpec::opt("older_than_days", ParamKind::Int, "selection: only messages older than N days"),
+            ParamSpec::opt("account", ParamKind::Str, "account name"),
+            ParamSpec::opt("confirm", ParamKind::Bool, "true to execute (preview without it)"),
+        ]),
+    td("mail_bulk_delete", App::Index, "index.bulk_delete",
+        "Bulk-delete messages from a mailbox (whole mailbox or filtered selection) — Mail moves them to Trash (recoverable). Preview without confirm.",
+        ps![
+            ParamSpec::req("mailbox", ParamKind::Str, "mailbox name"),
+            ParamSpec::opt("unread", ParamKind::Bool, "selection: only unread messages"),
+            ParamSpec::opt("older_than_days", ParamKind::Int, "selection: only messages older than N days"),
+            ParamSpec::opt("account", ParamKind::Str, "account name"),
+            ParamSpec::opt("confirm", ParamKind::Bool, "true to execute (preview without it)"),
+        ]),
     t("mail_attachment_save", App::Mail, "mail.attachment_save",
         "Save a message attachment to disk (by index from mail_get_message).",
         ps![
@@ -400,6 +433,27 @@ pub static TOOLS: &[Tool] = &[
             ParamSpec::opt("confirm", ParamKind::Bool, "true to perform the deletion"),
         ]),
     t("contacts_groups", App::Contacts, "contacts.groups", "List contact groups with member counts.", &[]),
+
+    // ─── Entity index ───────────────────────────────────────────────────────
+    t("index_rebuild", App::Index, "index.crawl",
+        "Rebuild/refresh the bite entity index for Mail: crawls a 30-day window first, then 10-day backfill batches in the background. Poll index_status for progress. Fast local search serves from the index once populated.",
+        ps![
+            ParamSpec::opt("window_days", ParamKind::Int, "initial window in days (default 30; backfill continues in 10-day batches)"),
+            ParamSpec::opt("mailbox", ParamKind::Str, "restrict crawl to one mailbox name"),
+        ]),
+    t("index_status", App::Index, "index.crawl_status",
+        "Entity index state: rows per app, freshness, FTS index, pending crawl batches.",
+        &[]),
+    t("index_crawl_cancel", App::Index, "index.crawl_cancel",
+        "Cancel a running index crawl.",
+        &[]),
+    t("search", App::Index, "index.search",
+        "Unified full-text search across everything indexed by bite (Mail, Calendar, Reminders, Contacts, Notes). Served locally from the entity index — milliseconds, exact counts, no Apple Events.",
+        ps![
+            ParamSpec::req("query", ParamKind::Str, "full-text query"),
+            ParamSpec::opt("app", ParamKind::Str, "scope to one app (mail/calendar/reminders/contacts/notes/messages)"),
+            ParamSpec::opt("limit", ParamKind::Int, "max results (default 20)"),
+        ]),
 
     // ─── Messages ───────────────────────────────────────────────────────────
     t("messages_send", App::Messages, "messages.send",
@@ -491,6 +545,7 @@ mod tests {
                 App::Notes => "notes",
                 App::Contacts => "contacts",
                 App::Messages => "messages",
+                App::Index => "index",
             };
             assert_eq!(ns, expected_ns, "method {} has wrong namespace", t.method);
         }

@@ -5,6 +5,8 @@ mod clients;
 mod dispatch;
 mod doctor;
 mod helper;
+mod index;
+mod jobs;
 mod mcp;
 mod setup;
 

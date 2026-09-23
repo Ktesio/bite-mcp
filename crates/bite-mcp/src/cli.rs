@@ -87,6 +87,95 @@ pub enum Cmd {
         #[command(subcommand)]
         cmd: MessagesCmd,
     },
+    // ── Entity index ──
+    Index {
+        #[command(subcommand)]
+        cmd: IndexCmd,
+    },
+    // ── Unified cross-app search ──
+    Search {
+        query: String,
+        #[arg(long)]
+        app: Option<String>,
+        #[arg(long)]
+        limit: Option<i64>,
+    },
+    // ── Bulk Mail ops ──
+    MailBulk {
+        #[command(subcommand)]
+        cmd: MailBulkCmd,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum MailBulkCmd {
+    /// Mark messages (whole mailbox or filtered)
+    Mark {
+        #[arg(long, default_value = "INBOX")]
+        mailbox: String,
+        #[arg(long)]
+        read: Option<bool>,
+        #[arg(long)]
+        flagged: Option<bool>,
+        #[arg(long)]
+        junk: Option<bool>,
+        #[arg(long)]
+        unread: bool,
+        #[arg(long)]
+        older_than_days: Option<i64>,
+        #[arg(long)]
+        account: Option<String>,
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Move messages (whole mailbox or filtered)
+    Move {
+        #[arg(long, default_value = "INBOX")]
+        mailbox: String,
+        #[arg(long)]
+        to_mailbox: String,
+        #[arg(long)]
+        unread: bool,
+        #[arg(long)]
+        older_than_days: Option<i64>,
+        #[arg(long)]
+        account: Option<String>,
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Delete messages — Mail moves them to Trash (recoverable)
+    Delete {
+        #[arg(long, default_value = "INBOX")]
+        mailbox: String,
+        #[arg(long)]
+        unread: bool,
+        #[arg(long)]
+        older_than_days: Option<i64>,
+        #[arg(long)]
+        account: Option<String>,
+        #[arg(long)]
+        yes: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum IndexCmd {
+    /// Rebuild/refresh the entity index (30-day window + background backfill)
+    Rebuild {
+        #[arg(long)]
+        window_days: Option<i64>,
+        #[arg(long)]
+        mailbox: Option<String>,
+    },
+    /// Index state: rows, freshness, pending crawl batches
+    Status,
+    /// Cancel a running crawl
+    Cancel,
+    /// Destroy the entity index (requires --yes)
+    Wipe {
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -197,7 +286,7 @@ pub enum RemindersCmd {
         list: Option<String>,
         #[arg(long)]
         text: Option<String>,
-        #[arg(long)]
+        #[arg(long, num_args = 0..=1, default_missing_value = "true")]
         completed: Option<bool>,
         #[arg(long)]
         due_within_days: Option<i64>,
@@ -225,7 +314,7 @@ pub enum RemindersCmd {
         title: Option<String>,
         #[arg(long)]
         due: Option<String>,
-        #[arg(long)]
+        #[arg(long, num_args = 0..=1, default_missing_value = "true")]
         completed: Option<bool>,
         #[arg(long)]
         list: Option<String>,
@@ -261,9 +350,9 @@ pub enum MailCmd {
         subject: Option<String>,
         #[arg(long)]
         body: Option<String>,
-        #[arg(long)]
+        #[arg(long, num_args = 0..=1, default_missing_value = "true")]
         unread: Option<bool>,
-        #[arg(long)]
+        #[arg(long, num_args = 0..=1, default_missing_value = "true")]
         flagged: Option<bool>,
         #[arg(long)]
         since: Option<String>,
@@ -340,11 +429,11 @@ pub enum MailCmd {
         id: String,
         #[arg(long)]
         mailbox: Option<String>,
-        #[arg(long)]
+        #[arg(long, num_args = 0..=1, default_missing_value = "true")]
         read: Option<bool>,
-        #[arg(long)]
+        #[arg(long, num_args = 0..=1, default_missing_value = "true")]
         flagged: Option<bool>,
-        #[arg(long)]
+        #[arg(long, num_args = 0..=1, default_missing_value = "true")]
         junk: Option<bool>,
     },
     /// Delete a message (asks for --yes)

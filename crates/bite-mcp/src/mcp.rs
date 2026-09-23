@@ -118,6 +118,31 @@ fn handle_request(state: &ServerState, method: &str, params: &Value) -> Result<V
         "tools/call" => {
             let name = params.get("name").and_then(|n| n.as_str()).unwrap_or("");
             let args = params.get("arguments").cloned().unwrap_or(json!({}));
+            if name == "mail_messages_search" {
+                // fast path: entity index (falls back to live Apple Events
+                // automatically when the index has no Mail rows yet)
+                match crate::index::try_mail_search(&args) {
+                    Some(Ok(value)) => {
+                        return Ok(json!({
+                            "content": [ { "type": "text", "text": serde_json::to_string_pretty(&value).unwrap_or_default() } ],
+                            "structuredContent": value,
+                            "isError": false,
+                        }));
+                    }
+                    Some(Err(e)) => return Err(err(-32000, e.render())),
+                    None => {} // fall through to live path
+                }
+            }
+            if crate::index::is_local_tool(name) {
+                let mut handle = state.handle.lock().unwrap();
+                let value = crate::index::run_local_unwrapped(name, &args, Some(&mut handle))
+                    .map_err(|e| err(-32000, e.render()))?;
+                return Ok(json!({
+                    "content": [ { "type": "text", "text": serde_json::to_string_pretty(&value).unwrap_or_default() } ],
+                    "structuredContent": value,
+                    "isError": false,
+                }));
+            }
             let value =
                 run_tool_retrying(state, name, args).map_err(|e| err(-32000, e.render()))?;
             let is_error = is_tool_error(&value);

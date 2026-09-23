@@ -6,7 +6,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-bite-bridge = { path = "../bite-bridge", version = "0.1.1" }
+bite-bridge = { path = "../bite-bridge", version = "0.3.0" }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

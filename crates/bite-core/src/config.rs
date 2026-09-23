@@ -18,6 +18,9 @@ pub struct Config {
     /// GitHub repo for prebuilt helper downloads (`owner/repo`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub release_repo: Option<String>,
+    /// Entity-index auto-refresh threshold in hours (default 24).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_refresh_hours: Option<u64>,
 }
 
 pub fn data_dir() -> PathBuf {
@@ -43,14 +46,16 @@ impl Config {
 
     pub fn save(&self) -> std::io::Result<()> {
         let path = config_path();
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::write(path, toml::to_string_pretty(self).unwrap_or_default())
+        crate::fsops::write_private(
+            &path,
+            toml::to_string_pretty(self).unwrap_or_default().as_bytes(),
+        )
     }
 
     pub fn timeout(&self) -> std::time::Duration {
-        std::time::Duration::from_secs(self.timeout_secs.unwrap_or(120))
+        // generous ceiling: slow Apple Event queries on large mailboxes can
+        // legitimately take a while when Mail is busy indexing
+        std::time::Duration::from_secs(self.timeout_secs.unwrap_or(300))
     }
 }
 

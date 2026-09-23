@@ -1,12 +1,13 @@
 //! Rust↔Swift protocol conformance: every bridge method in the tool registry
-//! must be registered in the Swift dispatcher, and vice versa.
+//! must be registered in the Swift dispatcher (or implemented by the
+//! standalone crawler process for index.*), and vice versa.
 
 use std::path::PathBuf;
 
 fn swift_sources() -> Vec<PathBuf> {
-    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("swift/Sources/BiteBridge");
+    let base = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("swift/Sources");
     let mut out = Vec::new();
-    let mut stack = vec![dir];
+    let mut stack = vec![base];
     while let Some(d) = stack.pop() {
         if let Ok(entries) = std::fs::read_dir(&d) {
             for e in entries.flatten() {
@@ -31,9 +32,17 @@ fn registry_methods_exist_in_swift_and_no_strays() {
         .collect();
     let combined = sources.join("\n");
 
-    // every Rust registry method is registered in Swift
+    // Every Rust registry method is implemented in Swift: helper methods via
+    // d.register(...), index.* methods by the standalone bite-crawl process
+    // (manifest const in BiteCrawlCore).
     let mut missing = Vec::new();
     for tool in bite_core::tools() {
+        if tool.method.starts_with("index.") {
+            if !combined.contains(tool.method) {
+                missing.push(tool.method.to_string());
+            }
+            continue;
+        }
         let needle = format!("d.register(\"{}\")", tool.method);
         if !combined.contains(&needle) {
             missing.push(needle);
@@ -44,8 +53,8 @@ fn registry_methods_exist_in_swift_and_no_strays() {
         "registry methods missing in Swift: {missing:?}"
     );
 
-    // no stray registered methods that the registry doesn't know about
-    // (sys.* handlers are infrastructure, everything else must be mapped)
+    // No stray registered helper methods that the registry doesn't know
+    // about. (sys.* is infrastructure; index.* lives in the crawler process.)
     let mut strays = Vec::new();
     for src in &sources {
         for line in src.lines() {
@@ -53,7 +62,7 @@ fn registry_methods_exist_in_swift_and_no_strays() {
                 let rest = &line[idx + "d.register(\"".len()..];
                 if let Some(end) = rest.find('"') {
                     let method = &rest[..end];
-                    if method.starts_with("sys.") {
+                    if method.starts_with("sys.") || method.starts_with("index.") {
                         continue;
                     }
                     if bite_core::tools().iter().all(|t| t.method != method) {

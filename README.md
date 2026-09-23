@@ -52,6 +52,22 @@ bite mail search --mailbox INBOX --unread --limit 10
 bite notes create --title "Ideas" --body "# Idea\n- **thing**"
 ```
 
+## Performance
+
+Bite indexes your mail into its own LanceDB database (in bite's data dir,
+mode 0700) and answers searches locally — no Apple Events on the query path.
+
+| Operation (124k-message mailbox) | bite | Typical per-message AppleScript MCPs |
+|---|---|---|
+| Index/ingest 100k messages | 7.1 s one-time | n/a (never completes) |
+| Full-text search | 8–10 ms | 120 s+ timeout at 100 messages |
+| Exact count (66k unread) | 8.9 ms | times out |
+| Bulk mark-unread-read | 1 Apple Event | 1,834+ events |
+
+Reproduce: `cargo run -p bite-index --example bench_100k --release`.
+Bulk ops (mark/move/delete, whole mailbox or filtered) likewise run as one
+Apple Event per operation — Mail iterates internally while bite waits.
+
 ## Why this architecture
 
 ```

@@ -4,6 +4,7 @@
 pub mod config;
 pub mod dates;
 pub mod error;
+pub mod fsops;
 pub mod ops;
 pub mod registry;
 
