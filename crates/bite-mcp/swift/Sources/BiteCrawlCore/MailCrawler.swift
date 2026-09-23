@@ -94,8 +94,11 @@ public enum MailCrawler {
         dataDir().appendingPathComponent("crawl-state.json")
     }
 
-    /// Methods the crawl process implements (conformance-checked by CI).
-    public static let supportedIndexMethods = ["index.crawl", "index.crawl_cancel", "index.crawl_status"]
+    /// Methods the index layer implements (conformance-checked by CI).
+    public static let supportedIndexMethods = [
+        "index.crawl", "index.crawl_cancel", "index.crawl_status",
+        "index.bulk_mark", "index.bulk_move", "index.bulk_delete", "index.search",
+    ]
 
     public static func writeBatch(staging: URL, jobID: String, seq: Int, records: [CrawlRecord]) {
         let path = staging.appendingPathComponent("\(jobID)-\(seq).jsonl")
