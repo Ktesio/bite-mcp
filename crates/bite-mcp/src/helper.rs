@@ -74,6 +74,10 @@ fn install_from(src: &PathBuf, stable: &PathBuf) -> Result<PathBuf, BridgeError>
         bite_core::fsops::ensure_private_dir(parent)
             .map_err(|e| BridgeError::spawn(e.to_string()))?;
     }
+    // preserve the binary (and its TCC identity) when content is unchanged
+    if path_exists_with_same_content(src, stable) {
+        return Ok(stable.clone());
+    }
     std::fs::copy(src, stable).map_err(|e| BridgeError::spawn(format!("copy helper: {e}")))?;
     set_exec(stable);
     adhoc_sign(stable);
@@ -139,6 +143,13 @@ fn compile_on_demand(stable: &PathBuf) -> Result<PathBuf, BridgeError> {
         return Err(BridgeError::spawn("swift build produced no bite-helper"));
     }
     install_from(&built, stable)
+}
+
+fn path_exists_with_same_content(src: &PathBuf, dst: &PathBuf) -> bool {
+    dst.exists()
+        && std::fs::read(src)
+            .map(|a| a == std::fs::read(dst).unwrap_or_default())
+            .unwrap_or(false)
 }
 
 fn set_exec(path: &PathBuf) {

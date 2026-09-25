@@ -13,8 +13,8 @@ use serde_json::{json, Value};
 use crate::helper::BridgeHandle;
 
 static INDEX: Mutex<Option<bite_index::EntityIndex>> = Mutex::new(None);
-/// Process-level guard: auto-refresh spawns at most one crawl per run.
-static AUTO_REFRESHED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Epoch-ms of the last crawl spawn attempt (auto-refresh or explicit).
+static LAST_SPAWN_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 fn dir() -> std::path::PathBuf {
     bite_core::config::data_dir().join("index.lance")
@@ -201,11 +201,17 @@ fn search_params_to_query(params: &Value) -> bite_index::SearchQuery {
     }
 }
 
-/// Mail search served from the entity index. Returns None when the index has
-/// no Mail rows yet (caller falls back to the live Apple Events path).
+/// Mail search served from the entity index (fast path). Returns None when
+/// the caller should fall back to the live Apple Events path (index has no
+/// Mail rows at all — never crawled). When the index exists but a crawl is
+/// still filling it, serves from the index and/or degrades to a SHORT live
+/// attempt with instant "indexing in progress" feedback instead of hanging.
 pub fn try_mail_search(params: &Value) -> Option<Result<Value, BiteError>> {
     let mail_rows = mail_rows_present()?;
     if mail_rows == 0 {
+        // never crawled: kick the crawler once (cooldown-guarded), then let
+        // the caller decide — MCP falls back to live with a short budget.
+        auto_refresh_if_stale();
         return None;
     }
     let mut q = search_params_to_query(params);
@@ -235,6 +241,24 @@ pub fn try_mail_search(params: &Value) -> Option<Result<Value, BiteError>> {
             "note": "served from the entity index — exact count, no Apple Events",
         }))
     }))
+}
+
+/// Instant, non-blocking response for agents querying Mail while the index
+/// is still being built and the live Apple Events path is slow/unavailable.
+pub fn not_ready_response(why: &str) -> Value {
+    let state = crawl_state();
+    json!({
+        "source": "not_ready",
+        "messages": [],
+        "indexing": {
+            "state": state.get("state").and_then(|v| v.as_str()).unwrap_or("unknown"),
+            "processed": state.get("processed").and_then(|v| v.as_i64()).unwrap_or(0),
+            "found": state.get("found").and_then(|v| v.as_i64()).unwrap_or(0),
+            "alive": crawl_running(),
+        },
+        "why": why,
+        "hint": "Mail indexing is still in progress. Searches may be slow or empty until it completes — poll index_status, or retry in a few minutes. You can still use mail_messages_get for a specific message id.",
+    })
 }
 
 /// Unified cross-app search (local tool).
@@ -271,21 +295,34 @@ pub fn is_local_tool(name: &str) -> bool {
     LOCAL_TOOLS.contains(&name)
 }
 
-/// Mail search fast path — returns Some(result) when served from the index.
+/// Mail search fast path — returns Some(result) when served from the index
+/// or when an instant not-ready response should be given; None means fall
+/// back to the normal live helper call with the standard timeout.
 pub fn try_search_local(params: &Value) -> Option<Result<Value, BiteError>> {
     auto_refresh_if_stale();
     try_mail_search(params)
 }
 
-/// Kick the crawler when the index is stale and no crawl is running. Fires
-/// at most once per control-plane process.
+/// Self-healing: if the index is stale/never built and no crawler runs,
+/// respawn it — at most once per 15 minutes (cooldown), from any process.
 fn auto_refresh_if_stale() {
-    if AUTO_REFRESHED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+    const COOLDOWN_MS: u64 = 15 * 60 * 1000;
+    let now_ms = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let last = LAST_SPAWN_MS.load(std::sync::atomic::Ordering::SeqCst);
+    if now_ms.saturating_sub(last) < COOLDOWN_MS {
         return;
     }
+    LAST_SPAWN_MS.store(now_ms, std::sync::atomic::Ordering::SeqCst);
+
     let state = crawl_state();
-    let is_running =
-        state.get("state").and_then(|v| v.as_str()) == Some("running") && crawl_running();
+    let state_str = state
+        .get("state")
+        .and_then(|v| v.as_str())
+        .unwrap_or("never_run");
+    let is_running = state_str == "running" && crawl_running();
     if is_running {
         return;
     }
@@ -298,13 +335,12 @@ fn auto_refresh_if_stale() {
         .and_then(|v| v.as_str())
         .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
         .map(|t| {
-            SystemTime::now()
-                .duration_since(t.into())
-                .map(|d| d.as_secs())
-                .unwrap_or(0)
+            let t_ms = t.timestamp_millis() as u64;
+            now_ms.saturating_sub(t_ms)
         })
         .unwrap_or(u64::MAX);
-    if stale / 3600 >= hours {
+    // never_run → immediately useful; otherwise refresh once stale
+    if state_str == "never_run" || stale / 3600 >= hours {
         let _ = spawn_crawl(&json!({}));
     }
 }

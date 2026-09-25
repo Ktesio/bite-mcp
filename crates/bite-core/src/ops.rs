@@ -15,6 +15,24 @@ pub fn run(
     run_with_config(bridge, tool_name, params, &Config::load())
 }
 
+/// Explicit per-call timeout (shorter budgets for Mail live fallbacks).
+pub fn run_with_timeout(
+    bridge: &Bridge,
+    tool_name: &str,
+    params: serde_json::Value,
+    timeout: std::time::Duration,
+) -> Result<serde_json::Value, BridgeError> {
+    run_with_config(
+        bridge,
+        tool_name,
+        params,
+        &Config {
+            timeout_secs: Some(timeout.as_secs()),
+            ..Config::load()
+        },
+    )
+}
+
 pub fn run_with_config(
     bridge: &Bridge,
     tool_name: &str,

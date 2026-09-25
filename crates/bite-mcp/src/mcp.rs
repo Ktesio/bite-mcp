@@ -119,8 +119,10 @@ fn handle_request(state: &ServerState, method: &str, params: &Value) -> Result<V
             let name = params.get("name").and_then(|n| n.as_str()).unwrap_or("");
             let args = params.get("arguments").cloned().unwrap_or(json!({}));
             if name == "mail_messages_search" {
-                // fast path: entity index (falls back to live Apple Events
-                // automatically when the index has no Mail rows yet)
+                // fast path: entity index (milliseconds, exact counts).
+                // When the index has no Mail rows yet, degrade to a SHORT
+                // live attempt — instant "indexing in progress" feedback
+                // instead of hanging the caller for minutes.
                 match crate::index::try_mail_search(&args) {
                     Some(Ok(value)) => {
                         return Ok(json!({
@@ -130,7 +132,35 @@ fn handle_request(state: &ServerState, method: &str, params: &Value) -> Result<V
                         }));
                     }
                     Some(Err(e)) => return Err(err(-32000, e.render())),
-                    None => {} // fall through to live path
+                    None => {
+                        let mut handle = state.handle.lock().unwrap();
+                        let bridge = handle
+                            .get()
+                            .map_err(|e| err(-32000, bite_core::BiteError::from(e).render()))?;
+                        let short = std::time::Duration::from_secs(45);
+                        match bite_core::ops::run_with_timeout(bridge, name, args.clone(), short) {
+                            Ok(value) => {
+                                let mut value = value;
+                                value["source"] = json!("live");
+                                value["index_hint"] = json!("served via live Apple Events (slow) — the entity index is still being built; retry soon for instant results");
+                                return Ok(json!({
+                                    "content": [ { "type": "text", "text": serde_json::to_string_pretty(&value).unwrap_or_default() } ],
+                                    "structuredContent": value,
+                                    "isError": false,
+                                }));
+                            }
+                            Err(e) if e.code == "timeout" => {
+                                return Ok(json!({
+                                    "content": [ { "type": "text", "text": serde_json::to_string_pretty(&crate::index::not_ready_response("live Apple Events timed out — Mail is busy")).unwrap_or_default() } ],
+                                    "structuredContent": crate::index::not_ready_response("live Apple Events timed out — Mail is busy"),
+                                    "isError": false,
+                                }));
+                            }
+                            Err(e) => {
+                                return Err(err(-32000, bite_core::BiteError::from(e).render()))
+                            }
+                        }
+                    }
                 }
             }
             if crate::index::is_local_tool(name) {
