@@ -175,6 +175,11 @@ public enum MailAE {
         return v < 0 ? nil : Int(v)
     }
 
+    /// Probe: can this process read basic Mail data? (doctor/diagnostics)
+    public static func probeMailAccounts(target: NSAppleEventDescriptor, timeoutSeconds: Int32) -> Int? {
+        count(everySpec(want: cAccount, from: nil), target: target, timeoutSeconds: timeoutSeconds)
+    }
+
     /// "every <class> of <container>" specifier.
     public static func everySpec(want: FourCharCode, from: NSAppleEventDescriptor?) -> NSAppleEventDescriptor {
         let seld = NSAppleEventDescriptor(descriptorType: typeAbsoluteOrdinalD, bytes: unsafeBytes(of: kAEAll), length: 4)!
