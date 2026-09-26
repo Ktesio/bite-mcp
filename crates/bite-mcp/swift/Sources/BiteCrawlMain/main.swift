@@ -24,6 +24,15 @@ var setJunk: Bool?
 var it = Array(CommandLine.arguments.dropFirst()).makeIterator()
 while let arg = it.next() {
     switch arg {
+    case "--probe-mail":
+        // Doctor diagnostic: can THIS binary send Mail Apple Events?
+        guard let target = MailAE.mailTarget() else {
+            print("{\"mail_automation\": \"mail_not_running\"}"); exit(0)
+        }
+        let n = MailAE.probeMailAccounts(target: target, timeoutSeconds: 15)
+        let verdict = (n != nil && n! > 0) ? "authorized" : "denied_or_empty"
+        print("{\"mail_automation\": \"\(verdict)\", \"accounts\": \(n ?? -1)}")
+        exit(0)
     case "--window-days": windowDays = Int(it.next() ?? "") ?? 30
     case "--mailbox": mailboxFilter = it.next()
     case "--no-body": storeBody = false
@@ -73,20 +82,22 @@ if let op = bulkOp {
 }
 
 // ── crawl mode ──
+// runJob writes its own state (incl. diagnostics); this callback only
+// mirrors progress to stdout for attached debugging.
 MailCrawler.runJob(jobID: jobID, windowDays: windowDays, storeBody: storeBody, mailboxFilter: mailboxFilter) { state, processed, found in
-    MailCrawler.writeState(jobID: jobID, state: state, processed: processed, found: found, window: nil)
+    FileHandle.standardError.write(Data("[progress] \(state) processed=\(processed) found=\(found)\n".utf8))
 }
 
 if mirrors, !CrawlState.shared.isCancelled {
     let staging = MailCrawler.stagingDir()
-    var seq = 0
-    Mirrors.calendar(staging: staging, jobID: jobID, seq: &seq) { _, p, f in
+    let seq = SeqCounter(0)
+    Mirrors.calendar(staging: staging, jobID: jobID, seq: seq) { _, p, f in
         MailCrawler.writeState(jobID: jobID, state: "running", processed: p, found: f, window: "mirrors:calendar")
     }
-    Mirrors.reminders(staging: staging, jobID: jobID, seq: &seq) { _, p, f in
+    Mirrors.reminders(staging: staging, jobID: jobID, seq: seq) { _, p, f in
         MailCrawler.writeState(jobID: jobID, state: "running", processed: p, found: f, window: "mirrors:reminders")
     }
-    Mirrors.contacts(staging: staging, jobID: jobID, seq: &seq) { _, p, f in
+    Mirrors.contacts(staging: staging, jobID: jobID, seq: seq) { _, p, f in
         MailCrawler.writeState(jobID: jobID, state: "running", processed: p, found: f, window: "mirrors:contacts")
     }
 }

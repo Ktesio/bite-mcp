@@ -122,6 +122,28 @@ pub fn run(fix: bool, probe: bool) -> Result<i32, bite_core::BiteError> {
         }
     }
 
+    // ── Crawler Mail-automation identity ──
+    // bite-crawl is a separate binary with its own TCC identity: Mail may be
+    // granted to the helper but denied to the crawler (silent empty results).
+    let crawl_bin = bite_core::config::data_dir().join("bin").join("bite-crawl");
+    if crawl_bin.exists() {
+        let out = std::process::Command::new(&crawl_bin)
+            .arg("--probe-mail")
+            .output();
+        match out {
+            Ok(o) => {
+                let text = String::from_utf8_lossy(&o.stdout);
+                let authorized = text.contains("authorized");
+                status_line(authorized, "crawler Mail automation");
+                if !authorized {
+                    println!("        {YELLOW}{}{RESET}", text.trim());
+                    println!("        {DIM}→ approve the Mail automation prompt once, from your terminal{RESET}");
+                }
+            }
+            Err(_) => println!("        {DIM}probe failed to run{RESET}"),
+        }
+    }
+
     // ── Agent clients ──
     println!();
     for spec in clients::clients() {

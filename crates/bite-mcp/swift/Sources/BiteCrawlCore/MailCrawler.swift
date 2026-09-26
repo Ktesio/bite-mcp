@@ -154,24 +154,26 @@ public enum MailCrawler {
             edge -= 10 * day
         }
 
-        // Mail's AE layer can stay saturated for long stretches; retry the
-        // account enumeration with backoff before giving up (user-approved:
-        // background progress may take a long time).
+        // Mail's AE layer can stay saturated for many hours; keep retrying
+        // for ~24 h before giving up (the control plane auto-respawns later
+        // if we ever do exit). Heartbeat the state file every attempt.
         var accounts: [(name: String, spec: NSAppleEventDescriptor)]? = nil
-        for attempt in 0..<30 {
+        let maxWaitAttempts = 1440  // 24 h at 60 s intervals
+        for attempt in 0..<maxWaitAttempts {
             if CrawlState.shared.isCancelled { break }
             if let list = MailAE.accountList(target: target) {
                 accounts = list
                 break
             }
+            let diag = lastError.map { " — \($0)" } ?? ""
             writeState(jobID: jobID, state: "waiting_mail", processed: 0, found: 0,
-                       window: "attempt \(attempt + 1)/30 — Mail is busy or unresponsive")
+                       window: "attempt \(attempt + 1)/\(maxWaitAttempts)\(diag)")
             progress("waiting_mail", 0, 0)
             Thread.sleep(forTimeInterval: 60)
         }
         guard let accounts else {
             writeState(jobID: jobID, state: "failed", processed: 0, found: 0,
-                       window: "Mail unresponsive for 30 attempts")
+                       window: "Mail unresponsive for 24 h")
             progress("failed", 0, 0)
             return
         }

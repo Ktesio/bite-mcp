@@ -36,6 +36,9 @@ let keyAELogicalTerms = AEKeyword(0x7465726d)           // 'term'
 let kErrNumberKeyword = AEKeyword(0x6572726e)           // 'errn'
 let kErrStringKeyword = AEKeyword(0x65727273)           // 'errs'
 
+/// Last Apple Event error for diagnostics.
+public var lastError: String?
+
 // Classes / event ids / operators
 let cMessage = FourCharCode(0x6d737367)                 // 'mssg'
 let cMailbox = FourCharCode(0x6d627870)                 // 'mbxp'
@@ -169,8 +172,16 @@ public enum MailAE {
         event.setParam(everyOrWhoseSpec, forKeyword: keyDirectObject)
         var rtyp = typeSInt32D.bigEndian
         event.setParam(NSAppleEventDescriptor(descriptorType: typeTypeD, bytes: &rtyp, length: 4)!, forKeyword: keyRequestedType)
-        guard let reply = try? event.sendEvent(timeout: TimeInterval(timeoutSeconds)) else { return nil }
-        if reply.forKeyword(kErrNumberKeyword) != nil { return nil }
+        guard let reply = try? event.sendEvent(timeout: TimeInterval(timeoutSeconds)) else {
+            lastError = "sendEvent threw"
+            return nil
+        }
+        if let errn = reply.forKeyword(kErrNumberKeyword)?.int32Value {
+            let errs = reply.forKeyword(kErrStringKeyword)?.stringValue ?? ""
+            lastError = "AE error \(errn): \(errs)"
+            return nil
+        }
+        lastError = nil
         let v = reply.int32Value
         return v < 0 ? nil : Int(v)
     }

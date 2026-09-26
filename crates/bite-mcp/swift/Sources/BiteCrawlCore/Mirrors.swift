@@ -7,15 +7,41 @@ import Foundation
 import EventKit
 import Contacts
 
+public final class SeqCounter {
+    public var value: Int
+    public init(_ v: Int = 0) { value = v }
+}
+
 public enum Mirrors {
-    public static func write(_ records: [CrawlRecord], staging: URL, jobID: String, seq: inout Int) {
+    public static func write(_ records: [CrawlRecord], staging: URL, jobID: String, seq: SeqCounter) {
         guard !records.isEmpty else { return }
-        MailCrawler.writeBatch(staging: staging, jobID: jobID, seq: seq, records: records)
-        seq += 1
+        MailCrawler.writeBatch(staging: staging, jobID: jobID, seq: seq.value, records: records)
+        seq.value += 1
+    }
+
+    /// Run `body` on a background queue with a hard deadline. Detached
+    /// processes have no UI: a pending TCC dialog would otherwise block a
+    /// mirror forever. Returns nil on timeout (mirror skipped this pass).
+    @discardableResult
+    static func withDeadline<T>(_ seconds: TimeInterval, _ name: String,
+                                progress: @escaping (String, Int, Int) -> Void,
+                                body: @escaping () -> T) -> T? {
+        let sem = DispatchSemaphore(value: 0)
+        var result: T?
+        DispatchQueue.global().async {
+            result = body()
+            sem.signal()
+        }
+        if sem.wait(timeout: .now() + seconds) == .success {
+            return result
+        }
+        progress("mirror_skipped:\(name)", CrawlState.shared.snapshot.processed, CrawlState.shared.snapshot.found)
+        return nil
     }
 
     /// Calendar mirror: events from -90d to +180d across all calendars.
-    public static func calendar(staging: URL, jobID: String, seq: inout Int, progress: @escaping (String, Int, Int) -> Void) {
+    public static func calendar(staging: URL, jobID: String, seq: SeqCounter, progress: @escaping (String, Int, Int) -> Void) {
+        withDeadline(300, "calendar", progress: progress, body: {
         let store = EKEventStore()
         let sem = DispatchSemaphore(value: 0)
         if #available(macOS 14.0, *) {
@@ -48,16 +74,18 @@ public enum Mirrors {
                 props: e.location.map { "{\"location\":\(jsonString($0))}" }
             ))
             if records.count >= 500 {
-                write(records, staging: staging, jobID: jobID, seq: &seq)
+                write(records, staging: staging, jobID: jobID, seq: seq)
                 records.removeAll(keepingCapacity: true)
             }
         }
-        write(records, staging: staging, jobID: jobID, seq: &seq)
+        write(records, staging: staging, jobID: jobID, seq: seq)
         progress("running", CrawlState.shared.snapshot.processed, events.count)
+        })
     }
 
     /// Reminders mirror: all lists, completed + incomplete.
-    public static func reminders(staging: URL, jobID: String, seq: inout Int, progress: @escaping (String, Int, Int) -> Void) {
+    public static func reminders(staging: URL, jobID: String, seq: SeqCounter, progress: @escaping (String, Int, Int) -> Void) {
+        withDeadline(300, "reminders", progress: progress, body: {
         let store = EKEventStore()
         let sem = DispatchSemaphore(value: 0)
         if #available(macOS 14.0, *) {
@@ -95,16 +123,18 @@ public enum Mirrors {
                 props: nil
             ))
             if records.count >= 500 {
-                write(records, staging: staging, jobID: jobID, seq: &seq)
+                write(records, staging: staging, jobID: jobID, seq: seq)
                 records.removeAll(keepingCapacity: true)
             }
         }
-        write(records, staging: staging, jobID: jobID, seq: &seq)
+        write(records, staging: staging, jobID: jobID, seq: seq)
         progress("running", CrawlState.shared.snapshot.processed, all.count)
+        })
     }
 
     /// Contacts mirror: all contacts in all containers.
-    public static func contacts(staging: URL, jobID: String, seq: inout Int, progress: @escaping (String, Int, Int) -> Void) {
+    public static func contacts(staging: URL, jobID: String, seq: SeqCounter, progress: @escaping (String, Int, Int) -> Void) {
+        withDeadline(300, "contacts", progress: progress, body: {
         let store = CNContactStore()
         let sem = DispatchSemaphore(value: 0)
         store.requestAccess(for: .contacts) { _, _ in sem.signal() }
@@ -140,12 +170,13 @@ public enum Mirrors {
                 priority: nil, props: nil
             ))
             if records.count >= 500 {
-                write(records, staging: staging, jobID: jobID, seq: &seq)
+                write(records, staging: staging, jobID: jobID, seq: seq)
                 records.removeAll(keepingCapacity: true)
             }
         }
-        write(records, staging: staging, jobID: jobID, seq: &seq)
+        write(records, staging: staging, jobID: jobID, seq: seq)
         progress("running", CrawlState.shared.snapshot.processed, records.count)
+        })
     }
 
     static func jsonString(_ s: String) -> String {
