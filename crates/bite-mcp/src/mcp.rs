@@ -163,6 +163,18 @@ fn handle_request(state: &ServerState, method: &str, params: &Value) -> Result<V
                     }
                 }
             }
+            if crate::index::is_live_mail_tool(name) {
+                // instant deferred response while Mail indexing runs — the
+                // agent re-calls with force_live: true if it really wants to
+                // pay the slow live price
+                if let Some(deferred) = crate::index::gate_live_mail(name, &args) {
+                    return Ok(json!({
+                        "content": [ { "type": "text", "text": serde_json::to_string_pretty(&deferred).unwrap_or_default() } ],
+                        "structuredContent": deferred,
+                        "isError": false,
+                    }));
+                }
+            }
             if crate::index::is_local_tool(name) {
                 let mut handle = state.handle.lock().unwrap();
                 let value = crate::index::run_local_unwrapped(name, &args, Some(&mut handle))

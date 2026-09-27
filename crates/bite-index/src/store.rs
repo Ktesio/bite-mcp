@@ -147,11 +147,33 @@ pub enum IndexError {
     Other(String),
 }
 
+/// Held only for the duration of a write. Multiple bite processes (MCP
+/// sessions, CLI) may hold read access concurrently; this lock just
+/// serializes writers and releases as soon as the write completes.
+pub struct WriteGuard {
+    _file: std::fs::File,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum LockError {
+    #[error("another bite process is writing the index")]
+    Busy,
+    #[error("io: {0}")]
+    Io(#[from] std::io::Error),
+}
+
+impl From<LockError> for IndexError {
+    fn from(e: LockError) -> Self {
+        match e {
+            LockError::Busy => IndexError::Other(e.to_string()),
+            LockError::Io(io) => IndexError::Io(io),
+        }
+    }
+}
+
 pub struct EntityIndex {
     dir: PathBuf,
     rt: tokio::runtime::Runtime,
-    /// exclusive writer lock, held for the store's lifetime
-    _lock: std::fs::File,
     conn: Connection,
 }
 
@@ -186,20 +208,10 @@ pub fn sql_str(s: &str) -> String {
 }
 
 impl EntityIndex {
-    /// Open (creating if needed) with an exclusive writer lock. The lock file
-    /// lives inside the private data dir.
+    /// Open (creating if needed). Does NOT take the writer lock — reads never
+    /// block other bite processes; writers acquire the lock per operation.
     pub fn open(dir: &Path) -> Result<Self, IndexError> {
         bite_core::fsops::ensure_private_dir(dir)?;
-        let lock_path = dir.join(".writer.lock");
-        let lock_file = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(&lock_path)?;
-        fs2::FileExt::try_lock_exclusive(&lock_file).map_err(|e| {
-            IndexError::Other(format!("another bite process is writing the index ({e})"))
-        })?;
-        bite_core::fsops::tighten_file(&lock_path).ok();
 
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
@@ -211,15 +223,24 @@ impl EntityIndex {
         let index = Self {
             dir: dir.to_path_buf(),
             rt,
-            _lock: lock_file,
             conn,
         };
         index.rt.block_on(async { index.ensure_table().await })?;
         Ok(index)
     }
 
-    pub fn dir(&self) -> &Path {
-        &self.dir
+    /// Acquire the short-lived writer lock (non-blocking). Callers treat
+    /// LockError::Busy as "skip this round, retry later".
+    pub fn lock_writer(&self) -> Result<WriteGuard, LockError> {
+        let path = self.dir.join(".writer.lock");
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&path)?;
+        fs2::FileExt::try_lock_exclusive(&file).map_err(|_| LockError::Busy)?;
+        bite_core::fsops::tighten_file(&path)?;
+        Ok(WriteGuard { _file: file })
     }
 
     async fn ensure_table(&self) -> Result<(), IndexError> {
@@ -399,6 +420,7 @@ impl EntityIndex {
     /// Destroy all rows and indexes (the `index wipe` command). The store
     /// remains usable afterwards.
     pub fn wipe(&self) -> Result<(), IndexError> {
+        let _guard = self.lock_writer()?;
         self.rt.block_on(async {
             let names = self.conn.table_names().execute().await?;
             if names.iter().any(|n| n == TABLE) {

@@ -1,6 +1,7 @@
 //! Command dispatch: CLI verbs → registry params → ops → output.
 
 use std::io::Write;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use bite_core::error::cli_error;
 use bite_core::{ops, BiteError};
@@ -13,7 +14,10 @@ use crate::cli::{
 use crate::helper::BridgeHandle;
 use crate::{doctor, mcp, setup};
 
+static FORCE_LIVE: AtomicBool = AtomicBool::new(false);
+
 pub fn run(cli: crate::cli::Cli) -> i32 {
+    FORCE_LIVE.store(cli.force_live, Ordering::SeqCst);
     match dispatch(cli) {
         Ok(code) => code,
         Err(e) => {
@@ -645,6 +649,12 @@ fn dispatch(cli: crate::cli::Cli) -> Result<i32, BiteError> {
 
 /// Execute a registry tool through the bridge; retries once if the helper died.
 fn call(handle: &mut BridgeHandle, tool: &str, params: Value) -> Result<Value, BiteError> {
+    // instant deferred feedback while Mail indexing runs (force_live bypasses)
+    if crate::index::is_live_mail_tool(tool) {
+        if let Some(deferred) = crate::index::gate_live_mail(tool, &params) {
+            return Ok(deferred);
+        }
+    }
     match ops::run(handle.get()?, tool, params.clone()) {
         Ok(v) => Ok(v),
         Err(e) if e.code == "helper_exited" => {

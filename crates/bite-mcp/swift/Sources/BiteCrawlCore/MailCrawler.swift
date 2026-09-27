@@ -269,7 +269,7 @@ public enum MailCrawler {
         func collect(_ record: CrawlRecord) {
             batchRecords.append(record)
             indexed += 1
-            if batchRecords.count >= 500 {
+            if batchRecords.count >= 200 {
                 writeBatch(staging: staging, jobID: jobID, seq: batchSeq, records: batchRecords)
                 batchSeq += 1
                 batchRecords.removeAll(keepingCapacity: true)
@@ -288,6 +288,11 @@ public enum MailCrawler {
                     failures += 1
                     Thread.sleep(forTimeInterval: min(300, Double(10 * failures)))
                     continue
+                }
+                // gentle pacing: small pause every few messages keeps Mail's
+                // event queue responsive for the user's interactive Mail use
+                if scanned % 5 == 0 {
+                    Thread.sleep(forTimeInterval: 0.15)
                 }
                 guard let record = read(position) else {
                     failures += 1
@@ -312,6 +317,9 @@ public enum MailCrawler {
                     Thread.sleep(forTimeInterval: min(300, Double(10 * failures)))
                     continue
                 }
+                if scanned % 5 == 0 {
+                    Thread.sleep(forTimeInterval: 0.15)
+                }
                 guard let record = read(position) else {
                     failures += 1
                     position -= 1
@@ -332,5 +340,13 @@ public enum MailCrawler {
             writeBatch(staging: staging, jobID: jobID, seq: batchSeq, records: batchRecords)
         }
         return (scanned, indexed)
+    }
+
+    /// Synchronous crawl used by the detached `bite-crawl` worker process.
+    public static func runCrawlWorker(windowDays: Int, storeBody: Bool, mailboxFilter: String?,
+                                      progress: @escaping (String, Int, Int) -> Void) {
+        let jobID = "crawl-\(Int(Date().timeIntervalSince1970))"
+        writeState(jobID: jobID, state: "running", processed: 0, found: 0, window: nil)
+        runJob(jobID: jobID, windowDays: windowDays, storeBody: storeBody, mailboxFilter: mailboxFilter, progress: progress)
     }
 }

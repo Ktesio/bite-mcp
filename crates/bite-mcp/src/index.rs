@@ -45,6 +45,23 @@ pub fn with_index<T>(
 pub fn ingest_pending() -> Result<Value, BiteError> {
     let staging = staging();
     with_index(|index| {
+        // writer lock is per-ingest: a busy lock just means another bite
+        // process is ingesting — skip and let the next poll pick it up
+        match index.lock_writer() {
+            Err(bite_index::LockError::Busy) => {
+                crate::jobs::set_pending_batches(pending_batches());
+                return Ok(
+                    json!({ "skipped": "writer busy", "pending_batches": pending_batches() }),
+                );
+            }
+            Err(e) => {
+                return Err(BiteError::from(BridgeError::new(
+                    "index_lock_error",
+                    e.to_string(),
+                )));
+            }
+            Ok(_guard) => {}
+        }
         let (batches, rows) = bite_index::ingest_staged(index, &staging)
             .map_err(|e| BridgeError::new("index_ingest_failed", e.to_string()))?;
         crate::jobs::set_pending_batches(0);
@@ -293,6 +310,56 @@ pub const LOCAL_TOOLS: &[&str] = &[
 
 pub fn is_local_tool(name: &str) -> bool {
     LOCAL_TOOLS.contains(&name)
+}
+
+/// Live Mail tools that read Mail one Apple Event at a time — these are the
+/// ones that hang while Mail is saturated or a crawl is hammering it.
+pub const LIVE_MAIL_TOOLS: &[&str] = &[
+    "mail_accounts",
+    "mail_mailboxes_list",
+    "mail_messages_search",
+    "mail_message_get",
+    "mail_reply",
+    "mail_forward",
+    "mail_move",
+    "mail_mark",
+    "mail_delete",
+    "mail_attachment_save",
+];
+
+pub fn is_live_mail_tool(name: &str) -> bool {
+    LIVE_MAIL_TOOLS.contains(&name)
+}
+
+/// Returns Some(deferred-response) when a live Mail call should get instant
+/// feedback instead of blocking behind a slow/unready path. None → run live.
+pub fn gate_live_mail(name: &str, params: &Value) -> Option<Value> {
+    if !is_live_mail_tool(name) {
+        return None;
+    }
+    if params
+        .get("force_live")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
+        return None; // caller accepts the slow live price
+    }
+    let rows = mail_rows_present().unwrap_or(0);
+    if rows > 0 && !crawl_running() {
+        return None; // index ready, Mail calm — run live normally
+    }
+    let state = crawl_state();
+    Some(json!({
+        "deferred": true,
+        "tool": name,
+        "reason": if rows == 0 { "index_not_ready" } else { "indexing_in_progress" },
+        "indexing": {
+            "state": state.get("state").and_then(|v| v.as_str()).unwrap_or("unknown"),
+            "processed": state.get("processed").and_then(|v| v.as_i64()).unwrap_or(0),
+            "found": state.get("found").and_then(|v| v.as_i64()).unwrap_or(0),
+        },
+        "hint": "Mail indexing is still in progress — live Mail queries compete with it and may take minutes. Either retry soon (the index will serve this instantly), or re-call with force_live: true to accept a slow live query.",
+    }))
 }
 
 /// Mail search fast path — returns Some(result) when served from the index
