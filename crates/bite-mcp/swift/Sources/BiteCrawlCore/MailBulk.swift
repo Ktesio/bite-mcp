@@ -27,6 +27,21 @@ public struct BulkSelection {
 }
 
 public enum MailBulk {
+    /// Synchronous bulk run used by `bite-crawl --bulk-worker`.
+    public static func runBulkWorker(op: String, accountName: String?, mailboxName: String,
+                                     toMailboxName: String?, selection: BulkSelection,
+                                     setRead: Bool?, setFlagged: Bool?, setJunk: Bool?,
+                                     writeState: @escaping (String, Int) -> Void) {
+        guard let target = MailAE.mailTarget() else {
+            writeState("failed", 0)
+            return
+        }
+        run(jobID: "bulk-\(Int(Date().timeIntervalSince1970))", op: op, accountName: accountName,
+            mailboxName: mailboxName, toMailboxName: toMailboxName, selection: selection,
+            setRead: setRead, setFlagged: setFlagged, setJunk: setJunk,
+            target: target, writeState: writeState)
+    }
+
     /// Wait until Mail answers a trivial Apple Event. Returns false when the
     /// patience budget (attempts × interval) runs out.
     public static func waitHealthy(target: NSAppleEventDescriptor, attempts: Int, interval: TimeInterval,

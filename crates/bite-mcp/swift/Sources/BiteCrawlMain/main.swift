@@ -1,13 +1,19 @@
-// bite-crawl — standalone background indexer + bulk operator.
+// bite-crawl — detached worker process.
 //
-// Spawned detached by the Rust control plane. Modes:
-//   (default)  crawl: 30-day Mail window + 10-day backfill batches + mirrors
-//   --bulk-op  one-shot bulk Mail operation (mark/move/delete)
+// Spawned by the Rust control plane (`bite index rebuild`, bulk tools).
+// Modes:
+//   --crawl-worker              30-day Mail window + 10-day backfill + mirrors
+//   --bulk-worker --bulk-op …   one-shot bulk Mail operation
+//
+// ALL Mail Apple Events are sent from THIS process's helper child
+// (bite-helper), whose TCC identity the user has already approved at the
+// stable install path. The parent `bite` process never touches Mail.
 
 import Foundation
 import BiteCrawlCore
 
 // ── args ──
+var workerMode = "crawl"
 var windowDays = 30
 var mailboxFilter: String?
 var storeBody = true
@@ -16,7 +22,7 @@ var bulkOp: String?
 var bulkMailbox = "INBOX"
 var bulkToMailbox: String?
 var bulkAccount: String?
-var selection = BulkSelection()
+var bulkSelection = BulkSelection()
 var setRead: Bool?
 var setFlagged: Bool?
 var setJunk: Bool?
@@ -24,25 +30,18 @@ var setJunk: Bool?
 var it = Array(CommandLine.arguments.dropFirst()).makeIterator()
 while let arg = it.next() {
     switch arg {
-    case "--probe-mail":
-        // Doctor diagnostic: can THIS binary send Mail Apple Events?
-        guard let target = MailAE.mailTarget() else {
-            print("{\"mail_automation\": \"mail_not_running\"}"); exit(0)
-        }
-        let n = MailAE.probeMailAccounts(target: target, timeoutSeconds: 15)
-        let verdict = (n != nil && n! > 0) ? "authorized" : "denied_or_empty"
-        print("{\"mail_automation\": \"\(verdict)\", \"accounts\": \(n ?? -1)}")
-        exit(0)
+    case "--crawl-worker": workerMode = "crawl"
+    case "--bulk-worker": workerMode = "bulk"
     case "--window-days": windowDays = Int(it.next() ?? "") ?? 30
     case "--mailbox": mailboxFilter = it.next()
     case "--no-body": storeBody = false
     case "--no-mirrors": mirrors = false
-    case "--bulk-op": bulkOp = it.next()
+    case "--bulk-op": bulkOp = it.next() ?? "mark"
     case "--bulk-mailbox": bulkMailbox = it.next() ?? "INBOX"
     case "--to-mailbox": bulkToMailbox = it.next()
     case "--bulk-account": bulkAccount = it.next()
-    case "--unread": selection.unread = true
-    case "--older-than-days": selection.olderThanDays = Int(it.next() ?? "")
+    case "--unread": bulkSelection.unread = true
+    case "--older-than-days": bulkSelection.olderThanDays = Int(it.next() ?? "")
     case "--set-read": setRead = Bool(it.next() ?? "true") ?? true
     case "--set-flagged": setFlagged = Bool(it.next() ?? "true") ?? true
     case "--set-junk": setJunk = Bool(it.next() ?? "true") ?? true
@@ -50,55 +49,47 @@ while let arg = it.next() {
     }
 }
 
-let jobID = "bulk-\(Int(Date().timeIntervalSince1970))"
-MailCrawler.writeState(jobID: jobID, state: "running", processed: 0, found: 0, window: nil)
+let jobID = workerMode + "-\(Int(Date().timeIntervalSince1970))"
+let progress: (String, Int, Int) -> Void = { state, processed, found in
+    MailCrawler.writeState(jobID: jobID, state: state, processed: processed, found: found, window: nil)
+    FileHandle.standardError.write(Data("[worker] \(state) processed=\(processed) found=\(found)\n".utf8))
+}
 
-if let op = bulkOp {
-    // ── bulk mode ──
-    guard let target = MailAE.mailTarget() else {
-        MailCrawler.writeState(jobID: jobID, state: "failed", processed: 0, found: 0, window: nil)
-        exit(1)
-    }
-    let ok = MailBulk.waitHealthy(
-        target: target,
-        attempts: 1440, interval: 60,          // ~24 h of patience
-        isCancelled: { CrawlState.shared.isCancelled },
-        progress: { note in
-            MailCrawler.writeState(jobID: jobID, state: "waiting_mail", processed: 0, found: 0, window: note)
-        }
-    )
-    guard ok else {
-        MailCrawler.writeState(jobID: jobID, state: "failed", processed: 0, found: 0,
-                               window: "Mail unresponsive for 24 h")
-        exit(1)
-    }
-    MailBulk.run(jobID: jobID, op: op, accountName: bulkAccount, mailboxName: bulkMailbox,
-                 toMailboxName: bulkToMailbox, selection: selection,
-                 setRead: setRead, setFlagged: setFlagged, setJunk: setJunk,
-                 target: target) { state, count in
-        MailCrawler.writeState(jobID: jobID, state: state, processed: count, found: 0, window: nil)
-    }
+// ── signal handling: stop cleanly on cancel ──
+var termSource: DispatchSourceSignal?
+let signalQueue = DispatchQueue.global()
+termSource = DispatchSource.makeSignalSource(signal: SIGTERM, queue: signalQueue)
+termSource?.setEventHandler {
+    CrawlState.shared.stop()
+    MailCrawler.writeState(jobID: jobID, state: "cancelled", processed: CrawlState.shared.snapshot.processed, found: CrawlState.shared.snapshot.found, window: nil)
     exit(0)
 }
+termSource?.resume()
+signal(SIGTERM, SIG_IGN)
 
-// ── crawl mode ──
-// runJob writes its own state (incl. diagnostics); this callback only
-// mirrors progress to stdout for attached debugging.
-MailCrawler.runJob(jobID: jobID, windowDays: windowDays, storeBody: storeBody, mailboxFilter: mailboxFilter) { state, processed, found in
-    FileHandle.standardError.write(Data("[progress] \(state) processed=\(processed) found=\(found)\n".utf8))
-}
+// ── run ──
+MailCrawler.writeState(jobID: jobID, state: "running", processed: 0, found: 0, window: nil)
 
-if mirrors, !CrawlState.shared.isCancelled {
-    let staging = MailCrawler.stagingDir()
-    let seq = SeqCounter(0)
-    Mirrors.calendar(staging: staging, jobID: jobID, seq: seq) { _, p, f in
-        MailCrawler.writeState(jobID: jobID, state: "running", processed: p, found: f, window: "mirrors:calendar")
+switch workerMode {
+case "bulk":
+    MailBulk.runBulkWorker(
+        op: bulkOp ?? "mark", accountName: bulkAccount, mailboxName: bulkMailbox,
+        toMailboxName: bulkToMailbox, selection: bulkSelection,
+        setRead: setRead, setFlagged: setFlagged, setJunk: setJunk
+    ) { state, count in
+        progress(state, count, 0)
     }
-    Mirrors.reminders(staging: staging, jobID: jobID, seq: seq) { _, p, f in
-        MailCrawler.writeState(jobID: jobID, state: "running", processed: p, found: f, window: "mirrors:reminders")
+case "crawl":
+    MailCrawler.runCrawlWorker(windowDays: windowDays, storeBody: storeBody, mailboxFilter: mailboxFilter, progress: progress)
+    if !CrawlState.shared.isCancelled && mirrors {
+        let staging = MailCrawler.stagingDir()
+        let seq = SeqCounter(0)
+        Mirrors.calendar(staging: staging, jobID: jobID, seq: seq, progress: progress)
+        Mirrors.reminders(staging: staging, jobID: jobID, seq: seq, progress: progress)
+        Mirrors.contacts(staging: staging, jobID: jobID, seq: seq, progress: progress)
     }
-    Mirrors.contacts(staging: staging, jobID: jobID, seq: seq) { _, p, f in
-        MailCrawler.writeState(jobID: jobID, state: "running", processed: p, found: f, window: "mirrors:contacts")
-    }
+    progress("done", CrawlState.shared.snapshot.processed, CrawlState.shared.snapshot.found)
+default:
+    break
 }
 exit(0)

@@ -227,14 +227,14 @@ pub static TOOLS: &[Tool] = &[
         ]),
 
     // ─── Mail ───────────────────────────────────────────────────────────────
-    t("mail_accounts", App::Mail, "mail.accounts", "List configured mail accounts.", &[]),
+    t("mail_accounts", App::Mail, "mail.accounts", "List configured mail accounts. Returns fast deferred feedback while indexing runs unless force_live.", ps![ParamSpec::opt("force_live", ParamKind::Bool, "accept a slow live query during indexing")]),
     t("mail_mailboxes_list", App::Mail, "mail.mailboxes",
         "List mailboxes (with unread counts).",
         ps![ParamSpec::opt("account", ParamKind::Str, "account name filter")]),
     t("mail_messages_search", App::Mail, "mail.messages_search",
-        "Search messages in a mailbox, newest first (scan-capped; `truncated` flag is honest). Message bodies are not included — use mail_get_message.",
+        "Search messages in a mailbox, newest first. Served from the entity index (instant) once indexing completes; while indexing runs, returns fast deferred feedback unless force_live. Message bodies are not included — use mail_message_get.",
         ps![
-            ParamSpec::opt("mailbox", ParamKind::Str, "mailbox name, default INBOX"),
+            ParamSpec::opt("force_live", ParamKind::Bool, "accept a slow live Apple Events query even while indexing is in progress"),
             ParamSpec::opt("account", ParamKind::Str, "account name filter"),
             ParamSpec::opt("from", ParamKind::Str, "sender substring"),
             ParamSpec::opt("to", ParamKind::Str, "recipient substring"),

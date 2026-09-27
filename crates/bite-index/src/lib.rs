@@ -2,7 +2,10 @@ pub mod store;
 
 use std::path::Path;
 
-pub use store::{EntityIndex, Hit, IndexStats, IngestStats, Record, SearchQuery, SearchResult};
+pub use store::{
+    EntityIndex, Hit, IndexStats, IngestStats, LockError, Record, SearchQuery, SearchResult,
+    WriteGuard,
+};
 
 /// Ingest every un-ingested `*.jsonl` batch in the staging dir (deleting each
 /// file on success — merge-insert makes re-ingest idempotent). Returns the

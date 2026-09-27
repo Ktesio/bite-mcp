@@ -15,6 +15,10 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub json: bool,
 
+    /// Accept slow live Apple Events queries even while Mail indexing runs
+    #[arg(long, global = true)]
+    pub force_live: bool,
+
     #[command(subcommand)]
     pub cmd: Cmd,
 }
