@@ -92,7 +92,7 @@ pub fn status() -> Result<Value, BiteError> {
             "pending_batches": pending_batches(),
             "crawl": {
                 "state": crawl_state(),
-                "alive": crawl_pid().map(pid_alive).unwrap_or(false),
+                "alive": live_crawler_pid().is_some(),
             },
             "jobs": crate::jobs::snapshot(),
         }))
@@ -145,8 +145,31 @@ fn crawl_pid() -> Option<i32> {
     std::fs::read_to_string(path).ok()?.trim().parse().ok()
 }
 
+/// Does this pid actually belong to a bite-crawl process? Pids get recycled;
+/// kill(2)-alive alone would let us "cancel" (or be deadlocked by) some
+/// unrelated process that inherited the number.
+fn crawl_process_matches(pid: i32) -> bool {
+    std::process::Command::new("ps")
+        .args(["-o", "comm=", "-p", &pid.to_string()])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).to_lowercase().contains("bite-crawl"))
+        .unwrap_or(false)
+}
+
+/// Pid from the pidfile only while a live bite-crawl owns it. Stale or
+/// recycled entries are removed so they can neither block spawns (permanent
+/// already_running) nor get signalled.
+fn live_crawler_pid() -> Option<i32> {
+    let pid = crawl_pid()?;
+    if pid_alive(pid) && crawl_process_matches(pid) {
+        return Some(pid);
+    }
+    let _ = std::fs::remove_file(bite_core::config::data_dir().join("crawl.pid"));
+    None
+}
+
 fn crawl_running() -> bool {
-    crawl_pid().map(pid_alive).unwrap_or(false)
+    live_crawler_pid().is_some()
 }
 
 /// Spawn the detached crawler. Safe to call when one already runs (returns
@@ -407,9 +430,16 @@ fn auto_refresh_if_stale() {
         })
         .unwrap_or(u64::MAX);
     // never_run → immediately useful; otherwise refresh once stale
-    if state_str == "never_run" || stale / 3600 >= hours {
+    if state_str == "never_run" || stale_after_ms(stale, hours) {
         let _ = spawn_crawl(&json!({}));
     }
+}
+
+/// `updated_at` age in MILLISECONDS vs a refresh threshold in hours.
+/// Keep the units explicit: an epoch-ms ÷ 3600 here once fired auto-refresh
+/// ~86 s in instead of after 24 h.
+fn stale_after_ms(age_ms: u64, threshold_hours: u64) -> bool {
+    age_ms / 3_600_000 >= threshold_hours
 }
 
 // ── tool entry points ──
@@ -424,8 +454,8 @@ fn cancel(handle: Option<&mut BridgeHandle>) -> Result<Value, BiteError> {
     if let Some(h) = handle {
         let _ = h.get()?;
     }
-    match crawl_pid() {
-        Some(pid) if pid_alive(pid) => {
+    match live_crawler_pid() {
+        Some(pid) => {
             let ok = std::process::Command::new("kill")
                 .args([&pid.to_string()])
                 .status()
@@ -433,8 +463,7 @@ fn cancel(handle: Option<&mut BridgeHandle>) -> Result<Value, BiteError> {
                 .unwrap_or(false);
             Ok(json!({ "cancelled": ok, "pid": pid }))
         }
-        Some(_) => Ok(json!({ "cancelled": false, "note": "no running crawler" })),
-        None => Ok(json!({ "cancelled": false, "note": "no crawler pidfile" })),
+        None => Ok(json!({ "cancelled": false, "note": "no running crawler" })),
     }
 }
 
@@ -531,20 +560,33 @@ fn bulk_spawn(name: &str, params: &Value) -> Result<Value, BiteError> {
     let flagged = params.get("flagged").and_then(|v| v.as_bool());
     let junk = params.get("junk").and_then(|v| v.as_bool());
     let older = params.get("older_than_days").and_then(|v| v.as_i64());
+    if let Some(d) = older {
+        if d <= 0 {
+            return Err(BiteError::from(BridgeError::new(
+                "invalid_params",
+                "older_than_days must be a positive integer",
+            )));
+        }
+    }
 
     let selection_label = {
         let mut parts: Vec<String> = Vec::new();
-        if let Some(true) = unread {
-            parts.push("unread".into());
-        }
-        if let Some(true) = flagged {
-            parts.push("flagged".into());
-        }
-        if let Some(true) = junk {
-            parts.push("junk".into());
+        if let Some(u) = unread {
+            parts.push(if u { "unread".into() } else { "read".into() });
         }
         if let Some(d) = older {
             parts.push(format!("older than {d} days"));
+        }
+        if op == "mark" {
+            if let Some(u) = unread {
+                parts.push(format!("set read={}", !u));
+            }
+            if let Some(f) = flagged {
+                parts.push(format!("set flagged={f}"));
+            }
+            if let Some(j) = junk {
+                parts.push(format!("set junk={j}"));
+            }
         }
         if parts.is_empty() {
             "all messages".to_string()
@@ -580,12 +622,30 @@ fn bulk_spawn(name: &str, params: &Value) -> Result<Value, BiteError> {
     if let Some(account) = params.get("account").and_then(|v| v.as_str()) {
         cmd.args(["--bulk-account", account]);
     }
-    if unread == Some(true) {
-        cmd.arg("--unread");
+    // `unread` is a SELECTION filter in both directions: true → unread
+    // messages, false → already-read messages (an explicit false must not
+    // silently widen to "all messages").
+    if let Some(u) = unread {
+        cmd.args(["--unread", if u { "true" } else { "false" }]);
     }
-    if older.is_some() {
-        if let Some(d) = older {
-            cmd.args(["--older-than-days", &d.to_string()]);
+    if let Some(d) = older {
+        cmd.args(["--older-than-days", &d.to_string()]);
+    }
+    if op == "mark" {
+        // forward the setters — these were parsed into the preview label
+        // only before, so bulk-mark silently no-op'd
+        if let Some(u) = unread {
+            // selecting unread marks them read; selecting read marks unread
+            let read_value = (!u).to_string();
+            cmd.args(["--set-read", read_value.as_str()]);
+        }
+        if let Some(f) = flagged {
+            let v = f.to_string();
+            cmd.args(["--set-flagged", v.as_str()]);
+        }
+        if let Some(j) = junk {
+            let v = j.to_string();
+            cmd.args(["--set-junk", v.as_str()]);
         }
     }
     let child = cmd
@@ -607,4 +667,21 @@ fn bulk_spawn(name: &str, params: &Value) -> Result<Value, BiteError> {
         "selection": selection_label,
         "note": "running detached — poll job_status; Mail does the iteration internally"
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn staleness_units_are_milliseconds() {
+        // 90 s of age must NOT read as 24 h stale (the old ÷3600 bug fired
+        // auto-refresh ~86 s after every crawl)
+        assert!(!stale_after_ms(90_000, 24));
+        // exactly 24 h old is stale for a 24 h threshold; 23 h is not
+        assert!(stale_after_ms(24 * 3_600_000, 24));
+        assert!(!stale_after_ms(23 * 3_600_000, 24));
+        // never-run sentinel (u64::MAX) is always stale
+        assert!(stale_after_ms(u64::MAX, 24));
+    }
 }

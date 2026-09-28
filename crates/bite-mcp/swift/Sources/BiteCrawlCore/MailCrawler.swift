@@ -7,8 +7,9 @@
 //
 // Mail transport: every read goes through MailAE's serialized NSAppleScript
 // executor (raw Apple Event sending is broken on macOS 27). Message reads
-// fetch `properties` in small index ranges — one bundled get per message,
-// bounded well under Mail's 120 s AppleEvent timeout.
+// fetch one Apple Event per chunk — full `properties` records when bodies
+// are wanted, an explicit 7-property bundle when they are not — bounded
+// well under Mail's 120 s AppleEvent timeout.
 
 import Foundation
 
@@ -49,6 +50,29 @@ public struct CrawlRecord: Codable {
     }
 }
 
+/// Locked box for the not-yet-flushed batch records, so the SIGTERM handler
+/// can flush a partial batch without racing the crawl thread.
+final class PendingBatch {
+    private let lock = NSLock()
+    private var records: [CrawlRecord] = []
+
+    func append(_ r: CrawlRecord) {
+        lock.lock(); records.append(r); lock.unlock()
+    }
+
+    func count() -> Int {
+        lock.lock(); defer { lock.unlock() }
+        return records.count
+    }
+
+    func drain() -> [CrawlRecord] {
+        lock.lock(); defer { lock.unlock() }
+        let out = records
+        records = []
+        return out
+    }
+}
+
 public final class CrawlState {
     public static let shared = CrawlState()
     private let lock = NSLock()
@@ -56,6 +80,7 @@ public final class CrawlState {
     private var processed = 0
     private var found = 0
     private var window: String?
+    private var flushPending: (() -> Void)?
 
     public init() {}
 
@@ -92,6 +117,18 @@ public final class CrawlState {
         lock.lock(); defer { lock.unlock() }
         return window
     }
+
+    /// The walk's partial-batch flusher; invoked by the SIGTERM handler so
+    /// a cancel never strands up to 50 staged records.
+    public func setFlushPending(_ f: (() -> Void)?) {
+        lock.lock(); defer { lock.unlock() }
+        flushPending = f
+    }
+
+    public func runFlushPending() {
+        lock.lock(); let f = flushPending; lock.unlock()
+        f?()
+    }
 }
 
 public enum MailCrawler {
@@ -119,18 +156,52 @@ public enum MailCrawler {
         "index.bulk_mark", "index.bulk_move", "index.bulk_delete", "index.search",
     ]
 
-    public static func writeBatch(staging: URL, jobID: String, seq: Int, records: [CrawlRecord]) {
-        let path = staging.appendingPathComponent("\(jobID)-\(seq).jsonl")
+    /// Serializes state-file writes: the SIGTERM handler and the crawl
+    /// thread both call writeState, and unsynchronized remove+move could
+    /// once leave NO state file behind.
+    private static let stateLock = NSLock()
+
+    /// Atomic replace: tmp → destination whether or not the destination
+    /// already exists. Caller owns any serialization.
+    static func atomicReplace(tmp: URL, dst: URL) -> Bool {
+        let fm = FileManager.default
+        do {
+            if fm.fileExists(atPath: dst.path) {
+                _ = try fm.replaceItemAt(dst, withItemAt: tmp)
+            } else {
+                try fm.moveItem(at: tmp, to: dst)
+            }
+            return true
+        } catch {
+            lastError = "atomic replace \(dst.lastPathComponent): \(error.localizedDescription)"
+            return false
+        }
+    }
+
+    /// Batch files are born-0600 (createFile with attributes BEFORE content
+    /// lands), tmp names are unique, and the destination is replaced
+    /// atomically. Returns false (with lastError) instead of swallowing
+    /// failures — a lost batch must not look like a successful crawl.
+    @discardableResult
+    public static func writeBatch(staging: URL, jobID: String, seq: Int, records: [CrawlRecord]) -> Bool {
         var lines = ""
         for r in records {
             if let data = try? JSONEncoder().encode(r), let line = String(data: data, encoding: .utf8) {
                 lines += line + "\n"
             }
         }
-        let tmp = path.appendingPathExtension("tmp")
-        try? lines.data(using: .utf8)?.write(to: tmp)
-        try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: tmp.path)
-        try? FileManager.default.moveItem(at: tmp, to: path)
+        guard let data = lines.data(using: .utf8) else {
+            lastError = "batch encode failed"
+            return false
+        }
+        let path = staging.appendingPathComponent("\(jobID)-\(seq).jsonl")
+        let tmp = staging.appendingPathComponent("\(jobID)-\(seq).\(ProcessInfo.processInfo.globallyUniqueString).tmp")
+        guard FileManager.default.createFile(atPath: tmp.path, contents: data,
+                                             attributes: [.posixPermissions: 0o600]) else {
+            lastError = "cannot create batch tmp \(tmp.path)"
+            return false
+        }
+        return atomicReplace(tmp: tmp, dst: path)
     }
 
     public static func writeState(jobID: String, state: String, processed: Int, found: Int, window: String?) {
@@ -143,23 +214,33 @@ public enum MailCrawler {
             "window": window ?? NSNull(),
             "updated_at": ISO8601DateFormatter().string(from: Date()),
         ]
+        guard let data = try? JSONSerialization.data(withJSONObject: dict, options: [.prettyPrinted]) else { return }
+        stateLock.lock()
+        defer { stateLock.unlock() }
         let path = statePath()
-        if let data = try? JSONSerialization.data(withJSONObject: dict, options: [.prettyPrinted]) {
-            let tmp = path.appendingPathExtension("tmp")
-            try? data.write(to: tmp)
-            try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: tmp.path)
-            try? FileManager.default.removeItem(at: path)
-            try? FileManager.default.moveItem(at: tmp, to: path)
+        let tmp = path.appendingPathExtension("\(ProcessInfo.processInfo.globallyUniqueString).tmp")
+        guard FileManager.default.createFile(atPath: tmp.path, contents: data,
+                                             attributes: [.posixPermissions: 0o600]) else { return }
+        _ = atomicReplace(tmp: tmp, dst: path)
+    }
+
+    /// Remove stale *.tmp droppings from a previous crashed run before this
+    /// job starts staging.
+    public static func sweepStaleTmp(at staging: URL) {
+        let fm = FileManager.default
+        guard let items = try? fm.contentsOfDirectory(at: staging, includingPropertiesForKeys: nil) else { return }
+        for f in items where f.lastPathComponent.hasSuffix(".tmp") {
+            try? fm.removeItem(at: f)
         }
     }
 
     public static func runJob(jobID: String, windowDays: Int, storeBody: Bool, mailboxFilter: String?,
-                              seq: SeqCounter, progress: @escaping (String, Int, Int) -> Void) {
+                              seq: SeqCounter, progress: @escaping (String, Int, Int) -> Void) -> String {
         let state = CrawlState.shared
         guard MailAE.mailRunning() else {
-            writeState(jobID: jobID, state: "failed", processed: 0, found: 0, window: nil)
+            writeState(jobID: jobID, state: "failed", processed: 0, found: 0, window: "Mail is not running")
             progress("failed", 0, 0)
-            return
+            return "failed"
         }
 
         let now = Int64(Date().timeIntervalSince1970 * 1000)
@@ -192,22 +273,33 @@ public enum MailCrawler {
             writeState(jobID: jobID, state: "failed", processed: 0, found: 0,
                        window: "Mail unresponsive for 24 h")
             progress("failed", 0, 0)
-            return
+            return "failed"
         }
 
-        var targets: [(account: String, name: String)] = []
+        var targets: [(account: String, index: Int, name: String)] = []
+        var anyListSucceeded = false
         for acct in accounts {
             guard let boxes = MailAE.mailboxList(account: acct) else { continue }
-            for boxName in boxes {
+            anyListSucceeded = true
+            for (idx, boxName) in boxes.enumerated() {
                 if let filter = mailboxFilter,
                    boxName.caseInsensitiveCompare(filter) != .orderedSame { continue }
-                targets.append((account: acct, name: boxName))
+                targets.append((account: acct, index: idx + 1, name: boxName))
             }
         }
+        guard anyListSucceeded else {
+            let diag = lastError ?? "unknown error"
+            writeState(jobID: jobID, state: "failed", processed: 0, found: 0,
+                       window: "cannot list mailboxes — \(diag)")
+            progress("failed", 0, 0)
+            return "failed"
+        }
+
+        let staging = stagingDir()
+        sweepStaleTmp(at: staging)
 
         var processed = 0
         var found = 0
-        let staging = stagingDir()
         let windowLabel = { (w: CrawlWindow) -> String in "\(w.fromMs)-\(w.toMs)" }
 
         for window in windows {
@@ -216,9 +308,19 @@ public enum MailCrawler {
                 let label = windowLabel(window)
                 writeState(jobID: jobID, state: "running", processed: processed, found: found, window: label)
                 progress("running", processed, found)
-                let r = crawlMailbox(jobID: jobID, account: t.account, mailbox: t.name,
+                let r = crawlMailbox(jobID: jobID, account: t.account, mailboxAt: t.index, mailbox: t.name,
                                      window: window, includeContent: storeBody,
                                      staging: staging, seq: seq, progress: progress)
+                if let err = r.transportError {
+                    // a transport failure is a failed JOB, not a skipped
+                    // mailbox — silently walking on would report done with
+                    // holes in the index
+                    writeState(jobID: jobID, state: "failed",
+                               processed: processed + r.scanned, found: found + r.indexed,
+                               window: err)
+                    progress("failed", processed + r.scanned, found + r.indexed)
+                    return "failed"
+                }
                 processed += r.scanned
                 found += r.indexed
                 CrawlState.shared.tally(processedAdd: r.scanned, foundAdd: r.indexed)
@@ -230,127 +332,197 @@ public enum MailCrawler {
         let finalState = state.isCancelled ? "cancelled" : "done"
         writeState(jobID: jobID, state: finalState, processed: processed, found: found, window: nil)
         progress(finalState, processed, found)
+        return finalState
     }
 
     /// Walk one mailbox for one date window in index-range chunks. Order
-    /// detected from the first chunk's dated rows; the walk stops at the
-    /// first window edge crossed.
-    static func crawlMailbox(jobID: String, account: String, mailbox: String,
+    /// detected from dated samples (resampled against the far end when the
+    /// first pair is ambiguous); the walk stops at the first confirmed
+    /// window edge. A failed chunk retries the SAME range — transient
+    /// errors never silently drop messages.
+    static func crawlMailbox(jobID: String, account: String, mailboxAt: Int, mailbox: String,
                              window: CrawlWindow, includeContent: Bool,
                              staging: URL, seq: SeqCounter,
-                             progress: @escaping (String, Int, Int) -> Void) -> (scanned: Int, indexed: Int) {
-        guard let total = MailAE.countMessages(mailbox: mailbox, account: account), total > 0 else {
-            return (0, 0)
+                             progress: @escaping (String, Int, Int) -> Void)
+        -> (scanned: Int, indexed: Int, transportError: String?) {
+        guard let initialTotal = MailAE.countMessages(mailboxAt: mailboxAt, account: account) else {
+            return (0, 0, "count failed for \(mailbox) — \(lastError ?? "unknown error")")
         }
+        guard initialTotal > 0 else { return (0, 0, nil) }
+        var total = initialTotal
 
-        // 12 full records per script keeps each execution (~3-5 s/message on
-        // the big INBOX) well inside the script's own 240 s event timeout.
+        // 12 records per script keeps each execution (~3-5 s/message on the
+        // big INBOX) well inside the script's own 240 s event timeout.
         let chunkSize = 12
         let walkLimit = min(total, 20_000)
+        let baseLabel = "\(window.fromMs)-\(window.toMs)"
 
-        var batchRecords: [CrawlRecord] = []
+        let pending = PendingBatch()
+        let flushLock = NSLock()
+
+        func flush() -> Bool {
+            flushLock.lock(); defer { flushLock.unlock() }
+            let recs = pending.drain()
+            guard !recs.isEmpty else { return true }
+            let ok = writeBatch(staging: staging, jobID: jobID, seq: seq.value, records: recs)
+            if ok {
+                seq.value += 1
+            }
+            return ok
+        }
+        CrawlState.shared.setFlushPending { _ = flush() }
+
         var scanned = 0
         var indexed = 0
+        var skipped = 0
         var edgeCrossed = false
+        var writeFailed = false
 
-        func flush() {
-            guard !batchRecords.isEmpty else { return }
-            writeBatch(staging: staging, jobID: jobID, seq: seq.value, records: batchRecords)
-            seq.value += 1
-            batchRecords.removeAll(keepingCapacity: true)
+        func label() -> String {
+            skipped > 0 ? "\(baseLabel) skipped=\(skipped)" : baseLabel
         }
 
-        func collect(_ record: CrawlRecord) {
-            batchRecords.append(record)
+        /// fresh state file + stderr line (keeps updated_at alive through
+        /// backoff windows and carries the skipped counter)
+        func heartbeat() {
+            writeState(jobID: jobID, state: "running",
+                       processed: CrawlState.shared.snapshot.processed,
+                       found: CrawlState.shared.snapshot.found,
+                       window: label())
+            progress("running", CrawlState.shared.snapshot.processed, CrawlState.shared.snapshot.found)
+        }
+
+        /// Returns false on a batch-write failure (the walk must stop).
+        func collect(_ record: CrawlRecord) -> Bool {
+            pending.append(record)
             indexed += 1
             // Small staged batches keep the index fresh while Mail is slow;
             // the JSONL handoff tolerates any record count per file.
-            if batchRecords.count >= 50 {
-                flush()
+            if pending.count() >= 50 {
+                return flush()
             }
-        }
-
-        func inWindow(_ ms: Int64) -> Bool {
-            ms >= window.fromMs && ms < window.toMs
-        }
-
-        // Process one chunk's rows in walk order. Returns true when the
-        // window's lower edge was crossed.
-        func process(_ rows: [NSAppleEventDescriptor?], descending: Bool) -> Bool {
-            for row in descending ? rows.reversed() : rows {
-                scanned += 1
-                guard let record = MailAE.recordFromProperties(row, account: account, mailbox: mailbox,
-                                                               includeContent: includeContent),
-                      let ms = record.start_ms else { continue }
-                if ms < window.fromMs { return true }
-                if inWindow(ms) { collect(record) }
-            }
-            return false
+            return true
         }
 
         func rowDate(_ row: NSAppleEventDescriptor?) -> Date? {
             row?.forKeyword(MailAE.kwDateSent)?.dateValue
         }
 
+        // Process one chunk's rows in walk order. Returns true when the
+        // window edge is CONFIRMED: more than 2 stale rows (one mis-dated
+        // row must not end the whole window walk).
+        @discardableResult
+        func process(_ rows: [NSAppleEventDescriptor?], descending: Bool) -> Bool {
+            let edgeTolerance = 2
+            var stale = 0
+            for row in descending ? rows.reversed() : rows {
+                scanned += 1
+                guard let record = MailAE.recordFromRow(row, account: account, mailbox: mailbox,
+                                                        includeContent: includeContent),
+                      let ms = record.start_ms else {
+                    skipped += 1
+                    continue
+                }
+                if ms < window.fromMs {
+                    stale += 1
+                    skipped += 1
+                    if stale > edgeTolerance { return true }
+                    continue
+                }
+                if ms < window.toMs, !collect(record) {
+                    writeFailed = true
+                }
+            }
+            return false
+        }
+
         // First chunk doubles as the order probe (positions shift as mail
         // arrives, but ids dedupe at ingest, so overlap is harmless).
-        let probeEnd = min(chunkSize, walkLimit)
-        guard let probe = MailAE.readProperties(mailbox: mailbox, account: account, start: 1, end: probeEnd,
+        let probeEnd = min(chunkSize, walkLimit, total)
+        guard let probe = MailAE.readProperties(mailboxAt: mailboxAt, account: account, start: 1, end: probeEnd,
                                                 includeContent: includeContent), !probe.isEmpty else {
-            return (0, 0)
+            CrawlState.shared.setFlushPending(nil)
+            return (0, 0, "probe read failed for \(mailbox) — \(lastError ?? "unknown error")")
         }
-        var newestFirst = true
-        if probe.count >= 2, let d1 = rowDate(probe[0]), let d2 = rowDate(probe[1]) {
-            newestFirst = d1 >= d2
+        var newestFirst = MailAE.orderFromSamples(rowDate(probe[0]), probe.count >= 2 ? rowDate(probe[1]) : nil)
+        if newestFirst == nil, total > probeEnd,
+           let lastRows = MailAE.readProperties(mailboxAt: mailboxAt, account: account,
+                                                start: total, end: total, includeContent: includeContent),
+           let lastRow = lastRows.first {
+            // ambiguous first pair — resample against the far end
+            newestFirst = MailAE.orderFromSamples(rowDate(probe[0]), rowDate(lastRow))
         }
+        let newestFirstResolved = newestFirst ?? true
 
-        var plan = MailAE.chunkPlan(total: total, walkLimit: walkLimit, chunkSize: chunkSize, newestFirst: newestFirst)
-        if !newestFirst {
-            plan.removeFirst()  // probe chunk holds the mailbox's oldest rows; the descending walk starts at the far end
-        }
-
-        if newestFirst {
+        let (plan, processProbeFirst) = MailAE.walkPlan(total: total, walkLimit: walkLimit,
+                                                        chunkSize: chunkSize, newestFirst: newestFirstResolved)
+        if processProbeFirst {
             edgeCrossed = process(probe, descending: false)
         }
 
+        var i = processProbeFirst ? 1 : 0  // plan[0] IS the probe range for newest-first walks
         var consecutiveFailures = 0
-        for range in plan {
-            if CrawlState.shared.isCancelled || edgeCrossed || consecutiveFailures >= 3 || indexed >= walkLimit {
-                break
+        while i < plan.count, !CrawlState.shared.isCancelled, !edgeCrossed,
+              consecutiveFailures < 3, !writeFailed, indexed < walkLimit {
+            let range = plan[i]
+            if range.lowerBound > total {
+                i += 1
+                continue
             }
             if !MailAE.healthy() {
                 consecutiveFailures += 1
+                if consecutiveFailures >= 3 { break }
+                heartbeat()
                 Thread.sleep(forTimeInterval: min(60, Double(5 * consecutiveFailures)))
-                continue
+                continue  // retry the same range
             }
-            if let rows = MailAE.readProperties(mailbox: mailbox, account: account, start: range.start, end: range.end,
+            if let rows = MailAE.readProperties(mailboxAt: mailboxAt, account: account,
+                                                start: range.lowerBound, end: range.upperBound,
                                                 includeContent: includeContent) {
                 consecutiveFailures = 0
+                i += 1
                 // gentle pacing: a pause between chunks keeps Mail's event
                 // queue responsive for the user's interactive Mail use
                 Thread.sleep(forTimeInterval: 1)
-                edgeCrossed = process(rows, descending: !newestFirst)
-                progress("running", CrawlState.shared.snapshot.processed, CrawlState.shared.snapshot.found)
+                edgeCrossed = process(rows, descending: !newestFirstResolved)
+                heartbeat()
             } else {
-                consecutiveFailures += 1
-                Thread.sleep(forTimeInterval: min(60, Double(5 * consecutiveFailures)))
+                // refresh the count first: ranges beyond a shrunken mailbox
+                // evaporate instead of counting as transport failures
+                let refreshed = MailAE.countMessages(mailboxAt: mailboxAt, account: account)
+                if let nt = refreshed, nt != total { total = nt }
+                switch MailAE.failureDecision(range: range, refreshedTotal: refreshed,
+                                              consecutiveFailures: consecutiveFailures + 1) {
+                case .advance:
+                    i += 1
+                case .abort:
+                    consecutiveFailures = 3
+                case .retrySame:
+                    consecutiveFailures += 1
+                    heartbeat()
+                    Thread.sleep(forTimeInterval: min(60, Double(5 * consecutiveFailures)))
+                }
             }
         }
-        flush()
-        return (scanned, indexed)
+        CrawlState.shared.setFlushPending(nil)
+        if writeFailed || !flush() {
+            return (scanned, indexed, "batch write failed for \(mailbox) — \(lastError ?? "unknown error")")
+        }
+        return (scanned, indexed, nil)
     }
 
     /// Synchronous crawl used by the detached `bite-crawl` worker process.
-    /// Returns the batch sequence counter so mirror crawls continue the
-    /// same job's numbering instead of colliding with mail batches.
-    @discardableResult
+    /// Returns the terminal state ("done"/"failed"/"cancelled") plus the
+    /// batch sequence counter so mirror crawls continue the same job's
+    /// numbering instead of colliding with mail batches.
     public static func runCrawlWorker(windowDays: Int, storeBody: Bool, mailboxFilter: String?,
-                                      progress: @escaping (String, Int, Int) -> Void) -> SeqCounter {
+                                      progress: @escaping (String, Int, Int) -> Void)
+        -> (state: String, seq: SeqCounter) {
         let jobID = "crawl-\(Int(Date().timeIntervalSince1970))"
         let seq = SeqCounter(0)
         writeState(jobID: jobID, state: "running", processed: 0, found: 0, window: nil)
-        runJob(jobID: jobID, windowDays: windowDays, storeBody: storeBody, mailboxFilter: mailboxFilter,
-               seq: seq, progress: progress)
-        return seq
+        let terminal = runJob(jobID: jobID, windowDays: windowDays, storeBody: storeBody,
+                              mailboxFilter: mailboxFilter, seq: seq, progress: progress)
+        return (terminal, seq)
     }
 }

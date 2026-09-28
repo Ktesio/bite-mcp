@@ -29,6 +29,34 @@ var setRead: Bool?
 var setFlagged: Bool?
 var setJunk: Bool?
 
+func fatalArg(_ msg: String) -> Never {
+    FileHandle.standardError.write(Data("[worker] \(msg)\n".utf8))
+    exit(2)
+}
+
+// job_id stays a var so the SIGTERM handler (registered before arg parsing)
+// can always name a state file even if a signal lands mid-parse.
+var jobID = "crawl-\(Int(Date().timeIntervalSince1970))"
+
+// ── signal handling: register BEFORE parsing/probing so a SIGTERM during
+// arg parsing or --probe-mail hits our handler, not the default disposition ──
+var termSource: DispatchSourceSignal?
+let signalQueue = DispatchQueue.global()
+termSource = DispatchSource.makeSignalSource(signal: SIGTERM, queue: signalQueue)
+termSource?.setEventHandler {
+    CrawlState.shared.stop()
+    // flush any partial batch before reporting the cancel
+    CrawlState.shared.runFlushPending()
+    MailCrawler.writeState(jobID: jobID, state: "cancelled",
+                           processed: CrawlState.shared.snapshot.processed,
+                           found: CrawlState.shared.snapshot.found,
+                           window: CrawlState.shared.currentWindow)
+    exit(0)
+}
+termSource?.resume()
+signal(SIGTERM, SIG_IGN)
+
+// ── parse ──
 var it = Array(CommandLine.arguments.dropFirst()).makeIterator()
 while let arg = it.next() {
     switch arg {
@@ -42,23 +70,52 @@ while let arg = it.next() {
     case "--bulk-mailbox": bulkMailbox = it.next() ?? "INBOX"
     case "--to-mailbox": bulkToMailbox = it.next()
     case "--bulk-account": bulkAccount = it.next()
-    case "--unread": bulkSelection.unread = true
-    case "--older-than-days": bulkSelection.olderThanDays = Int(it.next() ?? "")
-    case "--set-read": setRead = Bool(it.next() ?? "true") ?? true
-    case "--set-flagged": setFlagged = Bool(it.next() ?? "true") ?? true
-    case "--set-junk": setJunk = Bool(it.next() ?? "true") ?? true
+    case "--unread":
+        // explicit true|false: false scopes to already-read messages
+        guard let raw = it.next(), let v = Bool(raw.lowercased()) else {
+            fatalArg("--unread expects true|false")
+        }
+        bulkSelection.unread = v
+    case "--older-than-days":
+        guard let raw = it.next(), let v = Int(raw), v > 0 else {
+            fatalArg("--older-than-days expects a positive integer")
+        }
+        bulkSelection.olderThanDays = v
+    case "--set-read":
+        guard let raw = it.next(), let v = Bool(raw.lowercased()) else {
+            fatalArg("--set-read expects true|false")
+        }
+        setRead = v
+    case "--set-flagged":
+        guard let raw = it.next(), let v = Bool(raw.lowercased()) else {
+            fatalArg("--set-flagged expects true|false")
+        }
+        setFlagged = v
+    case "--set-junk":
+        guard let raw = it.next(), let v = Bool(raw.lowercased()) else {
+            fatalArg("--set-junk expects true|false")
+        }
+        setJunk = v
     case "--probe-mail":
         // Doctor diagnostic: can THIS binary read Mail data through OSA?
-        // (raw Apple Events return silent null replies on macOS 27)
+        // 0 accounts is a configuration state, not a TCC denial — report
+        // it distinctly so doctor doesn't send users permission-chasing.
         let n = MailAE.probeMailAccounts()
-        let verdict = (n != nil && n! > 0) ? "authorized" : "denied_or_empty"
+        let verdict: String
+        switch n {
+        case .some(let c) where c > 0: verdict = "authorized"
+        case .some(let c) where c == 0: verdict = "no_accounts"
+        default: verdict = "denied_or_empty"
+        }
         print("{\"mail_automation\": \"\(verdict)\", \"accounts\": \(n ?? -1)}")
         exit(0)
     default: break
     }
 }
+if workerMode == "bulk" {
+    jobID = "bulk-\(Int(Date().timeIntervalSince1970))"
+}
 
-let jobID = workerMode + "-\(Int(Date().timeIntervalSince1970))"
 let progress: (String, Int, Int) -> Void = { state, processed, found in
     // Re-publish the last activity label instead of nil: coarse progress
     // reports must not clobber the wait-loop's attempt/diagnostic detail.
@@ -66,18 +123,6 @@ let progress: (String, Int, Int) -> Void = { state, processed, found in
                            window: CrawlState.shared.currentWindow)
     FileHandle.standardError.write(Data("[worker] \(state) processed=\(processed) found=\(found)\n".utf8))
 }
-
-// ── signal handling: stop cleanly on cancel ──
-var termSource: DispatchSourceSignal?
-let signalQueue = DispatchQueue.global()
-termSource = DispatchSource.makeSignalSource(signal: SIGTERM, queue: signalQueue)
-termSource?.setEventHandler {
-    CrawlState.shared.stop()
-    MailCrawler.writeState(jobID: jobID, state: "cancelled", processed: CrawlState.shared.snapshot.processed, found: CrawlState.shared.snapshot.found, window: CrawlState.shared.currentWindow)
-    exit(0)
-}
-termSource?.resume()
-signal(SIGTERM, SIG_IGN)
 
 // ── run ──
 MailCrawler.writeState(jobID: jobID, state: "running", processed: 0, found: 0, window: nil)
@@ -92,16 +137,21 @@ case "bulk":
         progress(state, count, 0)
     }
 case "crawl":
-    let seq = MailCrawler.runCrawlWorker(windowDays: windowDays, storeBody: storeBody, mailboxFilter: mailboxFilter, progress: progress)
-    if !CrawlState.shared.isCancelled && mirrors {
-        let staging = MailCrawler.stagingDir()
-        // continue the mail job's batch numbering: restarting at 0 would
-        // collide with (and drop) mail batches already staged
-        Mirrors.calendar(staging: staging, jobID: jobID, seq: seq, progress: progress)
-        Mirrors.reminders(staging: staging, jobID: jobID, seq: seq, progress: progress)
-        Mirrors.contacts(staging: staging, jobID: jobID, seq: seq, progress: progress)
+    let crawl = MailCrawler.runCrawlWorker(windowDays: windowDays, storeBody: storeBody,
+                                           mailboxFilter: mailboxFilter, progress: progress)
+    if crawl.state == "done" {
+        if mirrors {
+            let staging = MailCrawler.stagingDir()
+            // continue the mail job's batch numbering: restarting at 0 would
+            // collide with (and drop) mail batches already staged
+            Mirrors.calendar(staging: staging, jobID: jobID, seq: crawl.seq, progress: progress)
+            Mirrors.reminders(staging: staging, jobID: jobID, seq: crawl.seq, progress: progress)
+            Mirrors.contacts(staging: staging, jobID: jobID, seq: crawl.seq, progress: progress)
+        }
+        // only a genuinely done crawl reports done — never clobber a
+        // terminal failed/cancelled state written by the walk
+        progress("done", CrawlState.shared.snapshot.processed, CrawlState.shared.snapshot.found)
     }
-    progress("done", CrawlState.shared.snapshot.processed, CrawlState.shared.snapshot.found)
 default:
     break
 }
