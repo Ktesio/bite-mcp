@@ -242,8 +242,11 @@ public enum MailAE {
             ranges.reverse()  // descending walk visits the far (newest) piece first
         }
         let probe: ClosedRange<Int>
-        if newestFirst {
-            probe = ranges[0]  // plan[0] IS the probe range
+        if let first = ranges.first, newestFirst {
+            probe = first  // plan[0] IS the probe range
+        } else if newestFirst {
+            // degenerate domain (total<=0 || walkLimit<=0): nothing to walk
+            return (ranges, 1...1, newestFirst)
         } else {
             var end = min(chunkSize, walkLimit, total)
             if end == avoidWidth { end -= 1 }  // the probe reply hits the same ambiguity
@@ -369,16 +372,17 @@ public enum MailAE {
         case abort(reason: String)  // definitive mismatch — abort immediately
     }
 
-    /// Decision after re-validating an index-addressed mailbox. A nil name
-    /// is TRANSIENT (executor busy / watchdog overrun) and shares the
-    /// chunk-failure strike budget; a DIFFERENT name is definitive — the
-    /// enumeration order shifted and continuing would mislabel records.
-    /// Known limitation: nested mailboxes sharing a display name are
+    /// Decision after re-validating an index-addressed mailbox. A nil or
+    /// empty/whitespace name is TRANSIENT (executor busy / watchdog overrun
+    /// / null reply coerced to "") and shares the chunk-failure strike
+    /// budget; a DIFFERENT non-empty name is definitive — the enumeration
+    /// order shifted and continuing would mislabel records. Known
+    /// limitation: nested mailboxes sharing a display name are
     /// indistinguishable here.
     public static func identityDecision(currentName: String?, expected: String, mailboxAt: Int,
                                         account: String, consecutiveFailures: Int,
                                         maxConsecutive: Int = 3) -> IdentityDecision {
-        if let current = currentName {
+        if let current = currentName, !current.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             if current.caseInsensitiveCompare(expected) == .orderedSame { return .verified }
             return .abort(reason: "mailbox \(mailboxAt) in '\(account)' now resolves to '\(current)', expected '\(expected)' — aborting to avoid mislabeled records")
         }

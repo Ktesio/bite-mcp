@@ -141,17 +141,32 @@ public enum MailBulk {
         }
 
         // identity guard before any operation touches an index-resolved
-        // mailbox — a shifted enumeration order would misdirect the op
+        // mailbox — a shifted enumeration order would misdirect the op.
+        // Returns false (state already written) on failure.
         func identityFailure(_ box: (account: String, index: Int, name: String)) -> String? {
-            if let current = MailAE.mailboxName(at: box.index, account: box.account) {
+            if let current = MailAE.mailboxName(at: box.index, account: box.account),
+               !current.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                 if current.caseInsensitiveCompare(box.name) == .orderedSame { return nil }
                 return "mailbox \(box.index) in '\(box.account)' now resolves to '\(current)', expected '\(box.name)' — refusing to run bulk \(op) against a moved target"
             }
             return "couldn't verify identity of mailbox \(box.index) in '\(box.account)' before bulk \(op) — \(lastError ?? "unknown error")"
         }
+        // A nil/empty name is transient (executor busy / watchdog / null
+        // reply): retry twice with a pause before failing the op closed. A
+        // definitive name mismatch still fails immediately.
         func requireIdentity(_ box: (account: String, index: Int, name: String), estimated: Int?) -> Bool {
-            guard let failure = identityFailure(box) else { return true }
-            lastError = failure
+            for attempt in 0...2 {
+                if attempt > 0 { Thread.sleep(forTimeInterval: 3) }
+                if let failure = identityFailure(box) {
+                    lastError = failure
+                    if failure.contains("now resolves to") {
+                        writeState("failed", estimated ?? 0)
+                        return false  // definitive mismatch — no retry
+                    }
+                    continue  // transient — retry
+                }
+                return true
+            }
             writeState("failed", estimated ?? 0)
             return false
         }
@@ -169,11 +184,15 @@ public enum MailBulk {
                 if !ok { failed = err }
             }
             if failed == nil, let flagged = setFlagged {
+                // re-validate before EACH setter: a mid-group enumeration
+                // shift would misdirect setters 2/3
+                guard requireIdentity(src, estimated: estimated) else { return }
                 let (ok, err) = MailAE.setWhose(mailboxAt: src.index, account: src.account, selection: selection,
                                                 property: "flagged status", value: flagged)
                 if !ok { failed = err }
             }
             if failed == nil, let junk = setJunk {
+                guard requireIdentity(src, estimated: estimated) else { return }
                 let (ok, err) = MailAE.setWhose(mailboxAt: src.index, account: src.account, selection: selection,
                                                 property: "junk mail status", value: junk)
                 if !ok { failed = err }

@@ -259,8 +259,16 @@ public enum MailCrawler {
         return atomicReplace(tmp: tmp, dst: path)
     }
 
+    /// Skipped-mailbox counter carried in crawl-state ("skipped",
+    /// additive contract — Rust tolerates it missing; for operators).
+    public static func existingSkippedCount() -> Int {
+        guard let data = try? Data(contentsOf: statePath()),
+              let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else { return 0 }
+        return obj["skipped"] as? Int ?? 0
+    }
+
     public static func writeState(jobID: String, state: String, processed: Int, found: Int,
-                                  window: String?, failures: Int? = nil) {
+                                  window: String?, failures: Int? = nil, skipped: Int? = nil) {
         // once cancellation is armed ONLY the terminal cancelled state may
         // be written: heartbeats must not clobber it, and a post-cancel
         // failure write must not undo a user cancel (auto-respawn treats
@@ -276,9 +284,10 @@ public enum MailCrawler {
             "window": window ?? NSNull(),
             "updated_at": ISO8601DateFormatter().string(from: Date()),
         ]
-        // failures counter: explicit override at terminal writes
-        // (failed → existing+1, done → 0); everything else preserves it
+        // counters: explicit override at terminal writes
+        // (failed → existing+1, done → 0); everything else preserves
         dict["failures"] = failures ?? existingFailureCount()
+        dict["skipped"] = skipped ?? existingSkippedCount()
         guard let data = try? JSONSerialization.data(withJSONObject: dict, options: [.prettyPrinted]) else { return }
         stateLock.lock()
         defer { stateLock.unlock() }
@@ -375,6 +384,7 @@ public enum MailCrawler {
 
         var processed = 0
         var found = 0
+        var skippedMailboxes = 0
         let windowLabel = { (w: CrawlWindow) -> String in "\(w.fromMs)-\(w.toMs)" }
 
         for window in windows {
@@ -390,9 +400,13 @@ public enum MailCrawler {
                     // a transport failure is a failed JOB, not a skipped
                     // mailbox — silently walking on would report done with
                     // holes in the index
+                    let counters = terminalCounters(state: "failed",
+                                                    previousFailures: existingFailureCount(),
+                                                    previousSkipped: existingSkippedCount(),
+                                                    newSkips: skippedMailboxes)
                     writeState(jobID: jobID, state: "failed",
                                processed: processed + r.scanned, found: found + r.indexed,
-                               window: err, failures: existingFailureCount() + 1)
+                               window: err, failures: counters.failures, skipped: counters.skipped)
                     progress("failed", processed + r.scanned, found + r.indexed)
                     return "failed"
                 }
@@ -402,6 +416,7 @@ public enum MailCrawler {
                 if let skip = r.skipReason {
                     // per-mailbox SKIP, not a job failure: the diagnostic
                     // lands in the state window label and the walk moves on
+                    skippedMailboxes += 1
                     writeState(jobID: jobID, state: "running", processed: processed, found: found, window: skip)
                     progress("running", processed, found)
                     continue
@@ -412,8 +427,12 @@ public enum MailCrawler {
         }
 
         let finalState = state.isCancelled ? "cancelled" : "done"
+        let counters = terminalCounters(state: finalState,
+                                        previousFailures: existingFailureCount(),
+                                        previousSkipped: existingSkippedCount(),
+                                        newSkips: skippedMailboxes)
         writeState(jobID: jobID, state: finalState, processed: processed, found: found, window: nil,
-                   failures: finalState == "done" ? 0 : nil)
+                   failures: counters.failures, skipped: counters.skipped)
         progress(finalState, processed, found)
         return finalState
     }
@@ -443,6 +462,33 @@ public enum MailCrawler {
     public static func zeroYieldSkipReason(unreadable: Int, indexed: Int, threshold: Int = 500) -> String? {
         guard unreadable > threshold, indexed == 0 else { return nil }
         return "skipped: zero yield after \(unreadable) unreadable rows"
+    }
+
+    /// Order resolution with far-end resample. Returns the resolved
+    /// direction plus whether it had to DEFAULT (both samples ambiguous) —
+    /// a defaulted order with zero indexed rows later triggers the
+    /// order-undetectable skip, so the flag must reflect the FINAL state:
+    /// a successful far-end resample clears it (the stale-true variant
+    /// falsely skipped resolvable mailboxes).
+    public static func resolveOrder(firstSample: Date?, secondSample: Date?, farEndSample: Date?)
+        -> (newestFirst: Bool, defaulted: Bool) {
+        var order = MailAE.orderFromSamples(firstSample, secondSample)
+        if order == nil { order = MailAE.orderFromSamples(firstSample, farEndSample) }
+        return (order ?? true, order == nil)
+    }
+
+    /// Terminal state-file counters: failed bumps the failure streak
+    /// (drives the Rust respawn backoff), done zeroes it, cancelled
+    /// preserves it; skipped-mailbox counts accumulate for operators.
+    public static func terminalCounters(state: String, previousFailures: Int, previousSkipped: Int, newSkips: Int)
+        -> (failures: Int?, skipped: Int) {
+        let failures: Int?
+        switch state {
+        case "failed": failures = previousFailures + 1
+        case "done": failures = 0
+        default: failures = nil  // cancelled and anything else: preserve
+        }
+        return (failures, previousSkipped + newSkips)
     }
 
     static func crawlMailbox(jobID: String, account: String, mailboxAt: Int, mailbox: String,
@@ -576,17 +622,24 @@ public enum MailCrawler {
                                                 includeContent: includeContent), !probe.isEmpty else {
             return abort(0, 0, "probe read failed for \(mailbox) — \(lastError ?? "unknown error")")
         }
-        var newestFirst = MailAE.orderFromSamples(MailAE.dateFromRow(probe[0]),
-                                                  probe.count >= 2 ? MailAE.dateFromRow(probe[1]) : nil)
-        orderWasDefaulted = (newestFirst == nil)
-        if newestFirst == nil, total > probeRange.upperBound,
+        var secondSample: Date? = nil
+        if probe.count >= 2 { secondSample = MailAE.dateFromRow(probe[1]) }
+        var farEndSample: Date? = nil
+        // far-end resample only pays a read when the first pair is ambiguous
+        if MailAE.orderFromSamples(MailAE.dateFromRow(probe[0]), secondSample) == nil,
+           total > probeRange.upperBound,
            let lastRows = MailAE.readProperties(mailboxAt: mailboxAt, account: account,
                                                 start: total, end: total, includeContent: includeContent),
-           let lastRow = lastRows.first {
-            // ambiguous first pair — resample against the far end
-            newestFirst = MailAE.orderFromSamples(MailAE.dateFromRow(probe[0]), MailAE.dateFromRow(lastRow))
+           !lastRows.isEmpty {
+            farEndSample = MailAE.dateFromRow(lastRows[0])
         }
-        let newestFirstResolved = newestFirst ?? true
+        // resolveOrder recomputes `defaulted` AFTER the resample — a stale
+        // defaulted flag falsely skipped resolvable mailboxes
+        let (newestFirstResolved, orderWasAmbiguous) = MailCrawler.resolveOrder(
+            firstSample: MailAE.dateFromRow(probe[0]),
+            secondSample: secondSample,
+            farEndSample: farEndSample)
+        orderWasDefaulted = orderWasAmbiguous
 
         // re-plan under the resolved order; the probe range only applies to
         // newest-first walks (oldest-first probes are detection-only)

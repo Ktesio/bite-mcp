@@ -171,7 +171,9 @@ fn crawl_process_matches(pid: i32) -> bool {
             .output()
         {
             Ok(o) => {
-                return String::from_utf8_lossy(&o.stdout).to_lowercase().contains("bite-crawl")
+                return String::from_utf8_lossy(&o.stdout)
+                    .to_lowercase()
+                    .contains("bite-crawl")
             }
             Err(_) => continue, // try the next ps location
         }
@@ -506,7 +508,8 @@ fn cancel(handle: Option<&mut BridgeHandle>) -> Result<Value, BiteError> {
                 // write) — a 300 ms check misreported normal exits as
                 // "process survived". Poll up to ~3 s total.
                 let mut survived = true;
-                for _ in 0..12 {                    std::thread::sleep(std::time::Duration::from_millis(250));
+                for _ in 0..12 {
+                    std::thread::sleep(std::time::Duration::from_millis(250));
                     if live_crawler_pid() != Some(pid) {
                         survived = false;
                         break;
@@ -629,11 +632,7 @@ fn bulk_spawn(name: &str, params: &Value) -> Result<Value, BiteError> {
             )));
         }
     }
-    if op == "mark"
-        && read.is_none()
-        && flagged.is_none()
-        && junk.is_none()
-    {
+    if op == "mark" && read.is_none() && flagged.is_none() && junk.is_none() {
         return Err(BiteError::from(BridgeError::new(
             "invalid_params",
             "bulk mark needs at least one of read/flagged/junk to set",

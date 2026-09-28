@@ -95,6 +95,62 @@ final class MailOSATests: XCTestCase {
         }
     }
 
+    func testWalkPlanDegenerateDomainDoesNotCrash() {
+        // total<=0 || walkLimit<=0 must yield an empty plan and a harmless
+        // probe range (public API — callers guard, the planner must not crash)
+        for newestFirst in [true, false] {
+            let (plan, probe, processProbeFirst) = MailAE.walkPlan(total: 0, walkLimit: 30, chunkSize: 12, newestFirst: newestFirst, avoidWidth: 7)
+            XCTAssertTrue(plan.isEmpty)
+            XCTAssertEqual(probe, 1...1)
+            XCTAssertEqual(processProbeFirst, newestFirst)
+            let (plan2, probe2, _) = MailAE.walkPlan(total: 10, walkLimit: 0, chunkSize: 12, newestFirst: newestFirst, avoidWidth: 7)
+            XCTAssertTrue(plan2.isEmpty)
+            XCTAssertEqual(probe2, 1...1)
+        }
+    }
+
+    // ── order resolution (resample clears the defaulted flag) ──
+
+    func testResolveOrderRecomputesDefaultedAfterResample() {
+        let old = Date(timeIntervalSince1970: 500)
+        let early = Date(timeIntervalSince1970: 1_000)
+        let late = Date(timeIntervalSince1970: 2_000)
+        // both head samples ambiguous, far end resolves → defaulted CLEARED
+        // (position 1 older than the far end → oldest-first mailbox)
+        let resampled = MailCrawler.resolveOrder(firstSample: early, secondSample: early, farEndSample: late)
+        XCTAssertEqual(resampled.newestFirst, false)
+        XCTAssertFalse(resampled.defaulted, "a successful resample must clear the defaulted flag")
+        // far end also ambiguous → defaulted stays true
+        let stuck = MailCrawler.resolveOrder(firstSample: nil, secondSample: nil, farEndSample: nil)
+        XCTAssertEqual(stuck.newestFirst, true)
+        XCTAssertTrue(stuck.defaulted)
+        // head pair resolves directly → defaulted false, no resample needed
+        let direct = MailCrawler.resolveOrder(firstSample: late, secondSample: early, farEndSample: nil)
+        XCTAssertEqual(direct.newestFirst, true)
+        XCTAssertFalse(direct.defaulted)
+        // resample can also resolve to oldest-first
+        let ascending = MailCrawler.resolveOrder(firstSample: old, secondSample: old, farEndSample: early)
+        XCTAssertEqual(ascending.newestFirst, false)
+        XCTAssertFalse(ascending.defaulted)
+    }
+
+    // ── terminal counters (failures/skipped persistence) ──
+
+    func testTerminalCounters() {
+        // failed bumps the failure streak and accumulates skips
+        let failed = MailCrawler.terminalCounters(state: "failed", previousFailures: 2, previousSkipped: 1, newSkips: 2)
+        XCTAssertEqual(failed.failures, 3)
+        XCTAssertEqual(failed.skipped, 3)
+        // done zeroes failures, keeps accumulating skips
+        let done = MailCrawler.terminalCounters(state: "done", previousFailures: 2, previousSkipped: 0, newSkips: 1)
+        XCTAssertEqual(done.failures, 0)
+        XCTAssertEqual(done.skipped, 1)
+        // cancelled preserves the failure streak
+        let cancelled = MailCrawler.terminalCounters(state: "cancelled", previousFailures: 4, previousSkipped: 0, newSkips: 0)
+        XCTAssertNil(cancelled.failures)
+        XCTAssertEqual(cancelled.skipped, 0)
+    }
+
     func testWalkPlanNeverIssuesAvoidWidthChunks() {
         // greedy cut: a would-be 7-wide piece shrinks by one and the
         // leftover becomes its own tiny piece
@@ -195,6 +251,27 @@ final class MailOSATests: XCTestCase {
                                                  account: "iCloud", consecutiveFailures: 2) {
         } else {
             XCTFail("third nil must abort")
+        }
+    }
+
+    func testIdentityDecisionEmptyNameIsTransientNotDefinitive() {
+        // a null reply coerces to "" — that is TRANSIENT (a retry succeeds),
+        // not a definitive mismatch
+        XCTAssertEqual(
+            MailAE.identityDecision(currentName: "", expected: "INBOX", mailboxAt: 9,
+                                    account: "iCloud", consecutiveFailures: 0),
+            .retrySame
+        )
+        XCTAssertEqual(
+            MailAE.identityDecision(currentName: "   ", expected: "INBOX", mailboxAt: 9,
+                                    account: "iCloud", consecutiveFailures: 1),
+            .retrySame
+        )
+        // strikes still budget it
+        if case .abort = MailAE.identityDecision(currentName: "", expected: "INBOX", mailboxAt: 9,
+                                                 account: "iCloud", consecutiveFailures: 2) {
+        } else {
+            XCTFail("third empty must abort")
         }
     }
 

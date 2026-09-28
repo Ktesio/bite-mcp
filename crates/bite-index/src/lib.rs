@@ -50,26 +50,22 @@ pub fn ingest_staged(
                         Err(re) => {
                             // leave the file in place — it will be retried
                             // (and re-fail visibly) on the next ingest
-                            eprintln!(
-                                "bite-index: could not quarantine {}: {re}",
-                                file.display()
-                            );
+                            eprintln!("bite-index: could not quarantine {}: {re}", file.display());
                         }
                     }
                 }
                 // retention cap: keep quarantine/ bounded at 200 files,
-                // deleting the oldest by filename order — no new config
+                // deleting the OLDEST first by modification time (filename
+                // order lies once seq >= 10: "-10" sorts before "-9")
                 let mut qfiles: Vec<_> = std::fs::read_dir(&quarantine)
                     .map(|it| {
                         it.filter_map(|e| e.ok())
                             .map(|e| e.path())
-                            .filter(|p| {
-                                p.extension().map(|x| x == "jsonl").unwrap_or(false)
-                            })
+                            .filter(|p| p.extension().map(|x| x == "jsonl").unwrap_or(false))
                             .collect::<Vec<_>>()
                     })
                     .unwrap_or_default();
-                qfiles.sort();
+                qfiles.sort_by_key(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok());
                 if qfiles.len() > 200 {
                     for p in &qfiles[..qfiles.len() - 200] {
                         std::fs::remove_file(p).ok();

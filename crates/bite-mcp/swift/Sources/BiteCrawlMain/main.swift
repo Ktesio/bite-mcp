@@ -167,10 +167,14 @@ case "crawl":
             // terminal failed/cancelled state written by the walk
             progress("done", CrawlState.shared.snapshot.processed, CrawlState.shared.snapshot.found)
         } else {
+            // a persistent mirror failure must engage the respawn backoff —
+            // the done write above zeroed the failure streak, so this failed
+            // write bumps it again
             MailCrawler.writeState(jobID: jobID, state: "failed",
                                    processed: CrawlState.shared.snapshot.processed,
                                    found: CrawlState.shared.snapshot.found,
-                                   window: "mirror batch write failed — \(lastError ?? "unknown error")")
+                                   window: "mirror batch write failed — \(lastError ?? "unknown error")",
+                                   failures: MailCrawler.existingFailureCount() + 1)
             FileHandle.standardError.write(Data("[worker] failed: mirror batch write failed\n".utf8))
         }
     }

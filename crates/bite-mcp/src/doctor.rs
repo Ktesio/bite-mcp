@@ -137,7 +137,9 @@ pub fn run(fix: bool, probe: bool) -> Result<i32, bite_core::BiteError> {
                     // Mail answered fine — it just has nothing configured.
                     // Not a TCC problem; don't send users permission-chasing.
                     status_line(true, "crawler Mail automation");
-                    println!("        {DIM}Mail has no accounts configured — nothing to index{RESET}");
+                    println!(
+                        "        {DIM}Mail has no accounts configured — nothing to index{RESET}"
+                    );
                 } else {
                     let authorized = text.contains("authorized");
                     status_line(authorized, "crawler Mail automation");
