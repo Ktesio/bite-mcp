@@ -1,0 +1,49 @@
+{
+  "generation_hash": "be0c4284dbc59d328cd1",
+  "inputs": {
+    "jinja2_version": "3.1.6",
+    "project_root": "/Users/imagdy/dev/bite-mcp",
+    "renderer_sha256": "a622fd5d9f633690323bdecf6cc9dc28625ef0d7b9d971fcc3cd101ed271fa19",
+    "resolved_values": {
+      "config.core.output_folder": "/Users/imagdy/dev/bite-mcp/_bmad-output",
+      "customization.workflow.activation_steps_append": [],
+      "customization.workflow.activation_steps_prepend": [],
+      "customization.workflow.on_complete": "",
+      "customization.workflow.open_plan": "",
+      "customization.workflow.persistent_facts": [],
+      "customization.workflow.review": "none",
+      "customization.workflow.route": "oneshot"
+    },
+    "skill_root": "/Users/imagdy/dev/bite-mcp/.agents/skills/bmad-build",
+    "source_sha256": {
+      "plan-template.md": "e23e478344054c1f86f08f467df623f4db2a8c4fdf0e5f7be1738dde550fe33e",
+      "references/claims-check.md": "6cb20a86d819b95272876bca0dffef59ca07ba6a373d804295066751043867c0",
+      "references/deletion-check.md": "0f1f124e4e957147e89164a272b10bedc694ad0d9ad2618c8610ac74ee9cb0da",
+      "review-prompts/edge-case-hunter.md": "b909fe0ec8e4daaf2550d0ec783618c5146261d0dbc0e054698ce00d0905a3d1",
+      "review-prompts/verification-gap.md": "45ab0b8c4c56c5c055c97a293a8591a67e256d0b1a2058ce1f093cd866be8d03",
+      "step-01-clarify-and-route.md": "65b72788650494bdd560f960a887a80d7809cb5acda5a0a92c0bbf53d4b424cd",
+      "step-02-plan.md": "045a80d45fc8897439c25d54a439d2bad15c7870dddae61f64ff448392718837",
+      "step-03-implement.md": "aa285ac97fdaa6e66f273edf5363c98ddf0252bf965d51a9a336d194aeafdad1",
+      "step-04-review.md": "170bbabde8a2a1172db409e56d1efa5e9d4f03ae8e7ea12c96d680c448d1aca6",
+      "step-05-present.md": "8c3a4f5e627524b05c3f1db4850b6ab68ae6930d8046c340a3e1590dccc4ed61",
+      "step-oneshot.md": "abb1b605eb74b04b98bd797f01d0c40481ae2553fa2778139304d699df98bb37",
+      "workflow.md": "04f41448d126782db8442b44939c9af0b6179ca2ece599c0fd695d4b44848d36"
+    }
+  },
+  "outputs": {
+    "plan-template.md": "e23e478344054c1f86f08f467df623f4db2a8c4fdf0e5f7be1738dde550fe33e",
+    "references/claims-check.md": "6cb20a86d819b95272876bca0dffef59ca07ba6a373d804295066751043867c0",
+    "references/deletion-check.md": "0f1f124e4e957147e89164a272b10bedc694ad0d9ad2618c8610ac74ee9cb0da",
+    "review-prompts/edge-case-hunter.md": "b909fe0ec8e4daaf2550d0ec783618c5146261d0dbc0e054698ce00d0905a3d1",
+    "review-prompts/verification-gap.md": "45ab0b8c4c56c5c055c97a293a8591a67e256d0b1a2058ce1f093cd866be8d03",
+    "step-01-clarify-and-route.md": "e2715444b5a112e07632225b87950026e9884ef7ee391cdf84f527d03acab01d",
+    "step-02-plan.md": "7b0b98fc30c8a65d1cd93c0e72360a66cf9f93a64e229ad8db914a21697cab8d",
+    "step-oneshot.md": "3eb787161c26e36eb280640757ff170b280c07bae3a9e0ba18774c38a900c252",
+    "workflow.md": "3303d82aafb1b08a38dca21fe132b36322b4627f9a59c1ad91e3c10cb328b6bd"
+  },
+  "project_root": "/Users/imagdy/dev/bite-mcp",
+  "project_slug": "bite-mcp",
+  "root_hash": "d55ed466f2d9",
+  "schema_version": 1,
+  "skill": "bmad-build"
+}
