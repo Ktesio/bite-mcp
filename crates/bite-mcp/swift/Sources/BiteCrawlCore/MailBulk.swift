@@ -142,19 +142,26 @@ public enum MailBulk {
 
         // identity guard before any operation touches an index-resolved
         // mailbox — a shifted enumeration order would misdirect the op
-        if let current = MailAE.mailboxName(at: src.index, account: src.account),
-           current.caseInsensitiveCompare(src.name) == .orderedSame {
-            // resolved OK
-        } else {
-            lastError = "mailbox \(src.index) in '\(src.account)' no longer resolves to '\(src.name)' — refusing to run bulk \(op) against a moved target"
-            writeState("failed", 0)
-            return
+        func identityFailure(_ box: (account: String, index: Int, name: String)) -> String? {
+            if let current = MailAE.mailboxName(at: box.index, account: box.account) {
+                if current.caseInsensitiveCompare(box.name) == .orderedSame { return nil }
+                return "mailbox \(box.index) in '\(box.account)' now resolves to '\(current)', expected '\(box.name)' — refusing to run bulk \(op) against a moved target"
+            }
+            return "couldn't verify identity of mailbox \(box.index) in '\(box.account)' before bulk \(op) — \(lastError ?? "unknown error")"
         }
+        func requireIdentity(_ box: (account: String, index: Int, name: String), estimated: Int?) -> Bool {
+            guard let failure = identityFailure(box) else { return true }
+            lastError = failure
+            writeState("failed", estimated ?? 0)
+            return false
+        }
+        guard requireIdentity(src, estimated: nil) else { return }
         let estimated = MailAE.countWhose(mailboxAt: src.index, account: src.account, selection: selection)
         writeState("running", estimated ?? 0)
 
         switch op {
         case "mark":
+            guard requireIdentity(src, estimated: estimated) else { return }
             var failed: String?
             if let read = setRead {
                 let (ok, err) = MailAE.setWhose(mailboxAt: src.index, account: src.account, selection: selection,
@@ -175,12 +182,17 @@ public enum MailBulk {
 
         case "move":
             guard let dest else { writeState("failed", 0); return }
+            // re-validate BOTH ends immediately before the operation: the
+            // initial check can be ~minutes stale by the time Mail executes
+            guard requireIdentity(src, estimated: estimated) else { return }
+            guard requireIdentity(dest, estimated: estimated) else { return }
             let (ok, _) = MailAE.moveWhose(mailboxAt: src.index, account: src.account, selection: selection,
                                            toMailboxAt: dest.index, toAccount: dest.account)
             let remaining = ok ? MailAE.countWhose(mailboxAt: src.index, account: src.account, selection: selection) : nil
             writeState(terminalState(ok: ok, remaining: remaining), remaining ?? 0)
 
         case "delete":
+            guard requireIdentity(src, estimated: estimated) else { return }
             let (ok, _) = MailAE.deleteWhose(mailboxAt: src.index, account: src.account, selection: selection)
             let remaining = ok ? MailAE.countWhose(mailboxAt: src.index, account: src.account, selection: selection) : nil
             writeState(terminalState(ok: ok, remaining: remaining), remaining ?? 0)

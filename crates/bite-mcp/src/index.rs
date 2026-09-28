@@ -438,6 +438,7 @@ fn auto_refresh_if_stale() {
         .get("state")
         .and_then(|v| v.as_str())
         .unwrap_or("never_run");
+    let failures = state.get("failures").and_then(|v| v.as_u64()).unwrap_or(0);
     let is_running = state_str == "running" && crawl_running();
     if is_running {
         return;
@@ -455,19 +456,22 @@ fn auto_refresh_if_stale() {
             now_ms.saturating_sub(t_ms)
         })
         .unwrap_or(u64::MAX);
-    // never_run → immediately useful; a failed crawl should be retried on
-    // the next poll (its fresh updated_at must not shelter it); "cancelled"
-    // is user intent — never auto-respawned; otherwise refresh once stale
-    if respawn_eligible(state_str, stale, hours) {
+    // never_run → immediately useful; failed → retry (but a crash loop
+    // backs off to 24 h staleness after 5 consecutive failures — the
+    // LAST_SPAWN cooldown is per-process and can't bound fresh CLIs);
+    // cancelled is user intent — never eagerly respawned.
+    if respawn_eligible(state_str, stale, hours, failures) {
         let _ = spawn_crawl(&json!({}));
     }
 }
 
-/// Auto-refresh decision. `age_ms` is the crawl-state updated_at age.
-/// failed states are always eligible (bounded by the 15-min caller
-/// cooldown); cancelled states only via staleness, never eagerly.
-fn respawn_eligible(state: &str, age_ms: u64, threshold_hours: u64) -> bool {
-    state == "never_run" || state == "failed" || stale_after_ms(age_ms, threshold_hours)
+/// Auto-refresh decision. `age_ms` is the crawl-state updated_at age,
+/// `failures` the consecutive-failure counter persisted by the crawler
+/// (additive contract — absent means 0).
+fn respawn_eligible(state: &str, age_ms: u64, threshold_hours: u64, failures: u64) -> bool {
+    state == "never_run"
+        || (state == "failed" && failures < 5)
+        || stale_after_ms(age_ms, threshold_hours)
 }
 
 /// `updated_at` age in MILLISECONDS vs a refresh threshold in hours.
@@ -497,11 +501,18 @@ fn cancel(handle: Option<&mut BridgeHandle>) -> Result<Value, BiteError> {
                 .map(|s| s.success())
                 .unwrap_or(false);
             if ok {
-                // re-verify once: identity was checked before the kill, but
-                // a same-tick exec of an unrelated new process on the
-                // recycled pid remains a (documented, accepted) race
-                std::thread::sleep(std::time::Duration::from_millis(300));
-                if live_crawler_pid() == Some(pid) {
+                // wait out the graceful cancel: the Swift handler waits up
+                // to ~2 s (cancel-observed semaphore + final flush + state
+                // write) — a 300 ms check misreported normal exits as
+                // "process survived". Poll up to ~3 s total.
+                let mut survived = true;
+                for _ in 0..12 {                    std::thread::sleep(std::time::Duration::from_millis(250));
+                    if live_crawler_pid() != Some(pid) {
+                        survived = false;
+                        break;
+                    }
+                }
+                if survived {
                     return Ok(json!({
                         "cancelled": false,
                         "pid": pid,
@@ -750,18 +761,26 @@ mod tests {
         const H24: u64 = 24;
         const DAY_MS: u64 = 24 * 3_600_000;
         // never_run: always eligible
-        assert!(respawn_eligible("never_run", 0, H24));
-        assert!(respawn_eligible("never_run", u64::MAX, H24));
-        // failed: eligible even with a fresh updated_at (its freshness must
-        // not shelter a dead crawl for a day)
-        assert!(respawn_eligible("failed", 5_000, H24));
+        assert!(respawn_eligible("never_run", 0, H24, 0));
+        assert!(respawn_eligible("never_run", u64::MAX, H24, 9));
+        // failed: eligible while the consecutive-failure count is low —
+        // even with a fresh updated_at (its freshness must not shelter a
+        // dead crawl) — but a crash loop backs off to staleness at 5
+        assert!(respawn_eligible("failed", 5_000, H24, 0));
+        assert!(respawn_eligible("failed", 5_000, H24, 4));
+        assert!(!respawn_eligible("failed", 5_000, H24, 5));
+        assert!(!respawn_eligible("failed", 5_000, H24, 9));
+        // …and a stale failed state is eligible regardless of the counter
+        assert!(respawn_eligible("failed", DAY_MS, H24, 9));
+        // missing counter (0) keeps legacy state files working
+        assert!(respawn_eligible("failed", 5_000, H24, 0));
         // cancelled is user intent: never eagerly respawned…
-        assert!(!respawn_eligible("cancelled", 5_000, H24));
+        assert!(!respawn_eligible("cancelled", 5_000, H24, 0));
         // …only via ordinary staleness
-        assert!(respawn_eligible("cancelled", DAY_MS, H24));
+        assert!(respawn_eligible("cancelled", DAY_MS, H24, 0));
         // done: ordinary staleness only
-        assert!(!respawn_eligible("done", 5_000, H24));
-        assert!(respawn_eligible("done", DAY_MS, H24));
-        assert!(!respawn_eligible("running", 0, H24));
+        assert!(!respawn_eligible("done", 5_000, H24, 3));
+        assert!(respawn_eligible("done", DAY_MS, H24, 3));
+        assert!(!respawn_eligible("running", 0, H24, 0));
     }
 }

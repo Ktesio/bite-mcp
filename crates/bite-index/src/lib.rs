@@ -45,9 +45,36 @@ pub fn ingest_staged(
                 );
                 if std::fs::create_dir_all(&quarantine).is_ok() {
                     let dest = quarantine.join(file.file_name().unwrap_or_default());
-                    std::fs::rename(&file, dest).ok();
+                    match std::fs::rename(&file, dest) {
+                        Ok(_) => quarantined += 1,
+                        Err(re) => {
+                            // leave the file in place — it will be retried
+                            // (and re-fail visibly) on the next ingest
+                            eprintln!(
+                                "bite-index: could not quarantine {}: {re}",
+                                file.display()
+                            );
+                        }
+                    }
                 }
-                quarantined += 1;
+                // retention cap: keep quarantine/ bounded at 200 files,
+                // deleting the oldest by filename order — no new config
+                let mut qfiles: Vec<_> = std::fs::read_dir(&quarantine)
+                    .map(|it| {
+                        it.filter_map(|e| e.ok())
+                            .map(|e| e.path())
+                            .filter(|p| {
+                                p.extension().map(|x| x == "jsonl").unwrap_or(false)
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                qfiles.sort();
+                if qfiles.len() > 200 {
+                    for p in &qfiles[..qfiles.len() - 200] {
+                        std::fs::remove_file(p).ok();
+                    }
+                }
             }
         }
     }

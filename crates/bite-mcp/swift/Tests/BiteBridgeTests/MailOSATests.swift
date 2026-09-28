@@ -73,7 +73,7 @@ final class MailOSATests: XCTestCase {
         // walk starts at the far (newest) end…
         XCTAssertEqual(plan.first?.upperBound, 105)
         // …and the plan is NOT truncated: the tail (oldest) rows stay covered
-        XCTAssertEqual(plan.map { "\($0.lowerBound)-\($0.upperBound)" }, ["66-105", "26-65", "1-25"])
+        XCTAssertEqual(plan.map { "\($0.lowerBound)-\($0.upperBound)" }, ["81-105", "41-80", "1-40"])
         XCTAssertFalse(processProbeFirst)
         // probe is detection-only: the mailbox head
         XCTAssertEqual(probe, 1...40)
@@ -81,8 +81,9 @@ final class MailOSATests: XCTestCase {
 
     func testWalkPlanOldestFirstClampsToWalkLimit() {
         let (plan, _, _) = MailAE.walkPlan(total: 105, walkLimit: 50, chunkSize: 40, newestFirst: false)
-        // walkLimit 50 → positions 56…105, chunks in descending walk order
-        XCTAssertEqual(plan.map { "\($0.lowerBound)-\($0.upperBound)" }, ["66-105", "56-65"])
+        // walkLimit 50 → positions 56…105 (walk starts at the newest row),
+        // chunks in descending walk order
+        XCTAssertEqual(plan.map { "\($0.lowerBound)-\($0.upperBound)" }, ["96-105", "56-95"])
     }
 
     func testWalkPlanTotalWithinSingleChunk() {
@@ -95,28 +96,50 @@ final class MailOSATests: XCTestCase {
     }
 
     func testWalkPlanNeverIssuesAvoidWidthChunks() {
-        // total 19, chunk 12 → the tail chunk would be exactly 7 wide; the
-        // boundary shifts so no chunk width equals the bundle property count
+        // greedy cut: a would-be 7-wide piece shrinks by one and the
+        // leftover becomes its own tiny piece
         let (plan, probe, _) = MailAE.walkPlan(total: 19, walkLimit: 19, chunkSize: 12, newestFirst: true, avoidWidth: 7)
         XCTAssertFalse(plan.contains { $0.count == 7 })
-        // tail chunk (13-19, width 7) steals one position from its predecessor
-        XCTAssertEqual(plan.map { "\($0.lowerBound)-\($0.upperBound)" }, ["1-11", "12-19"])
+        XCTAssertEqual(plan.map { "\($0.lowerBound)-\($0.upperBound)" }, ["1-12", "13-18", "19-19"])
         XCTAssertEqual(probe, plan[0])  // newest-first probe stays plan[0]
-        // coverage intact: union == 1...19, no gaps or overlaps
         XCTAssertEqual(plan.reduce(0) { $0 + $1.count }, 19)
 
-        // descending tail: same invariant, ranges stay disjoint + ordered
-        let (dPlan, _, _) = MailAE.walkPlan(total: 19, walkLimit: 19, chunkSize: 12, newestFirst: false, avoidWidth: 7)
-        XCTAssertFalse(dPlan.contains { $0.count == 7 })
-        XCTAssertEqual(dPlan.reduce(0) { $0 + $1.count }, 19)
-        for (a, b) in zip(dPlan, dPlan.dropFirst()) {
-            XCTAssertEqual(a.lowerBound, b.upperBound + 1, "descending order broken")
-        }
-
-        // whole walk exactly 7 wide → split into two chunks
+        // whole walk exactly 7 wide → shrunk piece + tiny remainder
         let (sPlan, sProbe, _) = MailAE.walkPlan(total: 7, walkLimit: 7, chunkSize: 12, newestFirst: true, avoidWidth: 7)
-        XCTAssertEqual(sPlan.map { "\($0.lowerBound)-\($0.upperBound)" }, ["1-3", "4-7"])
+        XCTAssertEqual(sPlan.map { "\($0.lowerBound)-\($0.upperBound)" }, ["1-6", "7-7"])
         XCTAssertEqual(sProbe, sPlan[0])
+    }
+
+    func testWalkPlanDescendingSplitEmitsFarPieceFirst() {
+        // a 7-message mailbox walked oldest-first (descending) must visit
+        // the NEWEST rows first — ascending piece order would process the
+        // oldest rows, trip the edge tolerance, and never index the newest
+        let (plan, _, processProbeFirst) = MailAE.walkPlan(total: 7, walkLimit: 7, chunkSize: 12, newestFirst: false, avoidWidth: 7)
+        XCTAssertEqual(plan.map { "\($0.lowerBound)-\($0.upperBound)" }, ["7-7", "1-6"])
+        XCTAssertFalse(processProbeFirst)
+        XCTAssertEqual(plan.first?.upperBound, 7)  // far end first
+    }
+
+    func testWalkPlanChunkSizeAvoidPlusOneKeepsInvariant() {
+        // chunkSize == avoidWidth + 1 (8): every cut lands on 8s until the
+        // remainder forces a shrink — the invariant must hold throughout
+        for total in [15, 23, 31] {
+            for newestFirst in [true, false] {
+                let (plan, _, _) = MailAE.walkPlan(total: total, walkLimit: total, chunkSize: 8, newestFirst: newestFirst, avoidWidth: 7)
+                XCTAssertFalse(plan.contains { $0.count == 7 }, "total=\(total) newestFirst=\(newestFirst): \(plan)")
+                XCTAssertEqual(plan.reduce(0) { $0 + $1.count }, total, "coverage broken: \(plan)")
+                for (a, b) in zip(plan, plan.dropFirst()) {
+                    if newestFirst {
+                        XCTAssertEqual(b.lowerBound, a.upperBound + 1, "ascending order broken: \(plan)")
+                    } else {
+                        XCTAssertEqual(a.lowerBound, b.upperBound + 1, "descending order broken: \(plan)")
+                    }
+                }
+            }
+        }
+        // concrete shape for total=15, chunk=8: 8 + 6 + 1
+        let (plan, _, _) = MailAE.walkPlan(total: 15, walkLimit: 15, chunkSize: 8, newestFirst: true, avoidWidth: 7)
+        XCTAssertEqual(plan.map { "\($0.lowerBound)-\($0.upperBound)" }, ["1-8", "9-14", "15-15"])
     }
 
     // ── chunk failure policy ──
@@ -136,6 +159,56 @@ final class MailOSATests: XCTestCase {
     func testFailureDecisionAbortsAfterThreeStrikes() {
         XCTAssertEqual(MailAE.failureDecision(range: 13...24, refreshedTotal: nil, consecutiveFailures: 3), .abort)
         XCTAssertEqual(MailAE.failureDecision(range: 13...24, refreshedTotal: 105, consecutiveFailures: 4), .abort)
+    }
+
+    // ── mailbox identity re-validation ──
+
+    func testIdentityDecisionVerifiedAndMismatch() {
+        // same name (case-insensitive) → verified
+        XCTAssertEqual(
+            MailAE.identityDecision(currentName: "INBOX", expected: "inbox", mailboxAt: 9,
+                                    account: "iCloud", consecutiveFailures: 2),
+            .verified
+        )
+        // different name → definitive abort, no strike budget
+        if case .abort = MailAE.identityDecision(currentName: "Archive", expected: "INBOX", mailboxAt: 9,
+                                                 account: "iCloud", consecutiveFailures: 0) {
+        } else {
+            XCTFail("mismatch must abort")
+        }
+    }
+
+    func testIdentityDecisionNilIsTransientWithStrikeBudget() {
+        // nil (executor busy / watchdog) retries with strikes…
+        XCTAssertEqual(
+            MailAE.identityDecision(currentName: nil, expected: "INBOX", mailboxAt: 9,
+                                    account: "iCloud", consecutiveFailures: 0),
+            .retrySame
+        )
+        XCTAssertEqual(
+            MailAE.identityDecision(currentName: nil, expected: "INBOX", mailboxAt: 9,
+                                    account: "iCloud", consecutiveFailures: 1),
+            .retrySame
+        )
+        // …and aborts on the third strike
+        if case .abort = MailAE.identityDecision(currentName: nil, expected: "INBOX", mailboxAt: 9,
+                                                 account: "iCloud", consecutiveFailures: 2) {
+        } else {
+            XCTFail("third nil must abort")
+        }
+    }
+
+    // ── zero-yield breaker (skip, not fail) ──
+
+    func testZeroYieldSkipReason() {
+        // mostly-unreadable rows with nothing indexed → skip diagnostic
+        XCTAssertEqual(MailCrawler.zeroYieldSkipReason(unreadable: 501, indexed: 0),
+                       "skipped: zero yield after 501 unreadable rows")
+        // under threshold → keep walking
+        XCTAssertNil(MailCrawler.zeroYieldSkipReason(unreadable: 500, indexed: 0))
+        // indexing something → keep walking
+        XCTAssertNil(MailCrawler.zeroYieldSkipReason(unreadable: 900, indexed: 1))
+        XCTAssertNil(MailCrawler.zeroYieldSkipReason(unreadable: 0, indexed: 0))
     }
 
     // ── walk order detection ──

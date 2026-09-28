@@ -202,6 +202,15 @@ public enum MailCrawler {
         state == "done" || state == "failed" || state == "cancelled"
     }
 
+    /// Failure counter carried in crawl-state ("failures", additive
+    /// contract — Rust tolerates it missing). Reads the CURRENT file so a
+    /// failed job can persist existing+1 and a successful one can zero it.
+    public static func existingFailureCount() -> Int {
+        guard let data = try? Data(contentsOf: statePath()),
+              let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else { return 0 }
+        return obj["failures"] as? Int ?? 0
+    }
+
     /// Serializes state-file writes: the SIGTERM handler and the crawl
     /// thread both call writeState, and unsynchronized remove+move could
     /// once leave NO state file behind.
@@ -250,14 +259,16 @@ public enum MailCrawler {
         return atomicReplace(tmp: tmp, dst: path)
     }
 
-    public static func writeState(jobID: String, state: String, processed: Int, found: Int, window: String?) {
-        // once cancellation is armed only terminal writes pass — the walk's
-        // heartbeats must never overwrite the cancel handler's terminal
-        // state, and the handler must not race a heartbeat mid-write
-        if !isTerminalState(state) && CrawlState.shared.isCancelled { return }
+    public static func writeState(jobID: String, state: String, processed: Int, found: Int,
+                                  window: String?, failures: Int? = nil) {
+        // once cancellation is armed ONLY the terminal cancelled state may
+        // be written: heartbeats must not clobber it, and a post-cancel
+        // failure write must not undo a user cancel (auto-respawn treats
+        // failed as retry-now, which would override user intent)
+        if CrawlState.shared.isCancelled && state != "cancelled" { return }
         if state == "running" { CrawlState.shared.markStarted() }
         CrawlState.shared.setWindow(window)
-        let dict: [String: Any] = [
+        var dict: [String: Any] = [
             "job_id": jobID,
             "state": state,
             "processed": processed,
@@ -265,9 +276,15 @@ public enum MailCrawler {
             "window": window ?? NSNull(),
             "updated_at": ISO8601DateFormatter().string(from: Date()),
         ]
+        // failures counter: explicit override at terminal writes
+        // (failed → existing+1, done → 0); everything else preserves it
+        dict["failures"] = failures ?? existingFailureCount()
         guard let data = try? JSONSerialization.data(withJSONObject: dict, options: [.prettyPrinted]) else { return }
         stateLock.lock()
         defer { stateLock.unlock() }
+        // re-check under the lock: cancellation may have been armed (and
+        // its terminal state written) while this call waited on the lock
+        if CrawlState.shared.isCancelled && state != "cancelled" { return }
         let path = statePath()
         let tmp = path.appendingPathExtension("\(ProcessInfo.processInfo.globallyUniqueString).tmp")
         guard FileManager.default.createFile(atPath: tmp.path, contents: data,
@@ -295,7 +312,8 @@ public enum MailCrawler {
                               seq: SeqCounter, progress: @escaping (String, Int, Int) -> Void) -> String {
         let state = CrawlState.shared
         guard MailAE.mailRunning() else {
-            writeState(jobID: jobID, state: "failed", processed: 0, found: 0, window: "Mail is not running")
+            writeState(jobID: jobID, state: "failed", processed: 0, found: 0,
+                       window: "Mail is not running", failures: existingFailureCount() + 1)
             progress("failed", 0, 0)
             return "failed"
         }
@@ -328,7 +346,7 @@ public enum MailCrawler {
         }
         guard let accounts else {
             writeState(jobID: jobID, state: "failed", processed: 0, found: 0,
-                       window: "Mail unresponsive for 24 h")
+                       window: "Mail unresponsive for 24 h", failures: existingFailureCount() + 1)
             progress("failed", 0, 0)
             return "failed"
         }
@@ -347,7 +365,7 @@ public enum MailCrawler {
         guard anyListSucceeded else {
             let diag = lastError ?? "unknown error"
             writeState(jobID: jobID, state: "failed", processed: 0, found: 0,
-                       window: "cannot list mailboxes — \(diag)")
+                       window: "cannot list mailboxes — \(diag)", failures: existingFailureCount() + 1)
             progress("failed", 0, 0)
             return "failed"
         }
@@ -374,20 +392,28 @@ public enum MailCrawler {
                     // holes in the index
                     writeState(jobID: jobID, state: "failed",
                                processed: processed + r.scanned, found: found + r.indexed,
-                               window: err)
+                               window: err, failures: existingFailureCount() + 1)
                     progress("failed", processed + r.scanned, found + r.indexed)
                     return "failed"
                 }
                 processed += r.scanned
                 found += r.indexed
                 CrawlState.shared.tally(processedAdd: r.scanned, foundAdd: r.indexed)
+                if let skip = r.skipReason {
+                    // per-mailbox SKIP, not a job failure: the diagnostic
+                    // lands in the state window label and the walk moves on
+                    writeState(jobID: jobID, state: "running", processed: processed, found: found, window: skip)
+                    progress("running", processed, found)
+                    continue
+                }
                 progress("running", processed, found)
             }
             if state.isCancelled { break }
         }
 
         let finalState = state.isCancelled ? "cancelled" : "done"
-        writeState(jobID: jobID, state: finalState, processed: processed, found: found, window: nil)
+        writeState(jobID: jobID, state: finalState, processed: processed, found: found, window: nil,
+                   failures: finalState == "done" ? 0 : nil)
         progress(finalState, processed, found)
         return finalState
     }
@@ -399,19 +425,42 @@ public enum MailCrawler {
     /// errors never silently drop messages. Any abort (strikes, zero yield,
     /// identity drift, write failure) surfaces as transportError so the
     /// JOB fails instead of reporting done with holes.
+    /// One mailbox-window walk result. `transportError` fails the whole
+    /// job; `skipReason` (zero yield / order undetectable) abandons just
+    /// this mailbox's window with a diagnostic while the job continues.
+    struct WalkOutcome {
+        var scanned: Int
+        var indexed: Int
+        var transportError: String?
+        var skipReason: String?
+    }
+
+    /// Breaker: when a window accumulates mostly-unreadable rows while
+    /// indexing nothing, further chunks are wasted reads. The mailbox
+    /// window is SKIPPED (diagnostic in the state label) — other mailboxes
+    /// continue, and the job must not fail (a failure would loop-respawn
+    /// against unparseable data).
+    public static func zeroYieldSkipReason(unreadable: Int, indexed: Int, threshold: Int = 500) -> String? {
+        guard unreadable > threshold, indexed == 0 else { return nil }
+        return "skipped: zero yield after \(unreadable) unreadable rows"
+    }
+
     static func crawlMailbox(jobID: String, account: String, mailboxAt: Int, mailbox: String,
                              window: CrawlWindow, includeContent: Bool,
                              staging: URL, seq: SeqCounter,
-                             progress: @escaping (String, Int, Int) -> Void)
-        -> (scanned: Int, indexed: Int, transportError: String?) {
-        func abort(_ scanned: Int, _ indexed: Int, _ reason: String) -> (scanned: Int, indexed: Int, transportError: String?) {
+                             progress: @escaping (String, Int, Int) -> Void) -> WalkOutcome {
+        func abort(_ scanned: Int, _ indexed: Int, _ reason: String) -> WalkOutcome {
             CrawlState.shared.setFlushPending(nil)
-            return (scanned, indexed, reason)
+            return WalkOutcome(scanned: scanned, indexed: indexed, transportError: reason, skipReason: nil)
+        }
+        func skip(_ scanned: Int, _ indexed: Int, _ reason: String) -> WalkOutcome {
+            CrawlState.shared.setFlushPending(nil)
+            return WalkOutcome(scanned: scanned, indexed: indexed, transportError: nil, skipReason: reason)
         }
         guard let initialTotal = MailAE.countMessages(mailboxAt: mailboxAt, account: account) else {
             return abort(0, 0, "count failed for \(mailbox) — \(lastError ?? "unknown error")")
         }
-        guard initialTotal > 0 else { return (0, 0, nil) }
+        guard initialTotal > 0 else { return WalkOutcome(scanned: 0, indexed: 0, transportError: nil, skipReason: nil) }
         var total = initialTotal
 
         // 12 records per script keeps each execution (~3-5 s/message on the
@@ -441,8 +490,10 @@ public enum MailCrawler {
         var scanned = 0
         var indexed = 0
         var skipped = 0
+        var unreadable = 0  // rows that produced no usable record (drives the zero-yield breaker)
         var edgeCrossed = false
         var writeFailed = false
+        var orderWasDefaulted = false  // set after the probe; drives the order-undetectable skip
 
         func label() -> String {
             skipped > 0 ? "\(baseLabel) skipped=\(skipped)" : baseLabel
@@ -483,6 +534,7 @@ public enum MailCrawler {
                                                         includeContent: includeContent),
                       let ms = record.start_ms else {
                     skipped += 1
+                    unreadable += 1
                     continue
                 }
                 if ms < window.fromMs {
@@ -496,6 +548,20 @@ public enum MailCrawler {
                 }
             }
             return false
+        }
+
+        /// Per-window breaker + order-ambiguity diagnostic. A zero-yield or
+        /// defaulted-order window is SKIPPED (never a job failure): other
+        /// mailboxes continue and the job must not loop-respawn against
+        /// unparseable data.
+        func zeroYieldCheck() -> String? {
+            if let reason = MailCrawler.zeroYieldSkipReason(unreadable: unreadable, indexed: indexed) {
+                return reason
+            }
+            if orderWasDefaulted, indexed == 0 {
+                return "skipped: order undetectable — no dated rows to orient the walk"
+            }
+            return nil
         }
 
         // First chunk doubles as the order probe (positions shift as mail
@@ -512,6 +578,7 @@ public enum MailCrawler {
         }
         var newestFirst = MailAE.orderFromSamples(MailAE.dateFromRow(probe[0]),
                                                   probe.count >= 2 ? MailAE.dateFromRow(probe[1]) : nil)
+        orderWasDefaulted = (newestFirst == nil)
         if newestFirst == nil, total > probeRange.upperBound,
            let lastRows = MailAE.readProperties(mailboxAt: mailboxAt, account: account,
                                                 start: total, end: total, includeContent: includeContent),
@@ -529,6 +596,7 @@ public enum MailCrawler {
                                                             avoidWidth: 7)
         if processProbe {
             edgeCrossed = process(probe, descending: false)
+            if let reason = zeroYieldCheck() { return skip(scanned, indexed, reason) }
         }
 
         var i = processProbe ? 1 : 0  // newest-first: plan[0] IS the probe range
@@ -546,16 +614,9 @@ public enum MailCrawler {
                 continue
             }
             // identity guard: the enumeration order can shift between listing
-            // and use — a stale index would silently mislabel every record
-            if let current = MailAE.mailboxName(at: mailboxAt, account: account) {
-                if current.caseInsensitiveCompare(mailbox) != .orderedSame {
-                    abortReason = "mailbox \(mailboxAt) in '\(account)' now resolves to '\(current)', expected '\(mailbox)' — aborting to avoid mislabeled records"
-                    break
-                }
-            } else {
-                abortReason = "mailbox identity check failed for \(mailbox) — \(lastError ?? "unknown error")"
-                break
-            }
+            // and use — a stale index would silently mislabel every record.
+            // A transient nil shares the strike budget; a definitive name
+            // mismatch aborts immediately.
             if !MailAE.healthy() {
                 consecutiveFailures += 1
                 if consecutiveFailures >= 3 {
@@ -566,6 +627,20 @@ public enum MailCrawler {
                 Thread.sleep(forTimeInterval: min(60, Double(5 * consecutiveFailures)))
                 continue  // retry the same range
             }
+            switch MailAE.identityDecision(currentName: MailAE.mailboxName(at: mailboxAt, account: account),
+                                           expected: mailbox, mailboxAt: mailboxAt, account: account,
+                                           consecutiveFailures: consecutiveFailures) {
+            case .verified:
+                break
+            case .retrySame:
+                consecutiveFailures += 1
+                heartbeat()
+                Thread.sleep(forTimeInterval: min(60, Double(5 * consecutiveFailures)))
+                continue  // retry the revalidation (same range)
+            case .abort(let reason):
+                abortReason = reason
+            }
+            if abortReason != nil { break }
             if let rows = MailAE.readProperties(mailboxAt: mailboxAt, account: account,
                                                 start: range.lowerBound, end: range.upperBound,
                                                 includeContent: includeContent) {
@@ -576,10 +651,16 @@ public enum MailCrawler {
                 Thread.sleep(forTimeInterval: 1)
                 edgeCrossed = process(rows, descending: !newestFirstResolved)
                 heartbeat()
-                if skipped > 500 && indexed == 0 {
-                    // weeks of zero-progress reads on a pathological mailbox
-                    abortReason = "zero yield in \(mailbox): \(skipped) rows skipped, 0 indexed in this window"
-                    break
+                if let reason = zeroYieldCheck() {
+                    // skip this mailbox's window (diagnostic in the state
+                    // label) and let the remaining mailboxes continue —
+                    // but a batch-write failure still fails the job
+                    let flushed = flush()
+                    CrawlState.shared.setFlushPending(nil)
+                    if !flushed {
+                        return abort(scanned, indexed, "batch write failed for \(mailbox) — \(lastError ?? "unknown error")")
+                    }
+                    return skip(scanned, indexed, reason)
                 }
             } else {
                 // refresh the count first: ranges beyond a shrunken mailbox
@@ -607,12 +688,12 @@ public enum MailCrawler {
         let flushed = flush()
         CrawlState.shared.setFlushPending(nil)
         if writeFailed || !flushed {
-            return (scanned, indexed, "batch write failed for \(mailbox) — \(lastError ?? "unknown error")")
+            return abort(scanned, indexed, "batch write failed for \(mailbox) — \(lastError ?? "unknown error")")
         }
         if let abortReason {
-            return (scanned, indexed, abortReason)
+            return abort(scanned, indexed, abortReason)
         }
-        return (scanned, indexed, nil)
+        return WalkOutcome(scanned: scanned, indexed: indexed, transportError: nil, skipReason: nil)
     }
 
     /// Synchronous crawl used by the detached `bite-crawl` worker process.

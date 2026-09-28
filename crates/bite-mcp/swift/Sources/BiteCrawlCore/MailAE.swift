@@ -214,32 +214,32 @@ public enum MailAE {
     /// `avoidWidth` (the bundle property count, 7): no issued chunk may be
     /// exactly that wide — a bundle reply of width == property count is
     /// structurally ambiguous (7 columns × 7 messages vs 7 rows × 7 props),
-    /// and one mixed-type column would flip the interpretation. Boundary
-    /// positions are shuffled between neighbours by one, or a lone chunk is
-    /// split, so every width differs from `avoidWidth`.
+    /// and one mixed-type column would flip the interpretation. The cut is
+    /// greedy and shrinks any would-be avoid-width piece by one (the
+    /// leftover becomes its own tiny piece), so the invariant holds by
+    /// construction — no post-hoc boundary stealing that could push a
+    /// neighbour onto the banned width. Descending plans cut the same
+    /// ascending pieces and REVERSE them, so the far (newest) piece is
+    /// always emitted first.
     public static func walkPlan(total: Int, walkLimit: Int, chunkSize: Int, newestFirst: Bool,
                                 avoidWidth: Int? = nil)
         -> (plan: [ClosedRange<Int>], probeRange: ClosedRange<Int>, processProbeFirst: Bool) {
+        // descending walks cover the walkLimit slice ENDING at total (the
+        // newest row); ascending walks cover the slice STARTING at 1
+        let start = newestFirst ? 1 : max(1, total - walkLimit + 1)
+        let end = newestFirst ? min(total, walkLimit) : total
         var ranges: [ClosedRange<Int>] = []
-        if newestFirst {
-            let limit = min(total, walkLimit)
-            var s = 1
-            while s <= limit {
-                let e = min(s + chunkSize - 1, limit)
-                ranges.append(s...e)
-                s = e + 1
+        var s = start
+        while s <= end {
+            var e = min(s + chunkSize - 1, end)
+            if let avoid = avoidWidth, avoid > 1, e - s + 1 == avoid {
+                e -= 1  // shrink the piece; the leftover forms its own tiny piece
             }
-        } else {
-            let floor = max(1, total - walkLimit + 1)
-            var e = total
-            while e >= floor {
-                let s = max(e - chunkSize + 1, floor)
-                ranges.append(s...e)
-                e = s - 1
-            }
+            ranges.append(s...e)
+            s = e + 1
         }
-        if let avoid = avoidWidth, avoid > 1 {
-            ranges = Self.splitOffAvoidWidth(ranges, avoid, ascending: newestFirst)
+        if !newestFirst {
+            ranges.reverse()  // descending walk visits the far (newest) piece first
         }
         let probe: ClosedRange<Int>
         if newestFirst {
@@ -250,74 +250,6 @@ public enum MailAE {
             probe = 1...max(1, end)
         }
         return (ranges, probe, newestFirst)
-    }
-
-    /// Rewrite adjacent boundaries so no range is exactly `avoid` wide.
-    /// Boundary positions sit between neighbours — on the side determined
-    /// by walk direction — so ranges stay disjoint and ordered.
-    private static func splitOffAvoidWidth(_ ranges: [ClosedRange<Int>], _ avoid: Int, ascending: Bool) -> [ClosedRange<Int>] {
-        var out = ranges
-        var i = 0
-        while i < out.count {
-            if out[i].count != avoid { i += 1; continue }
-            let cur = out[i]
-            if ascending {
-                if i + 1 < out.count {
-                    // steal the next chunk's lowest position
-                    let next = out[i + 1]
-                    out[i] = cur.lowerBound...(cur.upperBound + 1)
-                    if next.count == 1 {
-                        out.remove(at: i + 1)
-                    } else {
-                        out[i + 1] = (next.lowerBound + 1)...next.upperBound
-                    }
-                } else if i > 0 {
-                    // last chunk: steal the previous chunk's highest position
-                    let prev = out[i - 1]
-                    if prev.count == 1 {
-                        out[i - 1] = prev.lowerBound...cur.upperBound
-                        out.remove(at: i)
-                    } else {
-                        out[i - 1] = prev.lowerBound...(prev.upperBound - 1)
-                        out[i] = (cur.lowerBound - 1)...cur.upperBound
-                    }
-                } else {
-                    // the whole walk is exactly `avoid` wide: split it in two
-                    let mid = cur.lowerBound + cur.count / 2
-                    out[i] = cur.lowerBound...(mid - 1)
-                    out.insert((mid)...cur.upperBound, at: i + 1)
-                }
-            } else {
-                // descending walk: neighbours sit on the opposite side
-                if i + 1 < out.count {
-                    // steal the next chunk's highest position
-                    let next = out[i + 1]
-                    out[i] = (cur.lowerBound - 1)...cur.upperBound
-                    if next.count == 1 {
-                        out.remove(at: i + 1)
-                    } else {
-                        out[i + 1] = next.lowerBound...(next.upperBound - 1)
-                    }
-                } else if i > 0 {
-                    // last chunk: steal the previous chunk's lowest position
-                    let prev = out[i - 1]
-                    if prev.count == 1 {
-                        out[i - 1] = cur.lowerBound...prev.upperBound
-                        out.remove(at: i)
-                    } else {
-                        out[i - 1] = (prev.lowerBound + 1)...prev.upperBound
-                        out[i] = cur.lowerBound...(cur.upperBound + 1)
-                    }
-                } else {
-                    let mid = cur.lowerBound + cur.count / 2
-                    out[i] = cur.lowerBound...(mid - 1)
-                    out.insert((mid)...cur.upperBound, at: i + 1)
-                }
-            }
-            // the fixed range is now avoid±1 (never `avoid`); the loop
-            // re-checks it before advancing
-        }
-        return out
     }
 
     /// Decision after a failed chunk read. `refreshedTotal` is a re-run
@@ -427,6 +359,33 @@ public enum MailAE {
             return row.forKeyword(kwDateSentD)?.dateValue
         }
         return row.atIndex(4)?.dateValue
+    }
+
+    // ── identity re-validation (index-addressed mailboxes) ──
+
+    public enum IdentityDecision: Equatable {
+        case verified
+        case retrySame              // transient — count a strike, retry
+        case abort(reason: String)  // definitive mismatch — abort immediately
+    }
+
+    /// Decision after re-validating an index-addressed mailbox. A nil name
+    /// is TRANSIENT (executor busy / watchdog overrun) and shares the
+    /// chunk-failure strike budget; a DIFFERENT name is definitive — the
+    /// enumeration order shifted and continuing would mislabel records.
+    /// Known limitation: nested mailboxes sharing a display name are
+    /// indistinguishable here.
+    public static func identityDecision(currentName: String?, expected: String, mailboxAt: Int,
+                                        account: String, consecutiveFailures: Int,
+                                        maxConsecutive: Int = 3) -> IdentityDecision {
+        if let current = currentName {
+            if current.caseInsensitiveCompare(expected) == .orderedSame { return .verified }
+            return .abort(reason: "mailbox \(mailboxAt) in '\(account)' now resolves to '\(current)', expected '\(expected)' — aborting to avoid mislabeled records")
+        }
+        if consecutiveFailures + 1 >= maxConsecutive {
+            return .abort(reason: "mailbox identity check failed \(maxConsecutive)× for '\(expected)' in '\(account)' — \(lastError ?? "unknown error")")
+        }
+        return .retrySame
     }
 
     /// Decimal string for an id descriptor. Wide/real ids ('comp', 'doub')
