@@ -1,370 +1,383 @@
-// Raw Apple Event toolkit for Mail — validated patterns from scripts/probe_ae.swift.
+// OSA (NSAppleScript) transport for Mail — re-implementation of the raw
+// Apple Event toolkit after macOS 27 broke direct AE sending.
 //
-// Object model gotcha: Mail's mailboxes are ACCOUNT-SCOPED. An app-level
-// mailbox specifier (from: null) silently resolves to an empty set with no
-// error — always chain account → mailbox → messages.
+// Why: on macOS 27, `NSAppleEventDescriptor.sendEvent` and raw
+// `AESendMessage` return silent empty null() replies for ALL events from
+// non-OSA senders (verified with minimal repros against Mail AND TextEdit:
+// literal-string `getd` echoes come back null; AESendMessage gets errn
+// -1700). OSA-mediated sending — NSAppleScript, ScriptingBridge, osascript —
+// works, so every Mail interaction here is a compiled script executed
+// through `OSAExecutor`.
+//
+// Shape constraints baked into this module:
+// - NSAppleScript is not thread-safe: ALL executions run on ONE serial
+//   queue. Every submission is watchdog-guarded; on overrun the execution
+//   is abandoned (the NSAppleScript leaks rather than deadlocking) and a
+//   timeout error is surfaced. While the executor is wedged, further
+//   submissions fail fast instead of piling up behind the stuck script.
+// - Message reads use `get properties of messages S thru E` — ONE bundled
+//   get per message, evaluated store-side. Loops that fetch properties in
+//   separate accesses wedge Mail's AE queue (gate-1 finding), and per-
+//   property bundles measured ~5 s/property while a range-of-properties
+//   fetch costs ~3-5 s per message for the FULL record.
+// - Heavy operations (counts, whose-based bulk ops) raise the in-script
+//   `with timeout` — Mail's default 120 s AppleEvent timeout is exceeded by
+//   bulk work on the big INBOX.
+// - Mail's mailboxes are ACCOUNT-scoped: always account → mailbox →
+//   messages.
 
 import Foundation
 import AppKit
 
-// Descriptor-type constants (module-level; shared with MailBulk)
-let typeTypeD = DescType(typeType)
-let typeSInt32D = DescType(typeSInt32)
-let typeEnumeratedD = DescType(typeEnumerated)
-let formWhoseD = DescType(0x77686f73)                   // 'whos'
-let formNameD = DescType(0x6e616d65)                    // 'name'
-let formIndexD = DescType(0x696e6478)                   // 'indx'
-let formPropD = DescType(0x70726f70)                    // 'prop'
-let typePropD = DescType(0x70726f70)
-let typeCurrentContainerD = DescType(0x63636e74)        // 'ccnt'
-let typeAbsoluteOrdinalD = DescType(0x6162736f)         // 'abso'
-
-// Keywords
-let keyDirectObject = AEKeyword(0x2d2d2d2d)             // '----'
-let keyAEWant = AEKeyword(0x77616e74)                   // 'want'
-let keyAEForm = AEKeyword(0x666f726d)                   // 'form'
-let keyAESeld = AEKeyword(0x73656c64)                   // 'seld'
-let keyAEFrom = AEKeyword(0x66726f6d)                   // 'from'
-let keyTimeoutAttr = AEKeyword(0x2174696d)              // '!tim' (ticks)
-let keyRequestedType = AEKeyword(0x72747970)            // 'rtyp'
-let keyAEData = AEKeyword(0x64617461)                   // 'data'
-let keyAEInsertHere = AEKeyword(0x696e7368)             // 'insh' (Mail move "to")
-let keyAEObject1 = AEKeyword(0x6f626a31)                // 'obj1'
-let keyAEObject2 = AEKeyword(0x6f626a32)                // 'obj2'
-let keyAECompOperator = AEKeyword(0x72656c6f)           // 'relo'
-let keyAELogicalTerms = AEKeyword(0x7465726d)           // 'term'
-let kErrNumberKeyword = AEKeyword(0x6572726e)           // 'errn'
-let kErrStringKeyword = AEKeyword(0x65727273)           // 'errs'
-
-/// Last Apple Event error for diagnostics.
+/// Last Mail transport error (script error message or watchdog overrun).
 public var lastError: String?
 
-// Classes / event ids / operators
-let cMessage = FourCharCode(0x6d737367)                 // 'mssg'
-let cMailbox = FourCharCode(0x6d627870)                 // 'mbxp'
-let cAccount = FourCharCode(0x6d616374)                 // 'mact'
-let kAECompareClass = FourCharCode(0x636f6d70)          // 'comp'
-let kAECompareEventID = FourCharCode(0x63636d70)        // 'ccmp'
-let kAEEquals = FourCharCode(0x3d202020)                // '=   '
-let kAELessThanEquals = FourCharCode(0x3c3d2020)        // '<=  '
-let kAEAnd = FourCharCode(0x414e4420)                   // 'AND '
-let kAELogicalAndEventID = FourCharCode(0x6c616e64)     // 'land'
-let kAELogicalClass = FourCharCode(0x6c6f6769)          // 'logi'
-let kAEAll = FourCharCode(0x616c6c20)                   // 'all '
+// Message record keywords (sdef four-char codes, validated live on macOS 27).
+let kwMessageIDD = AEKeyword(0x49442020)      // 'ID  '  — id
+let kwSubjectD = AEKeyword(0x7375626a)        // 'subj'  — subject
+let kwSenderD = AEKeyword(0x736e6472)         // 'sndr'  — sender
+let kwDateSentD = AEKeyword(0x64726376)       // 'drcv'  — date sent
+let kwReadD = AEKeyword(0x69737264)           // 'isrd'  — read status
+let kwFlaggedD = AEKeyword(0x6973666c)        // 'isfl'  — flagged status
+let kwJunkD = AEKeyword(0x69736a6b)           // 'isjk'  — junk mail status
+let kwContentD = AEKeyword(0x63746e74)        // 'ctnt'  — content
 
-// Properties
-let pAllD = FourCharCode(0x70414c4c)                    // 'pALL'
-let pNameD = FourCharCode(0x706e616d)                   // 'pnam'
-let pSubjectD = FourCharCode(0x7375626a)                // 'subj'
-let pSenderD = FourCharCode(0x736e6472)                 // 'sndr'
-let pDateSentD = FourCharCode(0x64726376)               // 'drcv'
-let pReadD = FourCharCode(0x69737264)                   // 'isrd'
-let pFlaggedD = FourCharCode(0x6973666c)                // 'isfl'
-let pJunkD = FourCharCode(0x69736a6b)                   // 'isjk'
-let pIDD = FourCharCode(0x49442020)                     // 'ID  '
-let pContentD = FourCharCode(0x63746e74)                // 'ctnt'
+/// Serialized NSAppleScript executor. All OSA work funnels through the one
+/// dedicated queue; `run` blocks the caller up to `timeoutSeconds` and
+/// returns nil (with `lastError` set) on watchdog overrun or script error.
+final class OSAExecutor {
+    static let shared = OSAExecutor()
+    private let queue = DispatchQueue(label: "bite.osa.mail", qos: .userInitiated)
+    private let lock = NSLock()
+    private var inFlight = false
 
-func codeDesc(_ code: FourCharCode, _ type: DescType) -> NSAppleEventDescriptor {
-    var c = code.bigEndian
-    return NSAppleEventDescriptor(descriptorType: type, bytes: &c, length: 4)!
-}
+    private final class ResultBox {
+        var reply: NSAppleEventDescriptor?
+        var failure: String?
+    }
 
-func intDesc(_ i: Int32) -> NSAppleEventDescriptor {
-    var v = i.bigEndian
-    return NSAppleEventDescriptor(descriptorType: typeSInt32D, bytes: &v, length: 4)!
-}
+    /// Compile + execute one script. Runs on the executor queue only.
+    private func executeScript(_ source: String) -> (NSAppleEventDescriptor?, String?) {
+        let script = NSAppleScript(source: source)
+        var err: NSDictionary?
+        if let desc = script?.executeAndReturnError(&err) {
+            return (desc, nil)
+        }
+        // Documented NSAppleScriptErrorDictionary keys (the SDK's constant
+        // declarations don't play well with dictionary subscripts here)
+        let num = (err?["NSAppleScriptErrorNumber"] as? Int).map(String.init) ?? "?"
+        let msg = (err?["NSAppleScriptErrorMessage"] as? String) ?? "unknown OSA failure"
+        return (nil, "AppleScript error \(num): \(msg)")
+    }
 
-func boolDesc(_ b: Bool) -> NSAppleEventDescriptor {
-    NSAppleEventDescriptor(boolean: b)
-}
+    func run(_ source: String, timeoutSeconds: TimeInterval) -> NSAppleEventDescriptor? {
+        lock.lock()
+        if inFlight {
+            // A previous script is still executing (likely wedged on Mail).
+            // Fail fast instead of queueing behind it — piled-up scripts
+            // would keep hammering Mail after the wedge clears.
+            lock.unlock()
+            lastError = "osa executor busy — previous script still in flight"
+            return nil
+        }
+        inFlight = true
+        lock.unlock()
 
-func objSpec(want: FourCharCode, form: DescType, seld: NSAppleEventDescriptor?, from: NSAppleEventDescriptor?) -> NSAppleEventDescriptor {
-    let spec = NSAppleEventDescriptor.record()
-    spec.setDescriptor(codeDesc(want, typeTypeD), forKeyword: keyAEWant)
-    var f = form.bigEndian
-    spec.setDescriptor(NSAppleEventDescriptor(descriptorType: typeEnumeratedD, bytes: &f, length: 4)!, forKeyword: keyAEForm)
-    if let seld { spec.setDescriptor(seld, forKeyword: keyAESeld) }
-    spec.setDescriptor(from ?? NSAppleEventDescriptor.null(), forKeyword: keyAEFrom)
-    return spec
-}
-
-func propSpec(_ property: FourCharCode, of target: NSAppleEventDescriptor?) -> NSAppleEventDescriptor {
-    objSpec(want: typePropD, form: formPropD, seld: codeDesc(property, typeTypeD), from: target)
+        let sem = DispatchSemaphore(value: 0)
+        let box = ResultBox()
+        let work = DispatchWorkItem {
+            let (reply, failure) = self.executeScript(source)
+            box.reply = reply
+            box.failure = failure
+            self.lock.lock()
+            self.inFlight = false
+            self.lock.unlock()
+            sem.signal()
+        }
+        queue.async(execute: work)
+        if sem.wait(timeout: .now() + timeoutSeconds) == .timedOut {
+            // Abandon this execution: the executor thread stays blocked on
+            // Mail (the NSAppleScript leaks), `inFlight` keeps further
+            // submissions failing fast, and the caller gets a timeout now
+            // instead of a deadlock.
+            lastError = "AppleScript timeout after \(Int(timeoutSeconds))s — Mail unresponsive"
+            return nil
+        }
+        if let failure = box.failure {
+            lastError = failure
+            return nil
+        }
+        lastError = nil
+        return box.reply
+    }
 }
 
 public enum MailAE {
-    public static let pAll = pAllD
-    public static let pName = pNameD
-    public static let pSubject = pSubjectD
-    public static let pSender = pSenderD
-    public static let pDateSent = pDateSentD
-    public static let pRead = pReadD
-    public static let pFlagged = pFlaggedD
-    public static let pJunk = pJunkD
-    public static let pID = pIDD
-    public static let pContent = pContentD
-    public static let cMessageM = cMessage
-    public static let cMailboxM = cMailbox
-    public static let cAccountM = cAccount
-    public static let formIndexM = formIndexD
+    // ── shared keywords (public for record mapping + tests) ──
+
+    public static let kwMessageID = kwMessageIDD
+    public static let kwSubject = kwSubjectD
+    public static let kwSender = kwSenderD
+    public static let kwDateSent = kwDateSentD
+    public static let kwRead = kwReadD
+    public static let kwFlagged = kwFlaggedD
+    public static let kwJunk = kwJunkD
+    public static let kwContent = kwContentD
+
+    // ── script text builders (pure; unit-tested) ──
+
+    /// AppleScript string literal with backslash and quote escaped.
+    public static func quotedAppleString(_ s: String) -> String {
+        "\"" + s
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\"", with: "\\\"") + "\""
+    }
+
+    static func tellPrefix(_ inScriptTimeout: Int) -> String {
+        """
+        with timeout of \(inScriptTimeout) seconds
+        tell application id "com.apple.mail"
+        """
+    }
+    static let tellSuffix = """
+        end tell
+        end timeout
+        """
+
+    static func mailboxRef(_ mailbox: String, _ account: String) -> String {
+        "mailbox \(quotedAppleString(mailbox)) of account \(quotedAppleString(account))"
+    }
+
+    /// " whose read status is false and date sent is less than or equal to
+    /// ((current date) - 30 * days)" — date arithmetic stays locale-safe.
+    /// Empty string when the selection is unrestricted.
+    public static func whoseClause(_ selection: BulkSelection) -> String {
+        var terms: [String] = []
+        if let unread = selection.unread {
+            terms.append("read status is \(unread ? "false" : "true")")
+        }
+        if let days = selection.olderThanDays {
+            terms.append("date sent is less than or equal to ((current date) - \(days) * days)")
+        }
+        return terms.isEmpty ? "" : " whose " + terms.joined(separator: " and ")
+    }
+
+    /// Contiguous index ranges covering one mailbox walk, in walk order.
+    /// Newest-first covers positions 1…min(total, walkLimit); oldest-first
+    /// covers the same-sized slice at the far end, walked downward.
+    public static func chunkPlan(total: Int, walkLimit: Int, chunkSize: Int, newestFirst: Bool) -> [(start: Int, end: Int)] {
+        var out: [(start: Int, end: Int)] = []
+        if newestFirst {
+            let limit = min(total, walkLimit)
+            var s = 1
+            while s <= limit {
+                let e = min(s + chunkSize - 1, limit)
+                out.append((s, e))
+                s = e + 1
+            }
+        } else {
+            let floor = max(1, total - walkLimit + 1)
+            var e = total
+            while e >= floor {
+                let s = max(e - chunkSize + 1, floor)
+                out.append((s, e))
+                e = s - 1
+            }
+        }
+        return out
+    }
+
+    /// Map one `properties` record descriptor to a CrawlRecord using the
+    /// exact field mapping the JSONL contract pins (docs/protocol.md,
+    /// bite-index::store::Record). Returns nil for rows without a usable id.
+    public static func recordFromProperties(_ row: NSAppleEventDescriptor?, account: String, mailbox: String,
+                                            includeContent: Bool) -> CrawlRecord? {
+        guard let row else { return nil }
+        let mailID = intString(row.forKeyword(kwMessageIDD))
+        guard let mailID, !mailID.isEmpty, mailID != "0" else { return nil }
+        let sent = row.forKeyword(kwDateSentD)?.dateValue.map { Int64($0.timeIntervalSince1970 * 1000) }
+        return CrawlRecord(
+            app: "mail", id: mailID, account: account, container: mailbox,
+            title: row.forKeyword(kwSubjectD)?.stringValue,
+            content: includeContent ? row.forKeyword(kwContentD)?.stringValue : nil,
+            participants: row.forKeyword(kwSenderD)?.stringValue,
+            start_ms: sent, end_ms: nil, updated_ms: sent,
+            read: row.forKeyword(kwReadD)?.booleanValue,
+            flagged: row.forKeyword(kwFlaggedD)?.booleanValue,
+            junk: row.forKeyword(kwJunkD)?.booleanValue,
+            completed: nil, priority: nil, props: nil
+        )
+    }
+
+    /// Decimal string for an id descriptor: stringValue coerces both 'long'
+    /// and wide-integer ids; int32 is the fallback, double the last resort
+    /// (AppleScript widens overflowing integers to real).
+    public static func intString(_ d: NSAppleEventDescriptor?) -> String? {
+        guard let d else { return nil }
+        if let s = d.stringValue, !s.isEmpty { return s }
+        let i = d.int32Value
+        if i != 0 { return String(i) }
+        let v = d.doubleValue
+        return v != 0 ? String(Int64(v)) : nil
+    }
 
     // ── target / health ──
 
-    public static func mailTarget() -> NSAppleEventDescriptor? {
-        guard let app = NSRunningApplication.runningApplications(withBundleIdentifier: "com.apple.mail").first else { return nil }
-        return NSAppleEventDescriptor(processIdentifier: app.processIdentifier)
+    /// Mail's running state — checked WITHOUT Apple Events so probing a
+    /// stopped Mail never launches it.
+    public static func mailRunning() -> Bool {
+        !NSRunningApplication.runningApplications(withBundleIdentifier: "com.apple.mail").isEmpty
     }
 
-    /// True when Mail answers a trivial Apple Event within `seconds`.
-    public static func healthy(target: NSAppleEventDescriptor, seconds: Int32 = 5) -> Bool {
-        let r = get(propSpec(pNameD, of: nil), target: target, timeoutSeconds: seconds)
-        return r.reply?.stringValue != nil && r.seconds < Double(seconds)
-    }
-
-    // ── event send ──
-
-    public static func get(_ direct: NSAppleEventDescriptor, target: NSAppleEventDescriptor, timeoutSeconds: Int32) -> (reply: NSAppleEventDescriptor?, seconds: Double) {
-        let event = NSAppleEventDescriptor(
-            eventClass: 0x636f7265, eventID: 0x67657464,
-            targetDescriptor: target, returnID: AEReturnID(-1), transactionID: 0
-        )
-        event.setParam(direct, forKeyword: keyDirectObject)
-        var ticks = timeoutSeconds * 60
-        event.setAttribute(
-            NSAppleEventDescriptor(descriptorType: typeSInt32D, bytes: &ticks, length: 4)!,
-            forKeyword: keyTimeoutAttr
-        )
-        let t0 = Date()
-        let reply = try? event.sendEvent(timeout: TimeInterval(timeoutSeconds))
-        return (reply, Date().timeIntervalSince(t0))
-    }
-
-    public static func errInfo(_ reply: NSAppleEventDescriptor?) -> String? {
-        guard let reply else { return "nil reply" }
-        if let n = reply.forKeyword(kErrNumberKeyword)?.int32Value {
-            let msg = reply.forKeyword(kErrStringKeyword)?.stringValue ?? ""
-            return "AppleEvent error \(n): \(msg)"
+    /// True when Mail answers a trivial scripted event within `seconds`.
+    public static func healthy(timeoutSeconds: Int32 = 15) -> Bool {
+        guard mailRunning() else {
+            lastError = "Mail is not running"
+            return false
         }
-        return nil
+        return run("tell application id \"com.apple.mail\" to count accounts",
+                   timeoutSeconds: TimeInterval(timeoutSeconds)) != nil
     }
 
-    /// One Apple Event returning a list of several properties of one object.
-    public static func readProperties(_ properties: [FourCharCode], of spec: NSAppleEventDescriptor, target: NSAppleEventDescriptor, timeoutSeconds: Int32 = 20) -> [NSAppleEventDescriptor?]? {
-        let list = NSAppleEventDescriptor.list()
-        for p in properties {
-            list.insert(propSpec(p, of: spec), at: Int(list.numberOfItems) + 1)
+    // ── enumeration one-shots ──
+
+    /// Probe: can this process read basic Mail data? (doctor/diagnostics)
+    public static func probeMailAccounts(timeoutSeconds: Int32 = 15) -> Int? {
+        countAccounts(timeoutSeconds: timeoutSeconds)
+    }
+
+    public static func countAccounts(timeoutSeconds: Int32 = 60) -> Int? {
+        guard let reply = run("tell application id \"com.apple.mail\" to count accounts",
+                              timeoutSeconds: TimeInterval(timeoutSeconds)) else { return nil }
+        return normalizeCount(reply)
+    }
+
+    /// Account names in Mail's own order (index = 1-based position).
+    public static func accountList(timeoutSeconds: Int32 = 60) -> [String]? {
+        guard let reply = run("tell application id \"com.apple.mail\" to get name of every account",
+                              timeoutSeconds: TimeInterval(timeoutSeconds)) else { return nil }
+        var out: [String] = []
+        for i in 1...max(reply.numberOfItems, 1) where i <= reply.numberOfItems {
+            if let s = reply.atIndex(i)?.stringValue { out.append(s) }
         }
-        let (reply, _) = get(list, target: target, timeoutSeconds: timeoutSeconds)
-        guard let reply, errInfo(reply) == nil, reply.descriptorType == DescType(0x6c697374) else { return nil }
+        return out.isEmpty ? nil : out
+    }
+
+    /// Mailbox names of one account, in Mail's own order.
+    public static func mailboxList(account: String, timeoutSeconds: Int32 = 60) -> [String]? {
+        guard mailRunning() else { lastError = "Mail is not running"; return nil }
+        let src = """
+        \(tellPrefix(120))
+        get name of every mailbox of account \(quotedAppleString(account))
+        \(tellSuffix)
+        """
+        guard let reply = run(src, timeoutSeconds: TimeInterval(timeoutSeconds)) else { return nil }
+        var out: [String] = []
+        for i in 1...max(reply.numberOfItems, 1) where i <= reply.numberOfItems {
+            if let s = reply.atIndex(i)?.stringValue { out.append(s) }
+        }
+        return out.isEmpty ? nil : out
+    }
+
+    public static func countMessages(mailbox: String, account: String, timeoutSeconds: Int32 = 360) -> Int? {
+        guard mailRunning() else { lastError = "Mail is not running"; return nil }
+        let src = """
+        \(tellPrefix(240))
+        count messages of \(mailboxRef(mailbox, account))
+        \(tellSuffix)
+        """
+        guard let reply = run(src, timeoutSeconds: TimeInterval(timeoutSeconds)) else { return nil }
+        return normalizeCount(reply)
+    }
+
+    // ── message reads ──
+
+    /// `get properties of messages S thru E` — ONE script execution whose
+    /// single Apple Event fetches the full record of every message in the
+    /// range. Returns one record descriptor per message, ascending position.
+    /// nil on script error / watchdog overrun (see `lastError`).
+    public static func readProperties(mailbox: String, account: String, start: Int, end: Int,
+                                      includeContent: Bool, timeoutSeconds: Int32 = 400) -> [NSAppleEventDescriptor?]? {
+        guard mailRunning() else { lastError = "Mail is not running"; return nil }
+        let src = """
+        \(tellPrefix(240))
+        set mb to \(mailboxRef(mailbox, account))
+        get properties of messages \(start) thru \(end) of mb
+        \(tellSuffix)
+        """
+        guard let reply = run(src, timeoutSeconds: TimeInterval(timeoutSeconds)) else { return nil }
         var out: [NSAppleEventDescriptor?] = []
         for i in 1...max(reply.numberOfItems, 1) where i <= reply.numberOfItems {
             out.append(reply.atIndex(i))
         }
-        return out
+        return out.isEmpty ? nil : out
     }
 
-    /// 'cnte' event — count of an every-element / whose specifier.
-    public static func count(_ everyOrWhoseSpec: NSAppleEventDescriptor, target: NSAppleEventDescriptor, timeoutSeconds: Int32 = 30) -> Int? {
-        let event = NSAppleEventDescriptor(
-            eventClass: 0x636f7265, eventID: 0x636e7465,
-            targetDescriptor: target, returnID: AEReturnID(-1), transactionID: 0
-        )
-        event.setParam(everyOrWhoseSpec, forKeyword: keyDirectObject)
-        var rtyp = typeSInt32D.bigEndian
-        event.setParam(NSAppleEventDescriptor(descriptorType: typeTypeD, bytes: &rtyp, length: 4)!, forKeyword: keyRequestedType)
-        guard let reply = try? event.sendEvent(timeout: TimeInterval(timeoutSeconds)) else {
-            lastError = "sendEvent threw"
-            return nil
-        }
-        if let errn = reply.forKeyword(kErrNumberKeyword)?.int32Value {
-            let errs = reply.forKeyword(kErrStringKeyword)?.stringValue ?? ""
-            lastError = "AE error \(errn): \(errs)"
-            return nil
-        }
-        lastError = nil
+    // ── bulk primitives (whose-based; one script per operation) ──
+
+    /// `count (every message … whose …)` — bounded by the caller via
+    /// timeoutSeconds; bulk counts on the big INBOX may run minutes.
+    public static func countWhose(mailbox: String, account: String, selection: BulkSelection,
+                                  timeoutSeconds: Int32 = 900) -> Int? {
+        guard mailRunning() else { lastError = "Mail is not running"; return nil }
+        let src = """
+        \(tellPrefix(600))
+        count (every message of \(mailboxRef(mailbox, account))\(whoseClause(selection)))
+        \(tellSuffix)
+        """
+        guard let reply = run(src, timeoutSeconds: TimeInterval(timeoutSeconds)) else { return nil }
+        return normalizeCount(reply)
+    }
+
+    /// `set <property> of (every message … whose …) to value` — one script.
+    public static func setWhose(mailbox: String, account: String, selection: BulkSelection,
+                                property: String, value: Bool, timeoutSeconds: Int32 = 900) -> (ok: Bool, error: String?) {
+        guard mailRunning() else { return (false, "Mail is not running") }
+        let src = """
+        \(tellPrefix(600))
+        set \(property) of (every message of \(mailboxRef(mailbox, account))\(whoseClause(selection))) to \(value)
+        \(tellSuffix)
+        """
+        return runOk(src, timeoutSeconds: TimeInterval(timeoutSeconds))
+    }
+
+    /// `move (every message … whose …) to mailbox …` — one script.
+    public static func moveWhose(mailbox: String, account: String, selection: BulkSelection,
+                                 toMailbox: String, toAccount: String, timeoutSeconds: Int32 = 900) -> (ok: Bool, error: String?) {
+        guard mailRunning() else { return (false, "Mail is not running") }
+        let src = """
+        \(tellPrefix(600))
+        move (every message of \(mailboxRef(mailbox, account))\(whoseClause(selection))) to \(mailboxRef(toMailbox, toAccount))
+        \(tellSuffix)
+        """
+        return runOk(src, timeoutSeconds: TimeInterval(timeoutSeconds))
+    }
+
+    /// `delete (every message … whose …)` — one script.
+    public static func deleteWhose(mailbox: String, account: String, selection: BulkSelection,
+                                   timeoutSeconds: Int32 = 900) -> (ok: Bool, error: String?) {
+        guard mailRunning() else { return (false, "Mail is not running") }
+        let src = """
+        \(tellPrefix(600))
+        delete (every message of \(mailboxRef(mailbox, account))\(whoseClause(selection)))
+        \(tellSuffix)
+        """
+        return runOk(src, timeoutSeconds: TimeInterval(timeoutSeconds))
+    }
+
+    // ── executor plumbing ──
+
+    static func run(_ source: String, timeoutSeconds: TimeInterval) -> NSAppleEventDescriptor? {
+        OSAExecutor.shared.run(source, timeoutSeconds: timeoutSeconds)
+    }
+
+    static func runOk(_ source: String, timeoutSeconds: TimeInterval) -> (ok: Bool, error: String?) {
+        if run(source, timeoutSeconds: timeoutSeconds) != nil { return (true, nil) }
+        return (false, lastError ?? "unknown OSA failure")
+    }
+
+    static func normalizeCount(_ reply: NSAppleEventDescriptor) -> Int? {
         let v = reply.int32Value
         return v < 0 ? nil : Int(v)
-    }
-
-    /// Probe: can this process read basic Mail data? (doctor/diagnostics)
-    public static func probeMailAccounts(target: NSAppleEventDescriptor, timeoutSeconds: Int32) -> Int? {
-        count(everySpec(want: cAccount, from: nil), target: target, timeoutSeconds: timeoutSeconds)
-    }
-
-    /// "every <class> of <container>" specifier.
-    public static func everySpec(want: FourCharCode, from: NSAppleEventDescriptor?) -> NSAppleEventDescriptor {
-        let seld = NSAppleEventDescriptor(descriptorType: typeAbsoluteOrdinalD, bytes: unsafeBytes(of: kAEAll), length: 4)!
-        return objSpec(want: want, form: formIndexD, seld: seld, from: from)
-    }
-
-    public static func unsafeBytes(of value: FourCharCode) -> UnsafeRawPointer {
-        var v = value.bigEndian
-        return withUnsafeBytes(of: &v) { UnsafeRawPointer($0.baseAddress!) }
-    }
-
-    // ── chains & enumeration ──
-
-    public static func accountSpec(index: Int) -> NSAppleEventDescriptor {
-        objSpec(want: cAccountM, form: formIndexM, seld: intDesc(Int32(index)), from: nil)
-    }
-
-    public static func mailboxSpec(name: String, account: NSAppleEventDescriptor?) -> NSAppleEventDescriptor {
-        objSpec(want: cMailboxM, form: formNameD, seld: NSAppleEventDescriptor(string: name), from: account)
-    }
-
-    public static func messageSpec(index: Int, mailbox: NSAppleEventDescriptor) -> NSAppleEventDescriptor {
-        objSpec(want: cMessageM, form: formIndexM, seld: intDesc(Int32(index)), from: mailbox)
-    }
-
-    public static func countAccounts(target: NSAppleEventDescriptor) -> Int? {
-        count(everySpec(want: cAccountM, from: nil), target: target)
-    }
-
-    public static func countMailboxes(account: NSAppleEventDescriptor, target: NSAppleEventDescriptor) -> Int? {
-        count(everySpec(want: cMailboxM, from: account), target: target)
-    }
-
-    public static func countMessages(mailbox: NSAppleEventDescriptor, target: NSAppleEventDescriptor) -> Int? {
-        count(everySpec(want: cMessageM, from: mailbox), target: target)
-    }
-
-    public static func accountName(_ account: NSAppleEventDescriptor, target: NSAppleEventDescriptor) -> String? {
-        let (reply, _) = get(propSpec(pNameD, of: account), target: target, timeoutSeconds: 20)
-        guard let reply, errInfo(reply) == nil else { return nil }
-        return reply.stringValue
-    }
-
-    public static func mailboxName(_ mailbox: NSAppleEventDescriptor, target: NSAppleEventDescriptor) -> String? {
-        let (reply, _) = get(propSpec(pNameD, of: mailbox), target: target, timeoutSeconds: 20)
-        guard let reply, errInfo(reply) == nil else { return nil }
-        return reply.stringValue
-    }
-
-    public static func accountList(target: NSAppleEventDescriptor) -> [(name: String, spec: NSAppleEventDescriptor)]? {
-        guard let n = countAccounts(target: target), n > 0 else { return nil }
-        var out: [(String, NSAppleEventDescriptor)] = []
-        for i in 1...n {
-            let spec = accountSpec(index: i)
-            guard let name = accountName(spec, target: target) else { continue }
-            out.append((name, spec))
-        }
-        return out
-    }
-
-    public static func mailboxList(accountName: String, account: NSAppleEventDescriptor, target: NSAppleEventDescriptor) -> [(name: String, spec: NSAppleEventDescriptor)]? {
-        guard let n = countMailboxes(account: account, target: target), n > 0 else { return nil }
-        var out: [(String, NSAppleEventDescriptor)] = []
-        for i in 1...n {
-            let spec = objSpec(want: cMailbox, form: formIndexD, seld: intDesc(Int32(i)), from: account)
-            guard let name = mailboxName(spec, target: target) else { continue }
-            out.append((name, spec))
-        }
-        return out
-    }
-
-    // ── bulk primitives ──
-
-    /// Send any pre-built event with a raised per-AE timeout.
-    public static func sendBulk(_ event: NSAppleEventDescriptor, target: NSAppleEventDescriptor, timeoutSeconds: Int32) -> (ok: Bool, seconds: Double, error: String?) {
-        var ticks = timeoutSeconds * 60
-        event.setAttribute(
-            NSAppleEventDescriptor(descriptorType: typeSInt32D, bytes: &ticks, length: 4)!,
-            forKeyword: keyTimeoutAttr
-        )
-        let t0 = Date()
-        guard let reply = try? event.sendEvent(timeout: TimeInterval(timeoutSeconds)) else {
-            return (false, Date().timeIntervalSince(t0), "sendEvent failed")
-        }
-        if let errn = reply.forKeyword(kErrNumberKeyword)?.int32Value {
-            let errs = reply.forKeyword(kErrStringKeyword)?.stringValue ?? ""
-            return (false, Date().timeIntervalSince(t0), "AppleEvent error \(errn): \(errs)")
-        }
-        return (true, Date().timeIntervalSince(t0), nil)
-    }
-
-    public static func countWhose(_ selector: NSAppleEventDescriptor, target: NSAppleEventDescriptor, timeoutSeconds: Int32) -> Int? {
-        count(selector, target: target, timeoutSeconds: timeoutSeconds)
-    }
-
-    /// set <property> of <specifier> to <value> — one Apple Event.
-    public static func setStatus(_ property: FourCharCode, on selector: NSAppleEventDescriptor, to value: Bool,
-                          target: NSAppleEventDescriptor, timeoutSeconds: Int32) -> (ok: Bool, error: String?) {
-        let event = NSAppleEventDescriptor(
-            eventClass: 0x636f7265, eventID: 0x73657464,
-            targetDescriptor: target, returnID: AEReturnID(-1), transactionID: 0
-        )
-        event.setParam(propSpec(property, of: selector), forKeyword: keyDirectObject)
-        event.setParam(boolDesc(value), forKeyword: keyAEData)
-        let (ok, _, err) = sendBulk(event, target: target, timeoutSeconds: timeoutSeconds)
-        return (ok, err)
-    }
-
-    /// "messages of <mailbox> whose <filter>" specifier. Empty filter →
-    /// every-message specifier.
-    public static func messageSelector(mailbox: NSAppleEventDescriptor, selection: BulkSelection, now: Date) -> NSAppleEventDescriptor {
-        guard !selection.isEmpty else {
-            return everySpec(want: cMessage, from: mailbox)
-        }
-
-        var tests: [[AEKeyword: NSAppleEventDescriptor]] = []
-        func compEvent(_ test: [AEKeyword: NSAppleEventDescriptor]) -> NSAppleEventDescriptor {
-            let ev = NSAppleEventDescriptor(
-                eventClass: kAECompareClass, eventID: kAECompareEventID,
-                targetDescriptor: NSAppleEventDescriptor.null(),
-                returnID: AEReturnID(-1), transactionID: 0
-            )
-            if let o1 = test[keyAEObject1] { ev.setParam(o1, forKeyword: keyAEObject1) }
-            if let relo = test[keyAECompOperator] { ev.setParam(relo, forKeyword: keyAECompOperator) }
-            if let o2 = test[keyAEObject2] { ev.setParam(o2, forKeyword: keyAEObject2) }
-            return ev
-        }
-        func eqTest(_ property: FourCharCode, _ value: NSAppleEventDescriptor) {
-            let it = NSAppleEventDescriptor(descriptorType: typeCurrentContainerD, data: nil)!
-            tests.append([
-                keyAEObject1: objSpec(want: typePropD, form: formPropD, seld: codeDesc(property, typeTypeD), from: it),
-                keyAECompOperator: codeDesc(kAEEquals, typeEnumeratedD),
-                keyAEObject2: value,
-            ])
-        }
-        func lteDateTest(_ property: FourCharCode, _ date: Date) {
-            let it = NSAppleEventDescriptor(descriptorType: typeCurrentContainerD, data: nil)!
-            tests.append([
-                keyAEObject1: objSpec(want: typePropD, form: formPropD, seld: codeDesc(property, typeTypeD), from: it),
-                keyAECompOperator: codeDesc(kAELessThanEquals, typeEnumeratedD),
-                keyAEObject2: NSAppleEventDescriptor(date: date),
-            ])
-        }
-        if let unread = selection.unread, unread {
-            eqTest(pReadD, boolDesc(false))
-        }
-        if let days = selection.olderThanDays {
-            lteDateTest(pDateSentD, now.addingTimeInterval(-Double(days) * 86400))
-        }
-
-        let test: NSAppleEventDescriptor
-        if tests.count == 1 {
-            test = compEvent(tests[0])
-        } else {
-            let terms = NSAppleEventDescriptor.list()
-            for t in tests {
-                terms.insert(compEvent(t), at: Int(terms.numberOfItems) + 1)
-            }
-            let logical = NSAppleEventDescriptor(
-                eventClass: kAELogicalClass, eventID: kAELogicalAndEventID,
-                targetDescriptor: NSAppleEventDescriptor.null(),
-                returnID: AEReturnID(-1), transactionID: 0
-            )
-            logical.setParam(codeDesc(kAEAnd, typeEnumeratedD), forKeyword: keyDirectObject)
-            logical.setParam(terms, forKeyword: keyAELogicalTerms)
-            test = logical
-        }
-
-        let spec = NSAppleEventDescriptor.record()
-        spec.setDescriptor(codeDesc(cMessage, typeTypeD), forKeyword: keyAEWant)
-        var form = formWhoseD.bigEndian
-        spec.setDescriptor(NSAppleEventDescriptor(descriptorType: typeEnumeratedD, bytes: &form, length: 4)!, forKeyword: keyAEForm)
-        spec.setDescriptor(test, forKeyword: keyAESeld)
-        spec.setDescriptor(mailbox, forKeyword: keyAEFrom)
-        return spec
     }
 }

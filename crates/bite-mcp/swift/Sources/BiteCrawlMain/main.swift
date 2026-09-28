@@ -4,10 +4,12 @@
 // Modes:
 //   --crawl-worker              30-day Mail window + 10-day backfill + mirrors
 //   --bulk-worker --bulk-op …   one-shot bulk Mail operation
+//   --probe-mail                doctor diagnostic (one-shot Mail OSA probe)
 //
-// ALL Mail Apple Events are sent from THIS process's helper child
-// (bite-helper), whose TCC identity the user has already approved at the
-// stable install path. The parent `bite` process never touches Mail.
+// ALL Mail access happens in THIS process through the OSA transport
+// (NSAppleScript on a serialized executor — raw Apple Event sending returns
+// silent null replies on macOS 27). The parent `bite` process never touches
+// Mail.
 
 import Foundation
 import BiteCrawlCore
@@ -45,13 +47,23 @@ while let arg = it.next() {
     case "--set-read": setRead = Bool(it.next() ?? "true") ?? true
     case "--set-flagged": setFlagged = Bool(it.next() ?? "true") ?? true
     case "--set-junk": setJunk = Bool(it.next() ?? "true") ?? true
+    case "--probe-mail":
+        // Doctor diagnostic: can THIS binary read Mail data through OSA?
+        // (raw Apple Events return silent null replies on macOS 27)
+        let n = MailAE.probeMailAccounts()
+        let verdict = (n != nil && n! > 0) ? "authorized" : "denied_or_empty"
+        print("{\"mail_automation\": \"\(verdict)\", \"accounts\": \(n ?? -1)}")
+        exit(0)
     default: break
     }
 }
 
 let jobID = workerMode + "-\(Int(Date().timeIntervalSince1970))"
 let progress: (String, Int, Int) -> Void = { state, processed, found in
-    MailCrawler.writeState(jobID: jobID, state: state, processed: processed, found: found, window: nil)
+    // Re-publish the last activity label instead of nil: coarse progress
+    // reports must not clobber the wait-loop's attempt/diagnostic detail.
+    MailCrawler.writeState(jobID: jobID, state: state, processed: processed, found: found,
+                           window: CrawlState.shared.currentWindow)
     FileHandle.standardError.write(Data("[worker] \(state) processed=\(processed) found=\(found)\n".utf8))
 }
 
@@ -61,7 +73,7 @@ let signalQueue = DispatchQueue.global()
 termSource = DispatchSource.makeSignalSource(signal: SIGTERM, queue: signalQueue)
 termSource?.setEventHandler {
     CrawlState.shared.stop()
-    MailCrawler.writeState(jobID: jobID, state: "cancelled", processed: CrawlState.shared.snapshot.processed, found: CrawlState.shared.snapshot.found, window: nil)
+    MailCrawler.writeState(jobID: jobID, state: "cancelled", processed: CrawlState.shared.snapshot.processed, found: CrawlState.shared.snapshot.found, window: CrawlState.shared.currentWindow)
     exit(0)
 }
 termSource?.resume()
@@ -80,10 +92,11 @@ case "bulk":
         progress(state, count, 0)
     }
 case "crawl":
-    MailCrawler.runCrawlWorker(windowDays: windowDays, storeBody: storeBody, mailboxFilter: mailboxFilter, progress: progress)
+    let seq = MailCrawler.runCrawlWorker(windowDays: windowDays, storeBody: storeBody, mailboxFilter: mailboxFilter, progress: progress)
     if !CrawlState.shared.isCancelled && mirrors {
         let staging = MailCrawler.stagingDir()
-        let seq = SeqCounter(0)
+        // continue the mail job's batch numbering: restarting at 0 would
+        // collide with (and drop) mail batches already staged
         Mirrors.calendar(staging: staging, jobID: jobID, seq: seq, progress: progress)
         Mirrors.reminders(staging: staging, jobID: jobID, seq: seq, progress: progress)
         Mirrors.contacts(staging: staging, jobID: jobID, seq: seq, progress: progress)

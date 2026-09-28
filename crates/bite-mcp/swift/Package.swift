@@ -21,7 +21,7 @@ let package = Package(
         ),
         .testTarget(
             name: "BiteBridgeTests",
-            dependencies: ["bite-helper"],
+            dependencies: ["bite-helper", "BiteCrawlCore"],
             path: "Tests/BiteBridgeTests"
         ),
     ],

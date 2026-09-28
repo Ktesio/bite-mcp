@@ -1,9 +1,14 @@
 // Mail crawler core: window scheduling (30d initial + 10d backfill),
-// health-probed per-message reads, JSONL batch staging.
+// chunked OSA reads, JSONL batch staging.
 //
 // Runs inside the standalone `bite-crawl` process. Lifetime is fully
 // detached from the helper/CLI/MCP: progress is published through a
 // callback + a crawl-state.json file the Rust control plane polls.
+//
+// Mail transport: every read goes through MailAE's serialized NSAppleScript
+// executor (raw Apple Event sending is broken on macOS 27). Message reads
+// fetch `properties` in small index ranges — one bundled get per message,
+// bounded well under Mail's 120 s AppleEvent timeout.
 
 import Foundation
 
@@ -50,6 +55,7 @@ public final class CrawlState {
     private var cancelled = false
     private var processed = 0
     private var found = 0
+    private var window: String?
 
     public init() {}
 
@@ -72,6 +78,19 @@ public final class CrawlState {
     public var snapshot: (processed: Int, found: Int) {
         lock.lock(); defer { lock.unlock() }
         return (processed, found)
+    }
+
+    /// Last activity label written into crawl-state's `window` field. The
+    /// worker's progress callback reads this so coarse progress reports can
+    /// never clobber the wait-loop's attempt/diagnostic detail.
+    public func setWindow(_ w: String?) {
+        lock.lock(); defer { lock.unlock() }
+        window = w
+    }
+
+    public var currentWindow: String? {
+        lock.lock(); defer { lock.unlock() }
+        return window
     }
 }
 
@@ -115,6 +134,7 @@ public enum MailCrawler {
     }
 
     public static func writeState(jobID: String, state: String, processed: Int, found: Int, window: String?) {
+        CrawlState.shared.setWindow(window)
         let dict: [String: Any] = [
             "job_id": jobID,
             "state": state,
@@ -134,16 +154,13 @@ public enum MailCrawler {
     }
 
     public static func runJob(jobID: String, windowDays: Int, storeBody: Bool, mailboxFilter: String?,
-                              progress: @escaping (String, Int, Int) -> Void) {
+                              seq: SeqCounter, progress: @escaping (String, Int, Int) -> Void) {
         let state = CrawlState.shared
-        guard let target = MailAE.mailTarget() else {
+        guard MailAE.mailRunning() else {
             writeState(jobID: jobID, state: "failed", processed: 0, found: 0, window: nil)
             progress("failed", 0, 0)
             return
         }
-        let props: [FourCharCode] = storeBody
-            ? [MailAE.pID, MailAE.pSubject, MailAE.pSender, MailAE.pDateSent, MailAE.pRead, MailAE.pFlagged, MailAE.pJunk, MailAE.pContent]
-            : [MailAE.pID, MailAE.pSubject, MailAE.pSender, MailAE.pDateSent, MailAE.pRead, MailAE.pFlagged, MailAE.pJunk]
 
         let now = Int64(Date().timeIntervalSince1970 * 1000)
         let day: Int64 = 86_400_000
@@ -157,11 +174,11 @@ public enum MailCrawler {
         // Mail's AE layer can stay saturated for many hours; keep retrying
         // for ~24 h before giving up (the control plane auto-respawns later
         // if we ever do exit). Heartbeat the state file every attempt.
-        var accounts: [(name: String, spec: NSAppleEventDescriptor)]? = nil
+        var accounts: [String]? = nil
         let maxWaitAttempts = 1440  // 24 h at 60 s intervals
         for attempt in 0..<maxWaitAttempts {
             if CrawlState.shared.isCancelled { break }
-            if let list = MailAE.accountList(target: target) {
+            if let list = MailAE.accountList() {
                 accounts = list
                 break
             }
@@ -178,13 +195,13 @@ public enum MailCrawler {
             return
         }
 
-        var targets: [(account: String, name: String, spec: NSAppleEventDescriptor)] = []
+        var targets: [(account: String, name: String)] = []
         for acct in accounts {
-            guard let boxes = MailAE.mailboxList(accountName: acct.name, account: acct.spec, target: target) else { continue }
-            for (boxName, boxSpec) in boxes {
+            guard let boxes = MailAE.mailboxList(account: acct) else { continue }
+            for boxName in boxes {
                 if let filter = mailboxFilter,
                    boxName.caseInsensitiveCompare(filter) != .orderedSame { continue }
-                targets.append((account: acct.name, name: boxName, spec: boxSpec))
+                targets.append((account: acct, name: boxName))
             }
         }
 
@@ -199,9 +216,9 @@ public enum MailCrawler {
                 let label = windowLabel(window)
                 writeState(jobID: jobID, state: "running", processed: processed, found: found, window: label)
                 progress("running", processed, found)
-                let r = crawlMailbox(jobID: jobID, account: t.name, mailbox: t.name, boxSpec: t.spec,
-                                     window: window, props: props, storeBody: storeBody,
-                                     target: target, staging: staging, progress: progress)
+                let r = crawlMailbox(jobID: jobID, account: t.account, mailbox: t.name,
+                                     window: window, includeContent: storeBody,
+                                     staging: staging, seq: seq, progress: progress)
                 processed += r.scanned
                 found += r.indexed
                 CrawlState.shared.tally(processedAdd: r.scanned, foundAdd: r.indexed)
@@ -215,64 +232,41 @@ public enum MailCrawler {
         progress(finalState, processed, found)
     }
 
-    /// Walk one mailbox for one date window. Order detected from the first
-    /// two dated samples; walk stops at the first window edge crossed.
-    static func crawlMailbox(jobID: String, account: String, mailbox: String, boxSpec: NSAppleEventDescriptor,
-                             window: CrawlWindow, props: [FourCharCode], storeBody: Bool,
-                             target: NSAppleEventDescriptor, staging: URL,
+    /// Walk one mailbox for one date window in index-range chunks. Order
+    /// detected from the first chunk's dated rows; the walk stops at the
+    /// first window edge crossed.
+    static func crawlMailbox(jobID: String, account: String, mailbox: String,
+                             window: CrawlWindow, includeContent: Bool,
+                             staging: URL, seq: SeqCounter,
                              progress: @escaping (String, Int, Int) -> Void) -> (scanned: Int, indexed: Int) {
-        guard let total = MailAE.countMessages(mailbox: boxSpec, target: target), total > 0 else {
+        guard let total = MailAE.countMessages(mailbox: mailbox, account: account), total > 0 else {
             return (0, 0)
         }
 
-        func read(_ position: Int) -> CrawlRecord? {
-            guard let vals = MailAE.readProperties(props, of: MailAE.messageSpec(index: position, mailbox: boxSpec), target: target),
-                  vals.count == props.count else {
-                return nil
-            }
-            func str(_ i: Int) -> String? { vals[i]?.stringValue }
-            func bool(_ i: Int) -> Bool? { vals[i]?.booleanValue }
-            func ms(_ i: Int) -> Int64? { vals[i]?.dateValue.map { Int64($0.timeIntervalSince1970 * 1000) } }
-            var mailID = str(0) ?? ""
-            if mailID.isEmpty, let d0 = vals[0] {
-                mailID = String(d0.int32Value)
-            }
-            guard !mailID.isEmpty, mailID != "0" else { return nil }
-            return CrawlRecord(
-                app: "mail", id: mailID, account: account, container: mailbox,
-                title: str(1), content: storeBody ? str(7) : nil, participants: str(2),
-                start_ms: ms(3), end_ms: nil, updated_ms: ms(3),
-                read: bool(4), flagged: bool(5), junk: bool(6),
-                completed: nil, priority: nil, props: nil
-            )
-        }
-
-        func dated(_ position: Int) -> Date? {
-            guard let vals = MailAE.readProperties([MailAE.pDateSent], of: MailAE.messageSpec(index: position, mailbox: boxSpec), target: target),
-                  vals.count == 1 else { return nil }
-            return vals[0]?.dateValue
-        }
-
-        var newestFirst = true
-        if let d1 = dated(1), let d2 = dated(2), total >= 2 {
-            newestFirst = d1 >= d2
-        }
+        // 12 full records per script keeps each execution (~3-5 s/message on
+        // the big INBOX) well inside the script's own 240 s event timeout.
+        let chunkSize = 12
+        let walkLimit = min(total, 20_000)
 
         var batchRecords: [CrawlRecord] = []
-        var batchSeq = 0
         var scanned = 0
         var indexed = 0
-        var failures = 0
         var edgeCrossed = false
-        let walkLimit = min(total, 20_000)
+
+        func flush() {
+            guard !batchRecords.isEmpty else { return }
+            writeBatch(staging: staging, jobID: jobID, seq: seq.value, records: batchRecords)
+            seq.value += 1
+            batchRecords.removeAll(keepingCapacity: true)
+        }
 
         func collect(_ record: CrawlRecord) {
             batchRecords.append(record)
             indexed += 1
-            if batchRecords.count >= 200 {
-                writeBatch(staging: staging, jobID: jobID, seq: batchSeq, records: batchRecords)
-                batchSeq += 1
-                batchRecords.removeAll(keepingCapacity: true)
+            // Small staged batches keep the index fresh while Mail is slow;
+            // the JSONL handoff tolerates any record count per file.
+            if batchRecords.count >= 50 {
+                flush()
             }
         }
 
@@ -280,73 +274,83 @@ public enum MailCrawler {
             ms >= window.fromMs && ms < window.toMs
         }
 
+        // Process one chunk's rows in walk order. Returns true when the
+        // window's lower edge was crossed.
+        func process(_ rows: [NSAppleEventDescriptor?], descending: Bool) -> Bool {
+            for row in descending ? rows.reversed() : rows {
+                scanned += 1
+                guard let record = MailAE.recordFromProperties(row, account: account, mailbox: mailbox,
+                                                               includeContent: includeContent),
+                      let ms = record.start_ms else { continue }
+                if ms < window.fromMs { return true }
+                if inWindow(ms) { collect(record) }
+            }
+            return false
+        }
+
+        func rowDate(_ row: NSAppleEventDescriptor?) -> Date? {
+            row?.forKeyword(MailAE.kwDateSent)?.dateValue
+        }
+
+        // First chunk doubles as the order probe (positions shift as mail
+        // arrives, but ids dedupe at ingest, so overlap is harmless).
+        let probeEnd = min(chunkSize, walkLimit)
+        guard let probe = MailAE.readProperties(mailbox: mailbox, account: account, start: 1, end: probeEnd,
+                                                includeContent: includeContent), !probe.isEmpty else {
+            return (0, 0)
+        }
+        var newestFirst = true
+        if probe.count >= 2, let d1 = rowDate(probe[0]), let d2 = rowDate(probe[1]) {
+            newestFirst = d1 >= d2
+        }
+
+        var plan = MailAE.chunkPlan(total: total, walkLimit: walkLimit, chunkSize: chunkSize, newestFirst: newestFirst)
+        if !newestFirst {
+            plan.removeFirst()  // probe chunk holds the mailbox's oldest rows; the descending walk starts at the far end
+        }
+
         if newestFirst {
-            var position = 1
-            while position <= walkLimit, !CrawlState.shared.isCancelled,
-                  !edgeCrossed, failures < 10, indexed < walkLimit {
-                if !MailAE.healthy(target: target) {
-                    failures += 1
-                    Thread.sleep(forTimeInterval: min(300, Double(10 * failures)))
-                    continue
-                }
-                // gentle pacing: small pause every few messages keeps Mail's
-                // event queue responsive for the user's interactive Mail use
-                if scanned % 5 == 0 {
-                    Thread.sleep(forTimeInterval: 0.15)
-                }
-                guard let record = read(position) else {
-                    failures += 1
-                    position += 1
-                    continue
-                }
-                scanned += 1
-                position += 1
-                if let ms = record.start_ms, ms < window.fromMs { edgeCrossed = true; break }
-                if let ms = record.start_ms, inWindow(ms) { collect(record) }
-                if CrawlState.shared.snapshot.processed % 25 == 0 {
-                    progress("running", CrawlState.shared.snapshot.processed, CrawlState.shared.snapshot.found)
-                }
+            edgeCrossed = process(probe, descending: false)
+        }
+
+        var consecutiveFailures = 0
+        for range in plan {
+            if CrawlState.shared.isCancelled || edgeCrossed || consecutiveFailures >= 3 || indexed >= walkLimit {
+                break
             }
-        } else {
-            var position = total
-            let floor = max(1, total - walkLimit)
-            while position >= floor, !CrawlState.shared.isCancelled,
-                  !edgeCrossed, failures < 10, indexed < walkLimit {
-                if !MailAE.healthy(target: target) {
-                    failures += 1
-                    Thread.sleep(forTimeInterval: min(300, Double(10 * failures)))
-                    continue
-                }
-                if scanned % 5 == 0 {
-                    Thread.sleep(forTimeInterval: 0.15)
-                }
-                guard let record = read(position) else {
-                    failures += 1
-                    position -= 1
-                    continue
-                }
-                scanned += 1
-                position -= 1
-                if let ms = record.start_ms {
-                    if ms < window.fromMs { edgeCrossed = true; break }
-                }
-                if let ms = record.start_ms, inWindow(ms) { collect(record) }
-                if CrawlState.shared.snapshot.processed % 25 == 0 {
-                    progress("running", CrawlState.shared.snapshot.processed, CrawlState.shared.snapshot.found)
-                }
+            if !MailAE.healthy() {
+                consecutiveFailures += 1
+                Thread.sleep(forTimeInterval: min(60, Double(5 * consecutiveFailures)))
+                continue
+            }
+            if let rows = MailAE.readProperties(mailbox: mailbox, account: account, start: range.start, end: range.end,
+                                                includeContent: includeContent) {
+                consecutiveFailures = 0
+                // gentle pacing: a pause between chunks keeps Mail's event
+                // queue responsive for the user's interactive Mail use
+                Thread.sleep(forTimeInterval: 1)
+                edgeCrossed = process(rows, descending: !newestFirst)
+                progress("running", CrawlState.shared.snapshot.processed, CrawlState.shared.snapshot.found)
+            } else {
+                consecutiveFailures += 1
+                Thread.sleep(forTimeInterval: min(60, Double(5 * consecutiveFailures)))
             }
         }
-        if !batchRecords.isEmpty {
-            writeBatch(staging: staging, jobID: jobID, seq: batchSeq, records: batchRecords)
-        }
+        flush()
         return (scanned, indexed)
     }
 
     /// Synchronous crawl used by the detached `bite-crawl` worker process.
+    /// Returns the batch sequence counter so mirror crawls continue the
+    /// same job's numbering instead of colliding with mail batches.
+    @discardableResult
     public static func runCrawlWorker(windowDays: Int, storeBody: Bool, mailboxFilter: String?,
-                                      progress: @escaping (String, Int, Int) -> Void) {
+                                      progress: @escaping (String, Int, Int) -> Void) -> SeqCounter {
         let jobID = "crawl-\(Int(Date().timeIntervalSince1970))"
+        let seq = SeqCounter(0)
         writeState(jobID: jobID, state: "running", processed: 0, found: 0, window: nil)
-        runJob(jobID: jobID, windowDays: windowDays, storeBody: storeBody, mailboxFilter: mailboxFilter, progress: progress)
+        runJob(jobID: jobID, windowDays: windowDays, storeBody: storeBody, mailboxFilter: mailboxFilter,
+               seq: seq, progress: progress)
+        return seq
     }
 }
