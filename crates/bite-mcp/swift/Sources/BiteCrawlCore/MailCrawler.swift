@@ -89,6 +89,7 @@ public final class CrawlState {
     private var flushPending: (() -> Bool)?
     private var jobStarted = false
     private var walkActive = false
+    private var skippedMailboxes = 0
     private let cancelSem = DispatchSemaphore(value: 0)
 
     public init() {}
@@ -141,6 +142,18 @@ public final class CrawlState {
     public func runFlushPending() -> Bool {
         lock.lock(); let f = flushPending; lock.unlock()
         return f?() ?? true
+    }
+
+    /// Per-run skip counter — the SIGTERM handler reads this so its
+    /// cancelled write preserves the run's skip total.
+    public func addSkippedMailbox() {
+        lock.lock(); defer { lock.unlock() }
+        skippedMailboxes += 1
+    }
+
+    public var skippedSoFar: Int {
+        lock.lock(); defer { lock.unlock() }
+        return skippedMailboxes
     }
 
     /// True once a real job has written a "running" state — the SIGTERM
@@ -417,6 +430,7 @@ public enum MailCrawler {
                     // per-mailbox SKIP, not a job failure: the diagnostic
                     // lands in the state window label and the walk moves on
                     skippedMailboxes += 1
+                    CrawlState.shared.addSkippedMailbox()
                     writeState(jobID: jobID, state: "running", processed: processed, found: found, window: skip)
                     progress("running", processed, found)
                     continue

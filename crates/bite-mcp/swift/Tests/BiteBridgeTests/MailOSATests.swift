@@ -97,15 +97,18 @@ final class MailOSATests: XCTestCase {
 
     func testWalkPlanDegenerateDomainDoesNotCrash() {
         // total<=0 || walkLimit<=0 must yield an empty plan and a harmless
-        // probe range (public API — callers guard, the planner must not crash)
+        // probe range (public API — callers guard, the planner must not
+        // crash), and must NOT report the probe as processable (nothing
+        // exists to process)
         for newestFirst in [true, false] {
             let (plan, probe, processProbeFirst) = MailAE.walkPlan(total: 0, walkLimit: 30, chunkSize: 12, newestFirst: newestFirst, avoidWidth: 7)
             XCTAssertTrue(plan.isEmpty)
             XCTAssertEqual(probe, 1...1)
-            XCTAssertEqual(processProbeFirst, newestFirst)
-            let (plan2, probe2, _) = MailAE.walkPlan(total: 10, walkLimit: 0, chunkSize: 12, newestFirst: newestFirst, avoidWidth: 7)
+            XCTAssertFalse(processProbeFirst)
+            let (plan2, probe2, processProbeFirst2) = MailAE.walkPlan(total: 10, walkLimit: 0, chunkSize: 12, newestFirst: newestFirst, avoidWidth: 7)
             XCTAssertTrue(plan2.isEmpty)
             XCTAssertEqual(probe2, 1...1)
+            XCTAssertFalse(processProbeFirst2)
         }
     }
 

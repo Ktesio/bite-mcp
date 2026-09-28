@@ -62,7 +62,8 @@ termSource?.setEventHandler {
         MailCrawler.writeState(jobID: jobID, state: "cancelled",
                                processed: CrawlState.shared.snapshot.processed,
                                found: CrawlState.shared.snapshot.found,
-                               window: window)
+                               window: window,
+                               skipped: MailCrawler.existingSkippedCount() + CrawlState.shared.skippedSoFar)
     }
     exit(0)
 }
@@ -150,6 +151,11 @@ case "bulk":
         progress(state, count, 0)
     }
 case "crawl":
+    // pre-job failure streak: the job's own done write zeroes the file's
+    // counter, so the post-mirror failed write must bump from THIS value
+    // to make consecutive mirror-failure cycles accumulate (1, 2, 3…)
+    // toward the ≥5 respawn gate
+    let preJobFailures = MailCrawler.existingFailureCount()
     let crawl = MailCrawler.runCrawlWorker(jobID: jobID, windowDays: windowDays, storeBody: storeBody,
                                            mailboxFilter: mailboxFilter, progress: progress)
     if crawl.state == "done" {
@@ -169,12 +175,12 @@ case "crawl":
         } else {
             // a persistent mirror failure must engage the respawn backoff —
             // the done write above zeroed the failure streak, so this failed
-            // write bumps it again
+            // write bumps the PRE-JOB streak instead
             MailCrawler.writeState(jobID: jobID, state: "failed",
                                    processed: CrawlState.shared.snapshot.processed,
                                    found: CrawlState.shared.snapshot.found,
                                    window: "mirror batch write failed — \(lastError ?? "unknown error")",
-                                   failures: MailCrawler.existingFailureCount() + 1)
+                                   failures: preJobFailures + 1)
             FileHandle.standardError.write(Data("[worker] failed: mirror batch write failed\n".utf8))
         }
     }

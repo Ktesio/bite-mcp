@@ -246,7 +246,8 @@ public enum MailAE {
             probe = first  // plan[0] IS the probe range
         } else if newestFirst {
             // degenerate domain (total<=0 || walkLimit<=0): nothing to walk
-            return (ranges, 1...1, newestFirst)
+            // and nothing to probe — do NOT report the probe as processable
+            return (ranges, 1...1, false)
         } else {
             var end = min(chunkSize, walkLimit, total)
             if end == avoidWidth { end -= 1 }  // the probe reply hits the same ambiguity

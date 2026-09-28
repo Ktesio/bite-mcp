@@ -142,7 +142,10 @@ public enum MailBulk {
 
         // identity guard before any operation touches an index-resolved
         // mailbox — a shifted enumeration order would misdirect the op.
-        // Returns false (state already written) on failure.
+        // Returns false (state already written) on failure. `context` is
+        // appended to the failure so a mid-group refusal records what the
+        // operation ALREADY applied (an operator re-run would otherwise
+        // silently diverge: the selection no longer matches).
         func identityFailure(_ box: (account: String, index: Int, name: String)) -> String? {
             if let current = MailAE.mailboxName(at: box.index, account: box.account),
                !current.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
@@ -154,11 +157,11 @@ public enum MailBulk {
         // A nil/empty name is transient (executor busy / watchdog / null
         // reply): retry twice with a pause before failing the op closed. A
         // definitive name mismatch still fails immediately.
-        func requireIdentity(_ box: (account: String, index: Int, name: String), estimated: Int?) -> Bool {
+        func requireIdentity(_ box: (account: String, index: Int, name: String), estimated: Int?, context: String? = nil) -> Bool {
             for attempt in 0...2 {
                 if attempt > 0 { Thread.sleep(forTimeInterval: 3) }
                 if let failure = identityFailure(box) {
-                    lastError = failure
+                    lastError = context.map { "\(failure) — \($0)" } ?? failure
                     if failure.contains("now resolves to") {
                         writeState("failed", estimated ?? 0)
                         return false  // definitive mismatch — no retry
@@ -178,24 +181,33 @@ public enum MailBulk {
         case "mark":
             guard requireIdentity(src, estimated: estimated) else { return }
             var failed: String?
+            var applied: [String] = []
+            // what earlier setters already changed — surfaced when a later
+            // identity check refuses, so an operator re-run knows the
+            // selection may no longer match
+            func appliedContext() -> String? {
+                applied.isEmpty ? nil
+                    : "partially applied: \(applied.joined(separator: ", ")) — re-running with the same selection may not match"
+            }
             if let read = setRead {
+                guard requireIdentity(src, estimated: estimated, context: appliedContext()) else { return }
                 let (ok, err) = MailAE.setWhose(mailboxAt: src.index, account: src.account, selection: selection,
                                                 property: "read status", value: read)
-                if !ok { failed = err }
+                if !ok { failed = err } else { applied.append("read=\(read)") }
             }
             if failed == nil, let flagged = setFlagged {
                 // re-validate before EACH setter: a mid-group enumeration
                 // shift would misdirect setters 2/3
-                guard requireIdentity(src, estimated: estimated) else { return }
+                guard requireIdentity(src, estimated: estimated, context: appliedContext()) else { return }
                 let (ok, err) = MailAE.setWhose(mailboxAt: src.index, account: src.account, selection: selection,
                                                 property: "flagged status", value: flagged)
-                if !ok { failed = err }
+                if !ok { failed = err } else { applied.append("flagged=\(flagged)") }
             }
             if failed == nil, let junk = setJunk {
-                guard requireIdentity(src, estimated: estimated) else { return }
+                guard requireIdentity(src, estimated: estimated, context: appliedContext()) else { return }
                 let (ok, err) = MailAE.setWhose(mailboxAt: src.index, account: src.account, selection: selection,
                                                 property: "junk mail status", value: junk)
-                if !ok { failed = err }
+                if !ok { failed = err } else { applied.append("junk=\(junk)") }
             }
             writeState(failed == nil ? "done" : "failed", estimated ?? 0)
 
