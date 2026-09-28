@@ -30,8 +30,16 @@
 import Foundation
 import AppKit
 
+private let lastErrorLock = NSLock()
+private var _lastError: String?
+
 /// Last Mail transport error (script error message or watchdog overrun).
-public var lastError: String?
+/// Thread-safe: the SIGTERM handler thread can write it via flush-failure
+/// paths while the crawl thread reads it.
+public var lastError: String? {
+    get { lastErrorLock.lock(); defer { lastErrorLock.unlock() }; return _lastError }
+    set { lastErrorLock.lock(); defer { lastErrorLock.unlock() }; _lastError = newValue }
+}
 
 // Message record keywords (sdef four-char codes, validated live on macOS 27).
 let kwMessageIDD = AEKeyword(0x49442020)      // 'ID  '  — id
@@ -192,17 +200,26 @@ public enum MailAE {
     }
 
     /// Contiguous index ranges covering one mailbox walk, in walk order,
-    /// plus whether the pre-walk probe chunk should be processed first.
+    /// plus the order-probe range and whether the probe result should be
+    /// processed as walk data.
     ///
     /// - newest-first: positions 1…min(total, walkLimit) in ascending
     ///   chunks; `plan[0]` IS the probe range, so the probe result is
     ///   processed and the loop starts at plan index 1.
     /// - oldest-first: the walk starts at the far (newest) end; the probe
-    ///   chunk overlaps only the plan's tail and is NOT processed here —
-    ///   the walk covers those rows when it reaches that chunk. Probe and
-    ///   plan overlap is harmless either way: ids dedupe at ingest.
-    public static func walkPlan(total: Int, walkLimit: Int, chunkSize: Int, newestFirst: Bool)
-        -> (plan: [ClosedRange<Int>], processProbeFirst: Bool) {
+    ///   chunk (head of the mailbox) is order-detection only — the walk
+    ///   covers those rows when it reaches that chunk. Probe and plan
+    ///   overlap is harmless either way: ids dedupe at ingest.
+    ///
+    /// `avoidWidth` (the bundle property count, 7): no issued chunk may be
+    /// exactly that wide — a bundle reply of width == property count is
+    /// structurally ambiguous (7 columns × 7 messages vs 7 rows × 7 props),
+    /// and one mixed-type column would flip the interpretation. Boundary
+    /// positions are shuffled between neighbours by one, or a lone chunk is
+    /// split, so every width differs from `avoidWidth`.
+    public static func walkPlan(total: Int, walkLimit: Int, chunkSize: Int, newestFirst: Bool,
+                                avoidWidth: Int? = nil)
+        -> (plan: [ClosedRange<Int>], probeRange: ClosedRange<Int>, processProbeFirst: Bool) {
         var ranges: [ClosedRange<Int>] = []
         if newestFirst {
             let limit = min(total, walkLimit)
@@ -212,16 +229,95 @@ public enum MailAE {
                 ranges.append(s...e)
                 s = e + 1
             }
-            return (ranges, true)
+        } else {
+            let floor = max(1, total - walkLimit + 1)
+            var e = total
+            while e >= floor {
+                let s = max(e - chunkSize + 1, floor)
+                ranges.append(s...e)
+                e = s - 1
+            }
         }
-        let floor = max(1, total - walkLimit + 1)
-        var e = total
-        while e >= floor {
-            let s = max(e - chunkSize + 1, floor)
-            ranges.append(s...e)
-            e = s - 1
+        if let avoid = avoidWidth, avoid > 1 {
+            ranges = Self.splitOffAvoidWidth(ranges, avoid, ascending: newestFirst)
         }
-        return (ranges, false)
+        let probe: ClosedRange<Int>
+        if newestFirst {
+            probe = ranges[0]  // plan[0] IS the probe range
+        } else {
+            var end = min(chunkSize, walkLimit, total)
+            if end == avoidWidth { end -= 1 }  // the probe reply hits the same ambiguity
+            probe = 1...max(1, end)
+        }
+        return (ranges, probe, newestFirst)
+    }
+
+    /// Rewrite adjacent boundaries so no range is exactly `avoid` wide.
+    /// Boundary positions sit between neighbours — on the side determined
+    /// by walk direction — so ranges stay disjoint and ordered.
+    private static func splitOffAvoidWidth(_ ranges: [ClosedRange<Int>], _ avoid: Int, ascending: Bool) -> [ClosedRange<Int>] {
+        var out = ranges
+        var i = 0
+        while i < out.count {
+            if out[i].count != avoid { i += 1; continue }
+            let cur = out[i]
+            if ascending {
+                if i + 1 < out.count {
+                    // steal the next chunk's lowest position
+                    let next = out[i + 1]
+                    out[i] = cur.lowerBound...(cur.upperBound + 1)
+                    if next.count == 1 {
+                        out.remove(at: i + 1)
+                    } else {
+                        out[i + 1] = (next.lowerBound + 1)...next.upperBound
+                    }
+                } else if i > 0 {
+                    // last chunk: steal the previous chunk's highest position
+                    let prev = out[i - 1]
+                    if prev.count == 1 {
+                        out[i - 1] = prev.lowerBound...cur.upperBound
+                        out.remove(at: i)
+                    } else {
+                        out[i - 1] = prev.lowerBound...(prev.upperBound - 1)
+                        out[i] = (cur.lowerBound - 1)...cur.upperBound
+                    }
+                } else {
+                    // the whole walk is exactly `avoid` wide: split it in two
+                    let mid = cur.lowerBound + cur.count / 2
+                    out[i] = cur.lowerBound...(mid - 1)
+                    out.insert((mid)...cur.upperBound, at: i + 1)
+                }
+            } else {
+                // descending walk: neighbours sit on the opposite side
+                if i + 1 < out.count {
+                    // steal the next chunk's highest position
+                    let next = out[i + 1]
+                    out[i] = (cur.lowerBound - 1)...cur.upperBound
+                    if next.count == 1 {
+                        out.remove(at: i + 1)
+                    } else {
+                        out[i + 1] = next.lowerBound...(next.upperBound - 1)
+                    }
+                } else if i > 0 {
+                    // last chunk: steal the previous chunk's lowest position
+                    let prev = out[i - 1]
+                    if prev.count == 1 {
+                        out[i - 1] = cur.lowerBound...prev.upperBound
+                        out.remove(at: i)
+                    } else {
+                        out[i - 1] = (prev.lowerBound + 1)...prev.upperBound
+                        out[i] = cur.lowerBound...(cur.upperBound + 1)
+                    }
+                } else {
+                    let mid = cur.lowerBound + cur.count / 2
+                    out[i] = cur.lowerBound...(mid - 1)
+                    out.insert((mid)...cur.upperBound, at: i + 1)
+                }
+            }
+            // the fixed range is now avoid±1 (never `avoid`); the loop
+            // re-checks it before advancing
+        }
+        return out
     }
 
     /// Decision after a failed chunk read. `refreshedTotal` is a re-run
@@ -257,10 +353,9 @@ public enum MailAE {
     /// - list of records: `get properties of messages …` → rows as-is
     /// - list of lists, outer ≠ expectedProps: ROW-major bundle (one list
     ///   per message)
-    /// - list of expectedProps lists: PROPERTY-major COLUMNS (each property
-    ///   → a list of per-message values) — repacked into rows; the 7×7
-    ///   ambiguous case is resolved by type-homogeneity (columns are
-    ///   type-uniform, rows are not)
+    /// - list of exactly expectedProps uniform lists: PROPERTY-major
+    ///   COLUMNS — repacked into rows (see the branch comment for why the
+    ///   column reading wins the ambiguous width case)
     /// - flat scalar list: property-major flat bundle — repacked into rows
     public static func rowsFromReply(_ reply: NSAppleEventDescriptor, expectedProps: Int) -> [NSAppleEventDescriptor?] {
         if reply.descriptorType != typeListD {
@@ -273,13 +368,15 @@ public enum MailAE {
         }
         if first.descriptorType == typeListD {
             let innerCounts = (1...n).compactMap { reply.atIndex($0).map { Int($0.numberOfItems) } }
-            let uniform = innerCounts.allSatisfy { $0 == innerCounts.first }
-            if n == expectedProps, uniform, let inner = innerCounts.first {
-                // outer count == expectedProps: columns vs rows is only
-                // decidable by shape of contents
-                if inner != expectedProps || isTypeHomogeneous(reply.atIndex(1)) {
-                    return repackColumns(reply, props: n, count: inner)
-                }
+            if n == expectedProps, let inner = innerCounts.first, uniform(innerCounts),
+               inner > 1 || expectedProps > 1 {
+                // width == property count is structurally ambiguous; chunk
+                // planning avoids issuing it, and when one arrives anyway
+                // the COLUMN reading wins — bundle fetches are property-
+                // major (live-verified), and a mixed-type id column (long/
+                // comp ids straddling 2^31) would defeat any homogeneity
+                // heuristic
+                return repackColumns(reply, props: n, count: inner)
             }
             return (1...n).map { reply.atIndex($0) }  // row-major bundle
         }
@@ -314,15 +411,22 @@ public enum MailAE {
         return rows
     }
 
-    private static func isTypeHomogeneous(_ d: NSAppleEventDescriptor?) -> Bool {
-        guard let list = d else { return false }
-        let n = Int(list.numberOfItems)
-        guard n > 1, let first = list.atIndex(1) else { return true }
-        let t = first.descriptorType
-        for i in 2...n where list.atIndex(i)?.descriptorType != t {
-            return false
+    private static func uniform(_ counts: [Int]) -> Bool {
+        counts.allSatisfy { $0 == counts.first }
+    }
+
+    /// Date sent from a row of either shape: record rows carry it under the
+    /// sdef keyword; bundle rows hold it at the fixed bundle position
+    /// (bundleProps order: id, subject, sender, date sent, read, flagged,
+    /// junk → index 4). A forKeyword-only read returns nil for list-shaped
+    /// rows — silently disabling order detection under --no-body — so both
+    /// shapes must be handled here.
+    public static func dateFromRow(_ row: NSAppleEventDescriptor?) -> Date? {
+        guard let row else { return nil }
+        if row.descriptorType == typeRecordD {
+            return row.forKeyword(kwDateSentD)?.dateValue
         }
-        return true
+        return row.atIndex(4)?.dateValue
     }
 
     /// Decimal string for an id descriptor. Wide/real ids ('comp', 'doub')
@@ -511,8 +615,24 @@ public enum MailAE {
         \(tellSuffix)
         """
         guard let reply = run(src, timeoutSeconds: TimeInterval(timeoutSeconds)) else { return nil }
-        let rows = rowsFromReply(reply, expectedProps: includeContent ? 0 : 7)
+        // 8 = full record's property count for the flat-repack fallback (the
+        // record-list shape ignores it); 7 = no-body bundle
+        let rows = rowsFromReply(reply, expectedProps: includeContent ? 8 : 7)
         return rows.isEmpty ? nil : rows
+    }
+
+    /// `name of mailbox «i» of account «A»` — used to re-validate
+    /// index-addressed mailboxes before reads/writes: the enumeration order
+    /// can shift between listing and use, and stale indices would silently
+    /// mislabel records.
+    public static func mailboxName(at index: Int, account: String, timeoutSeconds: Int32 = 60) -> String? {
+        guard mailRunning() else { lastError = "Mail is not running"; return nil }
+        let src = """
+        \(tellPrefix(45))
+        get name of mailbox \(index) of account \(quotedAppleString(account))
+        \(tellSuffix)
+        """
+        return run(src, timeoutSeconds: TimeInterval(timeoutSeconds))?.stringValue
     }
 
     // ── bulk primitives (whose-based; one script per operation) ──

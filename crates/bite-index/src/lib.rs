@@ -9,13 +9,15 @@ pub use store::{
 
 /// Ingest every un-ingested `*.jsonl` batch in the staging dir (deleting each
 /// file on success — merge-insert makes re-ingest idempotent). Returns the
-/// number of batches ingested and the total rows written.
+/// number of batches ingested, the total rows written, and the number of
+/// unreadable batches quarantined (moved to `<staging>/quarantine/`).
 pub fn ingest_staged(
     index: &EntityIndex,
     staging: &Path,
-) -> Result<(usize, usize), store::IndexError> {
+) -> Result<(usize, usize, usize), store::IndexError> {
     let mut batches = 0usize;
     let mut rows = 0usize;
+    let mut quarantined = 0usize;
     let mut files: Vec<_> = std::fs::read_dir(staging)
         .map(|it| {
             it.filter_map(|e| e.ok())
@@ -45,8 +47,9 @@ pub fn ingest_staged(
                     let dest = quarantine.join(file.file_name().unwrap_or_default());
                     std::fs::rename(&file, dest).ok();
                 }
+                quarantined += 1;
             }
         }
     }
-    Ok((batches, rows))
+    Ok((batches, rows, quarantined))
 }

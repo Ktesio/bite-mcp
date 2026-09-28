@@ -140,6 +140,16 @@ public enum MailBulk {
             }
         }
 
+        // identity guard before any operation touches an index-resolved
+        // mailbox — a shifted enumeration order would misdirect the op
+        if let current = MailAE.mailboxName(at: src.index, account: src.account),
+           current.caseInsensitiveCompare(src.name) == .orderedSame {
+            // resolved OK
+        } else {
+            lastError = "mailbox \(src.index) in '\(src.account)' no longer resolves to '\(src.name)' — refusing to run bulk \(op) against a moved target"
+            writeState("failed", 0)
+            return
+        }
         let estimated = MailAE.countWhose(mailboxAt: src.index, account: src.account, selection: selection)
         writeState("running", estimated ?? 0)
 

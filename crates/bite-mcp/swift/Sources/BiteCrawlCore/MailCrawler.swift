@@ -51,7 +51,9 @@ public struct CrawlRecord: Codable {
 }
 
 /// Locked box for the not-yet-flushed batch records, so the SIGTERM handler
-/// can flush a partial batch without racing the crawl thread.
+/// can flush a partial batch without racing the crawl thread. A failed
+/// write re-appends the drained records — a transient batch-write failure
+/// must not vaporize up to 50 records.
 final class PendingBatch {
     private let lock = NSLock()
     private var records: [CrawlRecord] = []
@@ -71,6 +73,10 @@ final class PendingBatch {
         records = []
         return out
     }
+
+    func refill(_ recs: [CrawlRecord]) {
+        lock.lock(); records.append(contentsOf: recs); lock.unlock()
+    }
 }
 
 public final class CrawlState {
@@ -80,7 +86,10 @@ public final class CrawlState {
     private var processed = 0
     private var found = 0
     private var window: String?
-    private var flushPending: (() -> Void)?
+    private var flushPending: (() -> Bool)?
+    private var jobStarted = false
+    private var walkActive = false
+    private let cancelSem = DispatchSemaphore(value: 0)
 
     public init() {}
 
@@ -119,15 +128,48 @@ public final class CrawlState {
     }
 
     /// The walk's partial-batch flusher; invoked by the SIGTERM handler so
-    /// a cancel never strands up to 50 staged records.
-    public func setFlushPending(_ f: (() -> Void)?) {
-        lock.lock(); defer { lock.unlock() }
+    /// a cancel never strands up to 50 staged records. Setting a flusher
+    /// also marks the walk active and arms the cancel-observed semaphore.
+    public func setFlushPending(_ f: (() -> Bool)?) {
+        lock.lock()
         flushPending = f
+        walkActive = (f != nil)
+        while cancelSem.wait(timeout: .now()) == .success {}  // drain stale signals
+        lock.unlock()
     }
 
-    public func runFlushPending() {
+    public func runFlushPending() -> Bool {
         lock.lock(); let f = flushPending; lock.unlock()
-        f?()
+        return f?() ?? true
+    }
+
+    /// True once a real job has written a "running" state — the SIGTERM
+    /// handler must not create a phantom cancelled state file on a
+    /// never-crawled install (a phantom suppresses auto-respawn).
+    public var hasStarted: Bool {
+        lock.lock(); defer { lock.unlock() }
+        return jobStarted
+    }
+
+    func markStarted() {
+        lock.lock(); defer { lock.unlock() }
+        jobStarted = true
+    }
+
+    public var isWalkActive: Bool {
+        lock.lock(); defer { lock.unlock() }
+        return walkActive
+    }
+
+    /// Signalled by the walk when it actually observes cancellation, so the
+    /// SIGTERM handler can briefly wait for in-flight loop work to stop
+    /// before its final flush.
+    public func signalCancelledObserved() {
+        cancelSem.signal()
+    }
+
+    public func waitCancelledObserved(timeout: TimeInterval) -> Bool {
+        cancelSem.wait(timeout: .now() + timeout) == .success
     }
 }
 
@@ -155,6 +197,10 @@ public enum MailCrawler {
         "index.crawl", "index.crawl_cancel", "index.crawl_status",
         "index.bulk_mark", "index.bulk_move", "index.bulk_delete", "index.search",
     ]
+
+    static func isTerminalState(_ state: String) -> Bool {
+        state == "done" || state == "failed" || state == "cancelled"
+    }
 
     /// Serializes state-file writes: the SIGTERM handler and the crawl
     /// thread both call writeState, and unsynchronized remove+move could
@@ -205,6 +251,11 @@ public enum MailCrawler {
     }
 
     public static func writeState(jobID: String, state: String, processed: Int, found: Int, window: String?) {
+        // once cancellation is armed only terminal writes pass — the walk's
+        // heartbeats must never overwrite the cancel handler's terminal
+        // state, and the handler must not race a heartbeat mid-write
+        if !isTerminalState(state) && CrawlState.shared.isCancelled { return }
+        if state == "running" { CrawlState.shared.markStarted() }
         CrawlState.shared.setWindow(window)
         let dict: [String: Any] = [
             "job_id": jobID,
@@ -224,12 +275,18 @@ public enum MailCrawler {
         _ = atomicReplace(tmp: tmp, dst: path)
     }
 
-    /// Remove stale *.tmp droppings from a previous crashed run before this
-    /// job starts staging.
+    /// Remove stale *.tmp droppings from a previous crashed run — but only
+    /// ones older than 10 minutes, so a concurrent worker's live tmp file
+    /// is never deleted underneath it.
     public static func sweepStaleTmp(at staging: URL) {
         let fm = FileManager.default
         guard let items = try? fm.contentsOfDirectory(at: staging, includingPropertiesForKeys: nil) else { return }
         for f in items where f.lastPathComponent.hasSuffix(".tmp") {
+            if let attrs = try? fm.attributesOfItem(atPath: f.path),
+               let mtime = attrs[.modificationDate] as? Date,
+               Date().timeIntervalSince(mtime) < 600 {
+                continue
+            }
             try? fm.removeItem(at: f)
         }
     }
@@ -339,14 +396,20 @@ public enum MailCrawler {
     /// detected from dated samples (resampled against the far end when the
     /// first pair is ambiguous); the walk stops at the first confirmed
     /// window edge. A failed chunk retries the SAME range — transient
-    /// errors never silently drop messages.
+    /// errors never silently drop messages. Any abort (strikes, zero yield,
+    /// identity drift, write failure) surfaces as transportError so the
+    /// JOB fails instead of reporting done with holes.
     static func crawlMailbox(jobID: String, account: String, mailboxAt: Int, mailbox: String,
                              window: CrawlWindow, includeContent: Bool,
                              staging: URL, seq: SeqCounter,
                              progress: @escaping (String, Int, Int) -> Void)
         -> (scanned: Int, indexed: Int, transportError: String?) {
+        func abort(_ scanned: Int, _ indexed: Int, _ reason: String) -> (scanned: Int, indexed: Int, transportError: String?) {
+            CrawlState.shared.setFlushPending(nil)
+            return (scanned, indexed, reason)
+        }
         guard let initialTotal = MailAE.countMessages(mailboxAt: mailboxAt, account: account) else {
-            return (0, 0, "count failed for \(mailbox) — \(lastError ?? "unknown error")")
+            return abort(0, 0, "count failed for \(mailbox) — \(lastError ?? "unknown error")")
         }
         guard initialTotal > 0 else { return (0, 0, nil) }
         var total = initialTotal
@@ -364,13 +427,16 @@ public enum MailCrawler {
             flushLock.lock(); defer { flushLock.unlock() }
             let recs = pending.drain()
             guard !recs.isEmpty else { return true }
-            let ok = writeBatch(staging: staging, jobID: jobID, seq: seq.value, records: recs)
-            if ok {
+            if writeBatch(staging: staging, jobID: jobID, seq: seq.value, records: recs) {
                 seq.value += 1
+                return true
             }
-            return ok
+            // put the records back — a later flush (e.g. from the SIGTERM
+            // handler) must get another chance at them
+            pending.refill(recs)
+            return false
         }
-        CrawlState.shared.setFlushPending { _ = flush() }
+        CrawlState.shared.setFlushPending { flush() }
 
         var scanned = 0
         var indexed = 0
@@ -404,13 +470,9 @@ public enum MailCrawler {
             return true
         }
 
-        func rowDate(_ row: NSAppleEventDescriptor?) -> Date? {
-            row?.forKeyword(MailAE.kwDateSent)?.dateValue
-        }
-
-        // Process one chunk's rows in walk order. Returns true when the
-        // window edge is CONFIRMED: more than 2 stale rows (one mis-dated
-        // row must not end the whole window walk).
+        /// Process one chunk's rows in walk order. Returns true when the
+        /// window edge is CONFIRMED: more than 2 stale rows (one mis-dated
+        /// row must not end the whole window walk).
         @discardableResult
         func process(_ rows: [NSAppleEventDescriptor?], descending: Bool) -> Bool {
             let edgeTolerance = 2
@@ -438,40 +500,68 @@ public enum MailCrawler {
 
         // First chunk doubles as the order probe (positions shift as mail
         // arrives, but ids dedupe at ingest, so overlap is harmless).
-        let probeEnd = min(chunkSize, walkLimit, total)
-        guard let probe = MailAE.readProperties(mailboxAt: mailboxAt, account: account, start: 1, end: probeEnd,
+        // walkPlan guarantees no chunk is exactly 7 wide (bundle property
+        // count) — such replies are structurally ambiguous.
+        let (_, probeRange, _) = MailAE.walkPlan(total: total, walkLimit: walkLimit,
+                                                 chunkSize: chunkSize, newestFirst: true,
+                                                 avoidWidth: 7)
+        guard let probe = MailAE.readProperties(mailboxAt: mailboxAt, account: account,
+                                                start: probeRange.lowerBound, end: probeRange.upperBound,
                                                 includeContent: includeContent), !probe.isEmpty else {
-            CrawlState.shared.setFlushPending(nil)
-            return (0, 0, "probe read failed for \(mailbox) — \(lastError ?? "unknown error")")
+            return abort(0, 0, "probe read failed for \(mailbox) — \(lastError ?? "unknown error")")
         }
-        var newestFirst = MailAE.orderFromSamples(rowDate(probe[0]), probe.count >= 2 ? rowDate(probe[1]) : nil)
-        if newestFirst == nil, total > probeEnd,
+        var newestFirst = MailAE.orderFromSamples(MailAE.dateFromRow(probe[0]),
+                                                  probe.count >= 2 ? MailAE.dateFromRow(probe[1]) : nil)
+        if newestFirst == nil, total > probeRange.upperBound,
            let lastRows = MailAE.readProperties(mailboxAt: mailboxAt, account: account,
                                                 start: total, end: total, includeContent: includeContent),
            let lastRow = lastRows.first {
             // ambiguous first pair — resample against the far end
-            newestFirst = MailAE.orderFromSamples(rowDate(probe[0]), rowDate(lastRow))
+            newestFirst = MailAE.orderFromSamples(MailAE.dateFromRow(probe[0]), MailAE.dateFromRow(lastRow))
         }
         let newestFirstResolved = newestFirst ?? true
 
-        let (plan, processProbeFirst) = MailAE.walkPlan(total: total, walkLimit: walkLimit,
-                                                        chunkSize: chunkSize, newestFirst: newestFirstResolved)
-        if processProbeFirst {
+        // re-plan under the resolved order; the probe range only applies to
+        // newest-first walks (oldest-first probes are detection-only)
+        let (walkRanges, _, processProbe) = MailAE.walkPlan(total: total, walkLimit: walkLimit,
+                                                            chunkSize: chunkSize,
+                                                            newestFirst: newestFirstResolved,
+                                                            avoidWidth: 7)
+        if processProbe {
             edgeCrossed = process(probe, descending: false)
         }
 
-        var i = processProbeFirst ? 1 : 0  // plan[0] IS the probe range for newest-first walks
+        var i = processProbe ? 1 : 0  // newest-first: plan[0] IS the probe range
         var consecutiveFailures = 0
-        while i < plan.count, !CrawlState.shared.isCancelled, !edgeCrossed,
-              consecutiveFailures < 3, !writeFailed, indexed < walkLimit {
-            let range = plan[i]
+        var abortReason: String?
+        while i < walkRanges.count, !edgeCrossed, consecutiveFailures < 3, !writeFailed,
+              indexed < walkLimit, abortReason == nil {
+            if CrawlState.shared.isCancelled {
+                CrawlState.shared.signalCancelledObserved()
+                break
+            }
+            let range = walkRanges[i]
             if range.lowerBound > total {
                 i += 1
                 continue
             }
+            // identity guard: the enumeration order can shift between listing
+            // and use — a stale index would silently mislabel every record
+            if let current = MailAE.mailboxName(at: mailboxAt, account: account) {
+                if current.caseInsensitiveCompare(mailbox) != .orderedSame {
+                    abortReason = "mailbox \(mailboxAt) in '\(account)' now resolves to '\(current)', expected '\(mailbox)' — aborting to avoid mislabeled records"
+                    break
+                }
+            } else {
+                abortReason = "mailbox identity check failed for \(mailbox) — \(lastError ?? "unknown error")"
+                break
+            }
             if !MailAE.healthy() {
                 consecutiveFailures += 1
-                if consecutiveFailures >= 3 { break }
+                if consecutiveFailures >= 3 {
+                    abortReason = "3 consecutive health-check failures in \(mailbox) — \(lastError ?? "Mail unresponsive")"
+                    break
+                }
                 heartbeat()
                 Thread.sleep(forTimeInterval: min(60, Double(5 * consecutiveFailures)))
                 continue  // retry the same range
@@ -486,6 +576,11 @@ public enum MailCrawler {
                 Thread.sleep(forTimeInterval: 1)
                 edgeCrossed = process(rows, descending: !newestFirstResolved)
                 heartbeat()
+                if skipped > 500 && indexed == 0 {
+                    // weeks of zero-progress reads on a pathological mailbox
+                    abortReason = "zero yield in \(mailbox): \(skipped) rows skipped, 0 indexed in this window"
+                    break
+                }
             } else {
                 // refresh the count first: ranges beyond a shrunken mailbox
                 // evaporate instead of counting as transport failures
@@ -495,8 +590,10 @@ public enum MailCrawler {
                                               consecutiveFailures: consecutiveFailures + 1) {
                 case .advance:
                     i += 1
+                    consecutiveFailures = 0  // fresh strike budget for the next range
                 case .abort:
                     consecutiveFailures = 3
+                    abortReason = "3 consecutive chunk-read failures in \(mailbox) at \(range.lowerBound)-\(range.upperBound) — \(lastError ?? "unknown error")"
                 case .retrySame:
                     consecutiveFailures += 1
                     heartbeat()
@@ -504,9 +601,16 @@ public enum MailCrawler {
                 }
             }
         }
+        if CrawlState.shared.isCancelled {
+            CrawlState.shared.signalCancelledObserved()
+        }
+        let flushed = flush()
         CrawlState.shared.setFlushPending(nil)
-        if writeFailed || !flush() {
+        if writeFailed || !flushed {
             return (scanned, indexed, "batch write failed for \(mailbox) — \(lastError ?? "unknown error")")
+        }
+        if let abortReason {
+            return (scanned, indexed, abortReason)
         }
         return (scanned, indexed, nil)
     }
@@ -514,11 +618,12 @@ public enum MailCrawler {
     /// Synchronous crawl used by the detached `bite-crawl` worker process.
     /// Returns the terminal state ("done"/"failed"/"cancelled") plus the
     /// batch sequence counter so mirror crawls continue the same job's
-    /// numbering instead of colliding with mail batches.
-    public static func runCrawlWorker(windowDays: Int, storeBody: Bool, mailboxFilter: String?,
+    /// numbering instead of colliding with mail batches. jobID comes from
+    /// the caller — one source of truth for the state file and batch names.
+    public static func runCrawlWorker(jobID: String, windowDays: Int, storeBody: Bool,
+                                      mailboxFilter: String?,
                                       progress: @escaping (String, Int, Int) -> Void)
         -> (state: String, seq: SeqCounter) {
-        let jobID = "crawl-\(Int(Date().timeIntervalSince1970))"
         let seq = SeqCounter(0)
         writeState(jobID: jobID, state: "running", processed: 0, found: 0, window: nil)
         let terminal = runJob(jobID: jobID, windowDays: windowDays, storeBody: storeBody,

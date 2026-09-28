@@ -45,12 +45,25 @@ let signalQueue = DispatchQueue.global()
 termSource = DispatchSource.makeSignalSource(signal: SIGTERM, queue: signalQueue)
 termSource?.setEventHandler {
     CrawlState.shared.stop()
-    // flush any partial batch before reporting the cancel
-    CrawlState.shared.runFlushPending()
-    MailCrawler.writeState(jobID: jobID, state: "cancelled",
-                           processed: CrawlState.shared.snapshot.processed,
-                           found: CrawlState.shared.snapshot.found,
-                           window: CrawlState.shared.currentWindow)
+    // flush any partial batch; a failed write re-appends the records, so
+    // drain once more after giving the walk a moment to notice cancellation
+    var flushOK = CrawlState.shared.runFlushPending()
+    if CrawlState.shared.isWalkActive {
+        _ = CrawlState.shared.waitCancelledObserved(timeout: 2.0)
+    }
+    flushOK = CrawlState.shared.runFlushPending() && flushOK
+    // only a job that actually started gets a cancelled state file — a
+    // phantom would suppress auto-respawn for a day on never-crawled installs
+    if CrawlState.shared.hasStarted {
+        var window = CrawlState.shared.currentWindow
+        if !flushOK {
+            window = (window.map { $0 + " " } ?? "") + "(flush failed)"
+        }
+        MailCrawler.writeState(jobID: jobID, state: "cancelled",
+                               processed: CrawlState.shared.snapshot.processed,
+                               found: CrawlState.shared.snapshot.found,
+                               window: window)
+    }
     exit(0)
 }
 termSource?.resume()
@@ -137,20 +150,29 @@ case "bulk":
         progress(state, count, 0)
     }
 case "crawl":
-    let crawl = MailCrawler.runCrawlWorker(windowDays: windowDays, storeBody: storeBody,
+    let crawl = MailCrawler.runCrawlWorker(jobID: jobID, windowDays: windowDays, storeBody: storeBody,
                                            mailboxFilter: mailboxFilter, progress: progress)
     if crawl.state == "done" {
+        var mirrorsOK = true
         if mirrors {
             let staging = MailCrawler.stagingDir()
             // continue the mail job's batch numbering: restarting at 0 would
             // collide with (and drop) mail batches already staged
-            Mirrors.calendar(staging: staging, jobID: jobID, seq: crawl.seq, progress: progress)
-            Mirrors.reminders(staging: staging, jobID: jobID, seq: crawl.seq, progress: progress)
-            Mirrors.contacts(staging: staging, jobID: jobID, seq: crawl.seq, progress: progress)
+            mirrorsOK = Mirrors.calendar(staging: staging, jobID: jobID, seq: crawl.seq, progress: progress)
+            mirrorsOK = Mirrors.reminders(staging: staging, jobID: jobID, seq: crawl.seq, progress: progress) && mirrorsOK
+            mirrorsOK = Mirrors.contacts(staging: staging, jobID: jobID, seq: crawl.seq, progress: progress) && mirrorsOK
         }
-        // only a genuinely done crawl reports done — never clobber a
-        // terminal failed/cancelled state written by the walk
-        progress("done", CrawlState.shared.snapshot.processed, CrawlState.shared.snapshot.found)
+        if mirrorsOK {
+            // only a genuinely done crawl reports done — never clobber a
+            // terminal failed/cancelled state written by the walk
+            progress("done", CrawlState.shared.snapshot.processed, CrawlState.shared.snapshot.found)
+        } else {
+            MailCrawler.writeState(jobID: jobID, state: "failed",
+                                   processed: CrawlState.shared.snapshot.processed,
+                                   found: CrawlState.shared.snapshot.found,
+                                   window: "mirror batch write failed — \(lastError ?? "unknown error")")
+            FileHandle.standardError.write(Data("[worker] failed: mirror batch write failed\n".utf8))
+        }
     }
 default:
     break
