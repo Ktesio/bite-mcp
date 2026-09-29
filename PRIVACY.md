@@ -24,8 +24,9 @@ on the machine you run it on:
 **Nowhere.** bite has no server, no account system, no analytics, no
 telemetry, and no crash reporting. All processing happens in three local
 processes on your machine (`bite`, its Swift helper, and the detached
-`bite-crawl` worker that indexes Mail) and stays in bite's 0700 data dir.
-The only network
+`bite-crawl` worker that indexes Mail) and stays in bite's 0700 data dir —
+the one exception being attachments you explicitly save elsewhere via
+`mail_attachment_save`. The only network
 activity in the entire project is the optional, explicit `bite install-helper
 --prebuilt` download (roadmap), which fetches a signed helper binary from the
 GitHub Releases page and involves none of your data.
@@ -40,8 +41,11 @@ with your data. bite itself adds no network hop; choose agents you trust.
 - Every permission is granted through macOS's own TCC prompts and can be
   reviewed or revoked at any time in **System Settings → Privacy & Security**
   (and Full Disk Access). Revoking takes effect immediately.
-- `bite doctor` shows, without triggering any prompt, which permissions are
-  granted, pending, or denied.
+- `bite doctor`'s status checks show, without triggering any prompt, which
+  permissions are granted, pending, or denied. Once the crawl worker is
+  installed, `bite doctor` also live-probes crawler Mail automation — that
+  one check can raise the Mail prompt once (see
+  [docs/permissions.md](docs/permissions.md)).
 - Destructive operations (deleting events/reminders/mail/notes/contacts,
   moving mail) always return a preview first and require an explicit
   `confirm: true`.

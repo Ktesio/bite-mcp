@@ -163,7 +163,8 @@ swept at job start (10 min age). Ingest deletes batches on success
 (merge-insert makes re-ingest idempotent).
 
 Coverage: the newest 30 days first, then 10-day backfill batches to a
-365-day horizon, at most 20,000 messages walked per mailbox per job.
+365-day horizon (~34 windows per job); each mailbox×window walk covers at
+most 20,000 messages and also stops at its window's date edge.
 `window_days` is currently accepted (tool param and `--window-days`) but
 ignored by the worker, and store-body-off (`--no-body`) is currently
 reachable only via the undeclared `no_body` MCP param on `index_rebuild` —

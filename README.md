@@ -38,7 +38,7 @@ VS Code, Gemini CLI (whichever it detects).
 | Notes | ScriptingBridge | folders, search, get (markdown+HTML), create, update (append), delete |
 | Contacts | Contacts.framework (native) | search, get, create, update, delete, groups |
 | Messages | ScriptingBridge + chat.db | send, recent chats, history |
-| Index | LanceDB + `bite-crawl` worker | index_rebuild, index_status, index_crawl_cancel, index_wipe, search, mail_bulk_* |
+| Index | LanceDB + `bite-crawl` worker | index_rebuild, index_status, index_crawl_cancel, search, mail_bulk_* — plus index_wipe (callable via CLI/tools/call, not advertised in tools/list) |
 
 Plus MCP resources (`bite://calendars`, `bite://mail/mailboxes`, …) and
 prompts (`plan-my-week`, `triage-inbox`, `daily-brief`).
@@ -67,8 +67,9 @@ mode 0700) and answers searches locally — no Apple Events on the query path.
 | Bulk mark-unread-read | a handful of Apple Events total | 1,834+ events |
 
 Reproduce: `cargo run -p bite-index --example bench_100k --release`.
-Bulk ops (mark/move/delete, whole mailbox or filtered) likewise run as a
-whose-clause script per operation plus verification counts — a handful of
+Bulk ops (mark/move/delete over a filtered selection — unfiltered
+whole-mailbox runs are refused) likewise run as a whose-clause script per
+operation plus verification counts — a handful of
 Apple Events total, still O(1) vs per-message: Mail iterates internally
 while bite waits.
 
