@@ -1,8 +1,10 @@
-# Bridge Protocol (Rust ↔ Swift helper)
+# Bridge & handoff protocols (Rust ↔ Swift)
 
-Line-delimited JSON (NDJSON) over the helper's stdin/stdout. One JSON value
-per line, UTF-8, `\n` terminated. Helper stderr is free-form diagnostics
-(mirrored by the Rust side to its own stderr).
+Part 1 is the helper protocol: line-delimited JSON (NDJSON) over the helper's
+stdin/stdout. One JSON value per line, UTF-8, `\n` terminated. Helper stderr
+is free-form diagnostics (mirrored by the Rust side to its own stderr). The
+staged batch handoff at the end is a separate, file-based contract with the
+detached `bite-crawl` worker — no NDJSON stream, no handshake.
 
 Version constant: `PROTOCOL_VERSION = 1` (both sides). Handshake mismatch is
 a fatal spawn error telling the user to run `bite install-helper --force`.
@@ -106,27 +108,47 @@ Both sides are pinned by tests: `tests/protocol_conformance.rs` (Rust) and
 ## Staged batch handoff (crawl worker → index)
 
 Mail search is served from a local entity index (LanceDB). The detached
-`bite-crawl` worker owns all Mail Apple Events; the Rust control plane never
-touches Mail. The two sides meet on disk in bite's data dir.
+`bite-crawl` worker owns Mail Apple Events *for indexing and bulk
+operations*; the Rust control plane itself never sends Mail Apple Events.
+Live `mail.*` tools still go through the helper's ScriptingBridge —
+including the live fallback while the index has no Mail rows yet
+(`force_live`, `index_not_ready`). The two sides meet on disk in bite's data
+dir.
 
 ### crawl-state.json
 
-The worker's progress file. Keys: `job_id`, `state`, `processed`, `found`,
-`window` (diagnostic label), `updated_at` (ISO 8601), `failures` (consecutive
-failed jobs — drives respawn backoff), `skipped` (cumulative skipped
-mailboxes). States:
+The worker's progress file, shared by crawl and bulk jobs (bulk job ids look
+like `bulk-<unix time>`; a bulk job overwrites the previous job's terminal
+state and refreshes `updated_at`). Keys: `job_id`, `state`, `processed`,
+`found`, `window` (diagnostic label), `updated_at` (ISO 8601), `failures`
+(consecutive failed crawl jobs — drives respawn backoff), `skipped`
+(cumulative skipped mailboxes). States:
 
 | state | meaning |
 |-------|---------|
 | `waiting_mail` | Mail not answering; 60 s probe heartbeats, 24 h cap |
-| `running` | crawling; heartbeats per chunk |
-| `done` | job finished (`failures` reset to 0) |
-| `failed` | transport/identity/write failure (`failures` incremented) |
-| `cancelled` | SIGTERM received (preserves `failures`) |
+| `running` | crawling (or a bulk op in flight) |
+| `done` | crawl job finished (`failures` reset to 0) |
+| `failed` | crawl transport/identity/write failure (`failures` incremented) |
+| `cancelled` | SIGTERM received after the job started (preserves `failures`) |
 | `partial` | bulk move/delete that verified with remaining > 0 |
 
-Zero-yield mailboxes are not failures: the walk skips them and records the
-reason in `window`.
+The `failures` counter contract belongs to crawl jobs: bulk terminal writes
+(`done`/`partial`/`failed`) always preserve it.
+
+Counters: `processed` counts rows scanned (unreadable rows included) for
+crawls, or the estimated/remaining selection count for bulk ops; `found`
+counts records staged (always 0 for bulk jobs). `window` is a free-form,
+transient label: the raw `<fromMs>-<toMs>` epoch-ms range while walking
+(plus ` skipped=N` when rows were skipped inside that mailbox-window —
+unrelated to the `skipped` mailbox counter), `attempt n/1440 — <error>`
+while waiting for Mail, or a skip/mirror-failure reason (`skipped: zero
+yield…`, `skipped: order undetectable…`). Each mailbox overwrites it, and
+the terminal `done` write clears it.
+
+A pre-start SIGTERM writes no state at all — a never-crawled install that is
+cancelled immediately stays `never_run` (and so stays eagerly
+respawn-eligible).
 
 ### Batch files
 
@@ -134,10 +156,18 @@ reason in `window`.
 `crawl-<unix time>`; the Calendar/Reminders/Contacts mirrors continue the
 same job's numbering). NDJSON, one `Record` per line matching
 `bite_index::store::Record` (`app`/`id` required; `content` omitted entirely
-when the store-body posture is off / `--no-body`), at most 50 records per
-file, written 0600 via unique tmp + atomic rename. Stale `*.tmp` files are
+when the store-body posture is off / `--no-body`), written 0600 via unique
+tmp + atomic rename. Mail batches hold at most 50 records; the
+Calendar/Reminders/Contacts mirrors stage up to 500. Stale `*.tmp` files are
 swept at job start (10 min age). Ingest deletes batches on success
 (merge-insert makes re-ingest idempotent).
+
+Coverage: the newest 30 days first, then 10-day backfill batches to a
+365-day horizon, at most 20,000 messages walked per mailbox per job.
+`window_days` is currently accepted (tool param and `--window-days`) but
+ignored by the worker, and store-body-off (`--no-body`) is currently
+reachable only via the undeclared `no_body` MCP param on `index_rebuild` —
+the CLI has no flag.
 
 Unparseable batches are quarantined to `batches/quarantine/` — ingest
 continues; the quarantine keeps at most 200 files (evicted oldest-by-mtime).
@@ -146,9 +176,29 @@ toward `pending_batches`.
 
 ### Worker lifecycle
 
-`crawl.pid` holds the pid of the detached worker. `index_crawl_cancel` sends
-SIGTERM, polls up to 3 s for exit, then honestly reports a survivor.
+`crawl.pid` holds the pid of the detached worker — shared by crawl and bulk
+jobs, so `index_crawl_cancel` cancels a running bulk op too. It sends
+SIGTERM, polls up to 3 s for exit, then honestly reports a survivor. The
+worker never deletes its own pidfile; stale entries are removed lazily by
+the control plane's identity-checked liveness probe (a pid is trusted only
+while `ps` confirms it is a bite-crawl process) — don't `kill $(cat
+crawl.pid)` blindly.
 
-Auto-refresh respawn (15-min cooldown per process): `never_run` and `failed`
-are eagerly eligible (`failed` only while `failures < 5`); `done` and
-`cancelled` come back only via staleness (default 24 h).
+Auto-refresh respawn (15-min cooldown per process) is eager only for
+`never_run` and `failed` (the latter only while `failures < 5`). Everything
+else — `done`, `cancelled`, `partial` (a bulk op's terminal state, with no
+live process afterwards), `waiting_mail`, and a crashed worker's residual
+`running` — comes back only via staleness (default 24 h). Any bulk op's
+terminal write refreshes `updated_at`, resetting that clock.
+
+`bite index status` reports `pending_batches` (staged + quarantined batch
+files), `crawl.state` (the crawl-state.json state) and `crawl.alive` (a live
+bite-crawl process owns the pidfile). `waiting_mail` or `running` with
+`alive: false` means the worker is gone — run `bite index rebuild` to
+respawn immediately.
+
+Skipped mailboxes are not persisted per-mailbox: the reason lives transiently
+in `window` and `skipped` is a cumulative count, so zero-yield mailboxes are
+retried every job (a skip is not a job failure — the walk moves on). To
+re-index one deliberately, run a targeted rebuild with a mailbox filter
+(`bite index rebuild --mailbox <name>`).

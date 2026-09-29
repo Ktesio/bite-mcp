@@ -28,7 +28,7 @@ VS Code, Gemini CLI (whichever it detects).
 
 ## What you get
 
-38 MCP tools + mirrored CLI verbs:
+45 MCP tools + mirrored CLI verbs:
 
 | App | Engine | Tools |
 |-----|--------|-------|
@@ -38,6 +38,7 @@ VS Code, Gemini CLI (whichever it detects).
 | Notes | ScriptingBridge | folders, search, get (markdown+HTML), create, update (append), delete |
 | Contacts | Contacts.framework (native) | search, get, create, update, delete, groups |
 | Messages | ScriptingBridge + chat.db | send, recent chats, history |
+| Index | LanceDB + `bite-crawl` worker | index_rebuild, index_status, index_crawl_cancel, index_wipe, search, mail_bulk_* |
 
 Plus MCP resources (`bite://calendars`, `bite://mail/mailboxes`, …) and
 prompts (`plan-my-week`, `triage-inbox`, `daily-brief`).
@@ -115,7 +116,7 @@ bite (Rust) ingests them into the entity index (LanceDB) — instant local searc
 
 | Path | Command | Needs |
 |------|---------|-------|
-| crates.io (source) | `cargo install bite-mcp` | Xcode Command Line Tools (compiles the Swift helper) |
+| crates.io (source) | `cargo install bite-mcp` | Xcode Command Line Tools (compiles both Swift binaries — helper + crawl worker) |
 | marketplace (Claude/ZCode) | `/plugin marketplace add ktesio/bite-mcp` | `bite` on PATH first |
 | other agent CLIs | `bite setup` (writes their MCP config) | `bite` on PATH |
 
@@ -125,6 +126,9 @@ bite (Rust) ingests them into the entity index (LanceDB) — instant local searc
    agent CLIs, prints marketplace commands.
 2. First call per app shows macOS's own permission prompt once (Calendar,
    Reminders, Contacts, and one "wants to control Mail" prompt per SB app).
+   The crawl worker is a separate binary with its own TCC identity, so Mail
+   indexing raises one more "wants to control Mail" prompt of its own — see
+   [docs/permissions.md](docs/permissions.md).
 3. Denied something? `bite doctor --fix` opens the right System Settings panes.
 
 ## Privacy & intended use
@@ -150,7 +154,8 @@ bite (Rust) ingests them into the entity index (LanceDB) — instant local searc
 - [NOTICE.md](NOTICE.md) — attribution and trademark notices
 - [SECURITY.md](SECURITY.md) — how to report security issues
 - [docs/PLAN.md](docs/PLAN.md) — the full implementation plan
-- [docs/protocol.md](docs/protocol.md) — the Rust↔Swift bridge protocol
+- [docs/protocol.md](docs/protocol.md) — the Rust↔Swift helper protocol and
+  the crawl batch handoff
 - [docs/permissions.md](docs/permissions.md) — every TCC prompt and how to recover
 - [docs/adding-an-app.md](docs/adding-an-app.md) — add Music/Finder/anything
 - [docs/ROADMAP.md](docs/ROADMAP.md) — Phase 2 surface

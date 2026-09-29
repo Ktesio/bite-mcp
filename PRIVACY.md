@@ -22,8 +22,10 @@ on the machine you run it on:
 ## Where the data goes
 
 **Nowhere.** bite has no server, no account system, no analytics, no
-telemetry, and no crash reporting. All processing happens in two local
-processes on your machine (`bite` and its Swift helper). The only network
+telemetry, and no crash reporting. All processing happens in three local
+processes on your machine (`bite`, its Swift helper, and the detached
+`bite-crawl` worker that indexes Mail) and stays in bite's 0700 data dir.
+The only network
 activity in the entire project is the optional, explicit `bite install-helper
 --prebuilt` download (roadmap), which fetches a signed helper binary from the
 GitHub Releases page and involves none of your data.
