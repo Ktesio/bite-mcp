@@ -102,3 +102,53 @@ chat (`id, name?, participants?, last_message?`), message (`id, text, from, time
 
 Both sides are pinned by tests: `tests/protocol_conformance.rs` (Rust) and
 `ProtocolTests` (Swift) plus the fake-helper golden conversations.
+
+## Staged batch handoff (crawl worker → index)
+
+Mail search is served from a local entity index (LanceDB). The detached
+`bite-crawl` worker owns all Mail Apple Events; the Rust control plane never
+touches Mail. The two sides meet on disk in bite's data dir.
+
+### crawl-state.json
+
+The worker's progress file. Keys: `job_id`, `state`, `processed`, `found`,
+`window` (diagnostic label), `updated_at` (ISO 8601), `failures` (consecutive
+failed jobs — drives respawn backoff), `skipped` (cumulative skipped
+mailboxes). States:
+
+| state | meaning |
+|-------|---------|
+| `waiting_mail` | Mail not answering; 60 s probe heartbeats, 24 h cap |
+| `running` | crawling; heartbeats per chunk |
+| `done` | job finished (`failures` reset to 0) |
+| `failed` | transport/identity/write failure (`failures` incremented) |
+| `cancelled` | SIGTERM received (preserves `failures`) |
+| `partial` | bulk move/delete that verified with remaining > 0 |
+
+Zero-yield mailboxes are not failures: the walk skips them and records the
+reason in `window`.
+
+### Batch files
+
+`<data-dir>/batches/<jobID>-<seq>.jsonl` (job IDs look like
+`crawl-<unix time>`; the Calendar/Reminders/Contacts mirrors continue the
+same job's numbering). NDJSON, one `Record` per line matching
+`bite_index::store::Record` (`app`/`id` required; `content` omitted entirely
+when the store-body posture is off / `--no-body`), at most 50 records per
+file, written 0600 via unique tmp + atomic rename. Stale `*.tmp` files are
+swept at job start (10 min age). Ingest deletes batches on success
+(merge-insert makes re-ingest idempotent).
+
+Unparseable batches are quarantined to `batches/quarantine/` — ingest
+continues; the quarantine keeps at most 200 files (evicted oldest-by-mtime).
+Quarantined files are counted as `quarantined` in the ingest output and
+toward `pending_batches`.
+
+### Worker lifecycle
+
+`crawl.pid` holds the pid of the detached worker. `index_crawl_cancel` sends
+SIGTERM, polls up to 3 s for exit, then honestly reports a survivor.
+
+Auto-refresh respawn (15-min cooldown per process): `never_run` and `failed`
+are eagerly eligible (`failed` only while `failures < 5`); `done` and
+`cancelled` come back only via staleness (default 24 h).

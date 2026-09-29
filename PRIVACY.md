@@ -11,7 +11,8 @@ on the machine you run it on:
 - **Calendar** — events in your calendars (EventKit)
 - **Reminders** — your reminder lists and items (EventKit)
 - **Mail** — messages, mailboxes, and attachments of accounts configured in
-  Apple Mail (Apple Events / ScriptingBridge)
+  Apple Mail (Apple Events — ScriptingBridge in the helper, NSAppleScript in
+  the local crawl worker)
 - **Notes** — your notes in Apple Notes (Apple Events / ScriptingBridge)
 - **Contacts** — your address book (Contacts framework)
 - **Messages** — sending iMessage/SMS via Apple Messages, recent chats, and —

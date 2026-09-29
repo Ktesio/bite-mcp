@@ -29,6 +29,10 @@ needs **Full Disk Access** for the terminal/agent app. Without FDA,
 
 - `bite doctor --probe` additionally live-tests the Apple Events grants for
   Mail/Notes/Messages — this *does* trigger the prompts if pending.
+- The doctor also runs the crawl worker's one-shot Mail probe
+  (`bite-crawl --probe-mail`) and distinguishes `authorized` /
+  `no_accounts` / `denied_or_empty` — a zero-account Mail is a configuration
+  state, not a TCC denial.
 - `bite doctor --fix` opens the matching System Settings pane for anything
   denied.
 
@@ -62,3 +66,10 @@ stable:
 source-only (compilation happens on the user's machine), so Gatekeeper never
 stands between users and the helper; a notarized prebuilt channel is a
 considered Phase 2 addition (ROADMAP).
+
+## macOS 27+: Apple Events go through OSA
+
+From macOS 27, raw (non-OSA) Apple Event sends return silent empty replies.
+bite sends through OSA everywhere — the helper via ScriptingBridge, the Mail
+crawl worker via NSAppleScript — so prompts and grants behave exactly as
+documented above.
