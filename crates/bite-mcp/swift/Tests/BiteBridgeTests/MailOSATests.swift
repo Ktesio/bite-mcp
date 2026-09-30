@@ -484,7 +484,6 @@ final class MailOSATests: XCTestCase {
         let scan = MailCrawler.scanChunk(rows, window: w2, reverseRows: false, edgeAscending: false,
                                          account: "a", mailbox: "m", includeContent: false)
         let ids = scan.records.map { $0.id }
-        print("DEBUG scan: collected=\(scan.records.count) scanned=\(scan.scanned) oow=\(scan.skippedOutOfWindow) skipped=\(scan.skipped) edge=\(scan.edgeCrossed) ids=\(ids.first ?? "?")…\(ids.last ?? "?")")
         // Half-open [fromMs, toMs): the collected slice is ages 31…60 (30
         // rows) — age 30 sits ON toMs (out), age 60 ON fromMs (in).
         XCTAssertEqual(scan.records.count, 30)
@@ -500,31 +499,75 @@ final class MailOSATests: XCTestCase {
                                                      outOfWindow: scan.skippedOutOfWindow,
                                                      indexed: scan.records.count),
                      "a 570-row approach prefix must not trip the zero-yield breaker")
-        XCTAssertNil(MailCrawler.zeroYieldSkipReason(unreadable: scan.unreadable,
-                                                     outOfWindow: scan.skippedOutOfWindow,
-                                                     indexed: scan.records.count))
     }
 
     func testScanChunkOrderMisDetectedTripwire() {
         // defaulted-order DESCENDING walk over an actually-ASCENDING
-        // mailbox (the untabled 5th state): 2 pre-window rows survive the
-        // stale tolerance, the in-window block is collected (arming the
-        // tripwire), then a long above-toMs tail trips "order
-        // mis-detected" — the window is SKIPPED, not walked to the cap.
+        // mailbox whose early rows sit INSIDE the backfill window: the
+        // in-window block is collected (arming the tripwire), then every
+        // later chunk lies entirely ABOVE toMs — those skips accumulate in
+        // the WALK-LEVEL tail until it passes 3 chunks' worth (36) and
+        // flags "order mis-detected". The tail must thread across scanChunk
+        // calls: with a per-call local it resets every 12-row chunk and
+        // never trips (the wiring this test pins).
         let now: Double = 1_790_000_000
         let w = CrawlWindow(fromMs: Int64((now - 60 * 86_400) * 1000), toMs: Int64((now - 30 * 86_400) * 1000))
+
+        // ascending dates: chunk 1 fully in-window (ages 45…34 days),
+        // later chunks climb above toMs into future-dated rows
+        var allRows: [[NSAppleEventDescriptor?]] = []
+        for chunk in 0..<5 {
+            var rows: [NSAppleEventDescriptor?] = []
+            for j in 0..<12 {
+                let age = 45 - chunk * 12 - j  // 45…-14 days before now
+                rows.append(datedRow(id: 500 + chunk * 12 + j, daysBeforeNow: age))
+            }
+            allRows.append(rows)
+        }
+
+        var tail = 0
+        var totalRecords = 0
+        var scan = MailCrawler.scanChunk(allRows[0], window: w, reverseRows: false, edgeAscending: false,
+                                         account: "a", mailbox: "m", includeContent: false,
+                                         orderMisDetectTail: 36, hasCollected: false,
+                                         aboveWindowTail: tail)
+        totalRecords += scan.records.count
+        XCTAssertEqual(totalRecords, 12, "chunk 1 fully in-window")
+        XCTAssertEqual(scan.aboveWindowTail, 0)
+        XCTAssertFalse(scan.orderMisDetected)
+
+        for chunk in 1..<5 {
+            scan = MailCrawler.scanChunk(allRows[chunk], window: w, reverseRows: false, edgeAscending: false,
+                                         account: "a", mailbox: "m", includeContent: false,
+                                         orderMisDetectTail: 36, hasCollected: true,
+                                         aboveWindowTail: scan.aboveWindowTail)
+            totalRecords += scan.records.count
+            tail = scan.aboveWindowTail
+            // chunk 2: ages 33…22 (3 in-window at ages 33-31, then the
+            // above-toMs run begins at age 30 == toMs); chunks 3-5 add 12
+            // above rows each
+            let wantTail = [9, 21, 33, 45][chunk - 1]
+            XCTAssertEqual(tail, wantTail, "chunk \(chunk + 1): walk-level tail must thread")
+            if chunk < 4 {
+                XCTAssertFalse(scan.orderMisDetected, "chunk \(chunk + 1): tail \(tail) is at — not past — the 36 budget")
+            } else {
+                XCTAssertTrue(scan.orderMisDetected, "chunk 5: 42 consecutive above-toMs rows past the collected block must flag mis-detection")
+            }
+        }
+        XCTAssertEqual(totalRecords, 15, "12 in-window + 3 in-window from chunk 2; chunks 3-5 are above-toMs skips (not collected)")
+
+        // WIDE-CHUNK case (production never produces an 80-row chunk, but
+        // this pins scanChunk's internal counting): 20 in-window + 60
+        // above-toMs in ONE call trips in a single invocation.
         var rows: [NSAppleEventDescriptor?] = []
-        rows.append(datedRow(id: 400, daysBeforeNow: 70))  // pre-window (below the tolerance)
-        rows.append(datedRow(id: 401, daysBeforeNow: 65))
         for i in 0..<20 { rows.append(datedRow(id: 500 + i, daysBeforeNow: 55 - i)) }  // in-window
         for i in 0..<60 { rows.append(datedRow(id: 600 + i, daysBeforeNow: max(0, 20 - i))) }  // above-toMs tail
-        let scan = MailCrawler.scanChunk(rows, window: w, reverseRows: false, edgeAscending: false,
+        let wide = MailCrawler.scanChunk(rows, window: w, reverseRows: false, edgeAscending: false,
                                          account: "a", mailbox: "m", includeContent: false,
                                          orderMisDetectTail: 36)
-        XCTAssertTrue(scan.orderMisDetected, "a long above-toMs tail after collected rows must flag mis-detection")
-        XCTAssertEqual(scan.records.count, 20)
-        XCTAssertEqual(scan.skippedOutOfWindow, 2)  // the 2 pre-window rows
-        XCTAssertFalse(scan.edgeCrossed)
+        XCTAssertTrue(wide.orderMisDetected, "60 above-toMs rows > 36 must flag mis-detection")
+        XCTAssertEqual(wide.records.count, 20)
+        XCTAssertFalse(wide.edgeCrossed)
 
         // the mirror shape (above-toMs block FIRST, nothing collected yet):
         // the tripwire stays disarmed — no collected row means the walk

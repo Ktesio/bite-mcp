@@ -536,6 +536,9 @@ public enum MailCrawler {
         public var skippedOutOfWindow: Int
         public var edgeCrossed: Bool
         public var orderMisDetected: Bool
+        /// Walk-level above-toMs tail AFTER this chunk (0 when reset by a
+        /// collect) — thread it back into the next call.
+        public var aboveWindowTail: Int
     }
 
     /// Pure per-chunk core of the walk: maps one chunk's rows through the
@@ -550,11 +553,11 @@ public enum MailCrawler {
                                  reverseRows: Bool, edgeAscending: Bool,
                                  account: String, mailbox: String, includeContent: Bool,
                                  edgeTolerance: Int = 2, orderMisDetectTail: Int = 36,
-                                 hasCollected: Bool = false) -> ChunkScan {
+                                 hasCollected: Bool = false, aboveWindowTail: Int = 0) -> ChunkScan {
         var scan = ChunkScan(records: [], scanned: 0, skipped: 0, unreadable: 0,
-                             skippedOutOfWindow: 0, edgeCrossed: false, orderMisDetected: false)
+                             skippedOutOfWindow: 0, edgeCrossed: false, orderMisDetected: false,
+                             aboveWindowTail: aboveWindowTail)
         var stale = 0
-        var aboveWindowTail = 0
         var seenCollect = hasCollected  // walk-level: tripwire only arms after rows were indexed
         for row in reverseRows ? rows.reversed() : rows {
             scan.scanned += 1
@@ -590,16 +593,18 @@ public enum MailCrawler {
                     // DESCENDING walks with a defaulted order: a long run of
                     // above-toMs rows AFTER rows were collected means the
                     // order was mis-detected — flag it (the caller skips the
-                    // window; the job continues)
-                    aboveWindowTail += 1
-                    if aboveWindowTail > orderMisDetectTail {
+                    // window; the job continues). The tail is WALK-level:
+                    // production chunks are ≤ 12 rows, so the counter must
+                    // thread across chunks (3 chunks' worth trips it).
+                    scan.aboveWindowTail += 1
+                    if scan.aboveWindowTail > orderMisDetectTail {
                         scan.orderMisDetected = true
                     }
                 }
                 continue
             case .collect:
                 seenCollect = true
-                aboveWindowTail = 0
+                scan.aboveWindowTail = 0
                 scan.records.append(record)
             }
         }
@@ -720,6 +725,7 @@ public enum MailCrawler {
         var skipped = 0
         var unreadable = 0  // rows that produced no usable record (drives the zero-yield breaker)
         var skippedOutOfWindow = 0  // dated rows outside the window (also feeds the breaker)
+        var aboveWindowTail = 0  // consecutive above-toMs rows after a collect — WALK-level, threads through scanChunk
         var edgeCrossed = false
         var writeFailed = false
         var orderWasDefaulted = false  // set after the probe; drives the order-undetectable skip
@@ -838,11 +844,13 @@ public enum MailCrawler {
         func process(_ rows: [NSAppleEventDescriptor?], reverseRows: Bool, edgeAscending: Bool) -> Bool {
             let scan = MailCrawler.scanChunk(rows, window: window, reverseRows: reverseRows,
                                              edgeAscending: edgeAscending, account: account, mailbox: mailbox,
-                                             includeContent: includeContent, hasCollected: indexed > 0)
+                                             includeContent: includeContent, hasCollected: indexed > 0,
+                                             aboveWindowTail: aboveWindowTail)
             scanned += scan.scanned
             skipped += scan.skipped
             unreadable += scan.unreadable
             skippedOutOfWindow += scan.skippedOutOfWindow
+            aboveWindowTail = scan.aboveWindowTail
             if scan.orderMisDetected {
                 orderMisDetectedWalk = true
             }
@@ -964,7 +972,6 @@ public enum MailCrawler {
                                                                     newestFirstResolved: newestFirstResolved)
         if processProbe {
             edgeCrossed = process(probe, reverseRows: reverseRows, edgeAscending: edgeAscending)
-            if let reason = zeroYieldCheck() { return skip(scanned, indexed, reason) }
             if orderMisDetectedWalk {
                 let flushed = flush()
                 CrawlState.shared.setFlushPending(nil)
@@ -973,6 +980,7 @@ public enum MailCrawler {
                 }
                 return skip(scanned, indexed, "skipped: order mis-detected mid-walk — the defaulted order ran against the real layout (\(scanned) rows scanned, \(indexed) indexed)")
             }
+            if let reason = zeroYieldCheck() { return skip(scanned, indexed, reason) }
             // a SHRUNK blind probe succeeded below the full first chunk:
             // the unread tail would otherwise be skipped — re-queue it
             if blind, probeEnd < probeRange.upperBound {
