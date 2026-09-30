@@ -398,6 +398,10 @@ public enum MailCrawler {
         var processed = 0
         var found = 0
         var skippedMailboxes = 0
+        // Mailboxes whose counts have timed out: later windows skip the
+        // count attempts and go straight to blind pagination (memoized per
+        // job — 2×360 s of failed counting per window adds up to hours).
+        var blindMailboxes = Set<String>()
         let windowLabel = { (w: CrawlWindow) -> String in "\(w.fromMs)-\(w.toMs)" }
 
         for window in windows {
@@ -408,7 +412,8 @@ public enum MailCrawler {
                 progress("running", processed, found)
                 let r = crawlMailbox(jobID: jobID, account: t.account, mailboxAt: t.index, mailbox: t.name,
                                      window: window, includeContent: storeBody,
-                                     staging: staging, seq: seq, progress: progress)
+                                     staging: staging, seq: seq, blindMailboxes: &blindMailboxes,
+                                     progress: progress)
                 if let err = r.transportError {
                     // a transport failure is a failed JOB, not a skipped
                     // mailbox — silently walking on would report done with
@@ -512,6 +517,63 @@ public enum MailCrawler {
         blind && rows < requested
     }
 
+    /// Halve a blind chunk on an out-of-range failure: the lower half is
+    /// retried first, the upper half queued behind it. nil for a width-1
+    /// range (nothing left to halve). Halving a 12-wide chunk yields 6+6,
+    /// then 3+3, 2+1, 1+1 — never a 7-wide (bundle-ambiguous) piece.
+    public static func halve(_ range: ClosedRange<Int>) -> (lower: ClosedRange<Int>, upper: ClosedRange<Int>)? {
+        guard range.count > 1 else { return nil }
+        let mid = range.lowerBound + range.count / 2 - 1
+        return (range.lowerBound...mid, (mid + 1)...range.upperBound)
+    }
+
+    /// How to classify a FAILED blind chunk read. Mail ERRORS on
+    /// out-of-range reads (-1719 Invalid index, live-verified) — that is
+    /// the end-of-mailbox signal: halve at width > 1, stop cleanly at
+    /// width 1 (the read frontier). ANY other failure (-1712 timeouts,
+    /// executor busy, unusable replies) is transient and takes the strike
+    /// budget — halving against a wedged executor would cascade 12→1 in
+    /// milliseconds and silently stop the walk.
+    public enum BlindReadDecision: Equatable {
+        case halve
+        case endOfMailbox
+        case transientStrike
+    }
+
+    public static func blindReadDecision(errorNumber: Int?, width: Int, rangeErrorCode: Int = -1719) -> BlindReadDecision {
+        if errorNumber == rangeErrorCode {
+            return width > 1 ? .halve : .endOfMailbox
+        }
+        return .transientStrike
+    }
+
+    /// Direction-aware window decision for one dated row. Descending walks
+    /// (dates decrease with each step — newest-first mailboxes) end at
+    /// fromMs; ascending walks (oldest-first mailboxes — e.g. the forced
+    /// position-1 blind plan) end at toMs. Pre-window rows in ascending
+    /// walks are ordinary skips — the stale edge must NOT fire on them.
+    public enum RowDecision: Equatable {
+        case collect
+        case skip
+        case edge
+    }
+
+    public static func rowDecision(ms: Int64, fromMs: Int64, toMs: Int64, descending: Bool,
+                                   staleSoFar: Int, tolerance: Int = 2) -> (decision: RowDecision, stale: Int) {
+        if descending {
+            if ms < fromMs {
+                let stale = staleSoFar + 1
+                return (stale > tolerance ? .edge : .skip, stale)
+            }
+            return (ms < toMs ? .collect : .skip, staleSoFar)
+        }
+        if ms > toMs {
+            let stale = staleSoFar + 1
+            return (stale > tolerance ? .edge : .skip, stale)
+        }
+        return (ms >= fromMs ? .collect : .skip, staleSoFar)
+    }
+
     /// Terminal state-file counters: failed bumps the failure streak
     /// (drives the Rust respawn backoff), done zeroes it, cancelled
     /// preserves it; skipped-mailbox counts accumulate for operators.
@@ -529,6 +591,7 @@ public enum MailCrawler {
     static func crawlMailbox(jobID: String, account: String, mailboxAt: Int, mailbox: String,
                              window: CrawlWindow, includeContent: Bool,
                              staging: URL, seq: SeqCounter,
+                             blindMailboxes: inout Set<String>,
                              progress: @escaping (String, Int, Int) -> Void) -> WalkOutcome {
         func abort(_ scanned: Int, _ indexed: Int, _ reason: String) -> WalkOutcome {
             CrawlState.shared.setFlushPending(nil)
@@ -539,28 +602,71 @@ public enum MailCrawler {
             return WalkOutcome(scanned: scanned, indexed: indexed, transportError: nil, skipReason: reason)
         }
 
-        // ── count: up to 2 attempts, then BLIND WALK ──
+        // ── identity of this mailbox-window across windows ──
+        let blindKey = "\(account)|\(mailbox)"
+        // 12 records per script keeps each execution (~3-5 s/message on the
+        // big INBOX) well inside the script's own 240 s event timeout.
+        let chunkSize = 12
+
+        var scanned = 0
+        var indexed = 0
+        var skipped = 0
+        var unreadable = 0  // rows that produced no usable record (drives the zero-yield breaker)
+        var edgeCrossed = false
+        var writeFailed = false
+        var orderWasDefaulted = false  // set after the probe; drives the order-undetectable skip
+        var baseLabel = "\(window.fromMs)-\(window.toMs)"
+
+        func label() -> String {
+            skipped > 0 ? "\(baseLabel) skipped=\(skipped)" : baseLabel
+        }
+
+        /// fresh state file + stderr line (keeps updated_at alive through
+        /// backoff windows and carries the skipped counter)
+        func heartbeat() {
+            writeState(jobID: jobID, state: "running",
+                       processed: CrawlState.shared.snapshot.processed,
+                       found: CrawlState.shared.snapshot.found,
+                       window: label())
+            progress("running", CrawlState.shared.snapshot.processed, CrawlState.shared.snapshot.found)
+        }
+
+        // ── count: up to 2 attempts (decision-driven), then BLIND WALK ──
         // AE counts on large mailboxes are O(n) and can exceed any timeout,
         // while range reads on the same mailbox work — a failed count enters
-        // blind pagination instead of failing the job.
+        // blind pagination instead of failing the job. Once a mailbox has
+        // gone blind, later windows skip the count attempts entirely
+        // (memoized — 2×360 s per window per job would otherwise add up to
+        // hours of failed counting).
         var total: Int? = nil
         var countAttempts = 0
         var countDiagnostic = "unknown count failure"
-        while total == nil, countAttempts < 2 {
-            countAttempts += 1
-            if let t = MailAE.countMessages(mailboxAt: mailboxAt, account: account) {
-                total = t
-                break
-            }
-            countDiagnostic = lastError ?? countDiagnostic
-            switch MailCrawler.countAttemptDecision(tryNumber: countAttempts, total: total) {
-            case .counted, .enterBlindWalk:
-                break
-            case .retryAfterBackoff:
-                Thread.sleep(forTimeInterval: 5)  // bounded backoff between attempts
+        let memoizedBlind = blindMailboxes.contains(blindKey)
+        if !memoizedBlind {
+            while total == nil {
+                if CrawlState.shared.isCancelled { break }
+                countAttempts += 1
+                if let t = MailAE.countMessages(mailboxAt: mailboxAt, account: account) {
+                    total = t
+                    blindMailboxes.remove(blindKey)  // Mail calmed — count normally again
+                    break
+                }
+                countDiagnostic = lastError ?? countDiagnostic
+                let decision = MailCrawler.countAttemptDecision(tryNumber: countAttempts, total: nil)
+                if case .enterBlindWalk = decision {
+                    blindMailboxes.insert(blindKey)
+                    break  // total stays nil → blind mode
+                }
+                // .retryAfterBackoff
+                heartbeat()
+                Thread.sleep(forTimeInterval: 5)
             }
         }
-        let blind = (total == nil)
+        let blind = memoizedBlind || total == nil
+        if blind {
+            blindMailboxes.insert(blindKey)
+            baseLabel = "blind walk (count failed) \(window.fromMs)-\(window.toMs)"
+        }
 
         guard !blind || MailAE.mailRunning() else {
             return abort(0, 0, "Mail stopped before the blind walk of \(mailbox)")
@@ -570,15 +676,9 @@ public enum MailCrawler {
         }
         var totalValue = total ?? 0
 
-        // 12 records per script keeps each execution (~3-5 s/message on the
-        // big INBOX) well inside the script's own 240 s event timeout.
-        let chunkSize = 12
         // Blind walks have no count: the cap alone bounds the plan, and the
         // walk discovers the mailbox end via short/failed reads.
         let walkLimit = blind ? 20_000 : min(totalValue, 20_000)
-        let baseLabel = blind
-            ? "blind walk (count failed) \(window.fromMs)-\(window.toMs)"
-            : "\(window.fromMs)-\(window.toMs)"
 
         let pending = PendingBatch()
         let flushLock = NSLock()
@@ -598,28 +698,6 @@ public enum MailCrawler {
         }
         CrawlState.shared.setFlushPending { flush() }
 
-        var scanned = 0
-        var indexed = 0
-        var skipped = 0
-        var unreadable = 0  // rows that produced no usable record (drives the zero-yield breaker)
-        var edgeCrossed = false
-        var writeFailed = false
-        var orderWasDefaulted = false  // set after the probe; drives the order-undetectable skip
-
-        func label() -> String {
-            skipped > 0 ? "\(baseLabel) skipped=\(skipped)" : baseLabel
-        }
-
-        /// fresh state file + stderr line (keeps updated_at alive through
-        /// backoff windows and carries the skipped counter)
-        func heartbeat() {
-            writeState(jobID: jobID, state: "running",
-                       processed: CrawlState.shared.snapshot.processed,
-                       found: CrawlState.shared.snapshot.found,
-                       window: label())
-            progress("running", CrawlState.shared.snapshot.processed, CrawlState.shared.snapshot.found)
-        }
-
         /// Returns false on a batch-write failure (the walk must stop).
         func collect(_ record: CrawlRecord) -> Bool {
             pending.append(record)
@@ -633,8 +711,12 @@ public enum MailCrawler {
         }
 
         /// Process one chunk's rows in walk order. Returns true when the
-        /// window edge is CONFIRMED: more than 2 stale rows (one mis-dated
-        /// row must not end the whole window walk).
+        /// window edge is CONFIRMED: more than 2 out-of-window rows (one
+        /// mis-dated row must not end the whole window walk). Direction-
+        /// aware: descending walks (newest-first mailboxes) end BELOW
+        /// fromMs; ascending walks (oldest-first mailboxes, incl. the
+        /// forced position-1 blind plan) end ABOVE toMs — pre-window rows
+        /// there are ordinary skips, not an edge.
         @discardableResult
         func process(_ rows: [NSAppleEventDescriptor?], descending: Bool) -> Bool {
             let edgeTolerance = 2
@@ -648,14 +730,20 @@ public enum MailCrawler {
                     unreadable += 1
                     continue
                 }
-                if ms < window.fromMs {
-                    stale += 1
+                let (decision, newStale) = MailCrawler.rowDecision(ms: ms, fromMs: window.fromMs,
+                                                                   toMs: window.toMs, descending: descending,
+                                                                   staleSoFar: stale, tolerance: edgeTolerance)
+                stale = newStale
+                switch decision {
+                case .edge:
+                    return true
+                case .skip:
                     skipped += 1
-                    if stale > edgeTolerance { return true }
                     continue
-                }
-                if ms < window.toMs, !collect(record) {
-                    writeFailed = true
+                case .collect:
+                    if !collect(record) {
+                        writeFailed = true
+                    }
                 }
             }
             return false
@@ -684,15 +772,36 @@ public enum MailCrawler {
                                                  chunkSize: chunkSize, newestFirst: true,
                                                  avoidWidth: 7)
         let probe: [NSAppleEventDescriptor?]?
+        var probeEnd = probeRange.upperBound
         if blind {
             // no total: an out-of-range read ERRORS (-1719 Invalid index),
-            // so shrink the probe window until Mail answers
+            // so shrink the probe window until Mail answers. A width-1
+            // -1719 means the mailbox is EMPTY → skip with diagnostic;
+            // persistent non-range failures take a small strike budget and
+            // then abort with the diagnostic.
             var rows: [NSAppleEventDescriptor?]? = nil
             var end = probeRange.upperBound
-            while end >= 1, rows == nil {
+            var probeStrikes = 0
+            while end >= 1 {
+                if CrawlState.shared.isCancelled { break }
                 rows = MailAE.readProperties(mailboxAt: mailboxAt, account: account, start: 1, end: end,
                                              includeContent: includeContent)
-                if rows == nil { end = end / 2 }
+                if rows != nil { probeEnd = end; break }
+                if lastErrorNumber == -1719 {
+                    if end == 1 {
+                        return skip(0, 0, "skipped: mailbox appears empty (count also failed: \(countDiagnostic))")
+                    }
+                    end = end / 2
+                    heartbeat()
+                    Thread.sleep(forTimeInterval: 1)
+                } else {
+                    probeStrikes += 1
+                    if probeStrikes >= 2 {
+                        return abort(0, 0, "blind probe read failed for \(mailbox) — \(lastError ?? "unknown error")")
+                    }
+                    heartbeat()
+                    Thread.sleep(forTimeInterval: min(60, Double(5 * probeStrikes)))
+                }
             }
             probe = rows
         } else {
@@ -727,22 +836,38 @@ public enum MailCrawler {
             farEndSample: farEndSample)
         orderWasDefaulted = orderWasAmbiguous
 
-        // re-plan under the resolved order; the probe range only applies to
-        // newest-first walks (oldest-first probes are detection-only)
+        // Blind walks FORCE the newest-first plan shape (anchored at
+        // position 1, ascending): a far-end-anchored plan would fabricate
+        // position `cap` and read out-of-range immediately. The resolved
+        // order only drives the PROCESS direction below. Counted walks keep
+        // the order-shaped plans.
         var (walkRanges, _, processProbe) = MailAE.walkPlan(total: blind ? walkLimit : totalValue,
                                                             walkLimit: walkLimit,
                                                             chunkSize: chunkSize,
-                                                            newestFirst: newestFirstResolved,
+                                                            newestFirst: blind ? true : newestFirstResolved,
                                                             avoidWidth: 7)
+        let processDescending = blind ? newestFirstResolved : !newestFirstResolved
         if processProbe {
-            edgeCrossed = process(probe, descending: false)
+            edgeCrossed = process(probe, descending: processDescending)
             if let reason = zeroYieldCheck() { return skip(scanned, indexed, reason) }
+            // a SHRUNK blind probe succeeded below the full first chunk:
+            // the unread tail would otherwise be skipped — re-queue it
+            if blind, probeEnd < probeRange.upperBound {
+                var tail = (probeEnd + 1)...probeRange.upperBound
+                if tail.count == 7 {
+                    // keep the bundle-ambiguity invariant on re-queued tails
+                    let halves = MailCrawler.halve(tail)!
+                    walkRanges.insert(halves.upper, at: 1)
+                    tail = halves.lower
+                }
+                walkRanges.insert(tail, at: 1)
+            }
         }
 
         var i = processProbe ? 1 : 0  // newest-first: plan[0] IS the probe range
         var consecutiveFailures = 0
         var abortReason: String?
-        while i < walkRanges.count, !edgeCrossed, consecutiveFailures < 3, !writeFailed,
+        walk: while i < walkRanges.count, !edgeCrossed, consecutiveFailures < 3, !writeFailed,
               indexed < walkLimit, abortReason == nil {
             if CrawlState.shared.isCancelled {
                 CrawlState.shared.signalCancelledObserved()
@@ -789,7 +914,7 @@ public enum MailCrawler {
                 // gentle pacing: a pause between chunks keeps Mail's event
                 // queue responsive for the user's interactive Mail use
                 Thread.sleep(forTimeInterval: 1)
-                edgeCrossed = process(rows, descending: !newestFirstResolved)
+                edgeCrossed = process(rows, descending: processDescending)
                 heartbeat()
                 if let reason = zeroYieldCheck() {
                     // skip this mailbox's window (diagnostic in the state
@@ -809,17 +934,30 @@ public enum MailCrawler {
                     break
                 }
             } else if blind {
-                // Blind pagination with no known total: an out-of-range read
-                // ERRORS (-1719 Invalid index). Halve the failed chunk and
-                // retry the lower half — no strike, shrinking can't produce
-                // a 7-wide (bundle-ambiguous) piece from a 12-wide one. At
-                // width 1 the failure means "past the end": stop cleanly.
-                if range.count > 1 {
-                    let mid = range.lowerBound + range.count / 2 - 1
-                    walkRanges[i] = range.lowerBound...mid
-                    walkRanges.insert((mid + 1)...range.upperBound, at: i + 1)
-                } else {
-                    break  // walked off the end of the mailbox
+                // Blind pagination with no known total: classify the failure.
+                // -1719 (Invalid index) at the read frontier is the
+                // end-of-mailbox signal — halve at width > 1 (halving from 12
+                // never produces a 7-wide bundle-ambiguous piece), stop
+                // cleanly at width 1. ANY other failure is transient and
+                // takes the strike budget (halving against a wedged executor
+                // would cascade 12→1 in milliseconds and silently stop).
+                heartbeat()
+                switch MailCrawler.blindReadDecision(errorNumber: lastErrorNumber,
+                                                     width: range.count) {
+                case .halve:
+                    let halves = MailCrawler.halve(range)!
+                    walkRanges[i] = halves.lower
+                    walkRanges.insert(halves.upper, at: i + 1)
+                    Thread.sleep(forTimeInterval: 1)
+                case .endOfMailbox:
+                    break walk
+                case .transientStrike:
+                    consecutiveFailures += 1
+                    if consecutiveFailures >= 3 {
+                        abortReason = "3 consecutive blind-read failures in \(mailbox) at \(range.lowerBound)-\(range.upperBound) — \(lastError ?? "unknown error")"
+                    } else {
+                        Thread.sleep(forTimeInterval: min(60, Double(5 * consecutiveFailures)))
+                    }
                 }
             } else {
                 // refresh the count first: ranges beyond a shrunken mailbox

@@ -32,6 +32,7 @@ import AppKit
 
 private let lastErrorLock = NSLock()
 private var _lastError: String?
+private var _lastErrorNumber: Int?
 
 /// Last Mail transport error (script error message or watchdog overrun).
 /// Thread-safe: the SIGTERM handler thread can write it via flush-failure
@@ -39,6 +40,14 @@ private var _lastError: String?
 public var lastError: String? {
     get { lastErrorLock.lock(); defer { lastErrorLock.unlock() }; return _lastError }
     set { lastErrorLock.lock(); defer { lastErrorLock.unlock() }; _lastError = newValue }
+}
+
+/// The script error NUMBER of the last failed execution (e.g. -1719
+/// Invalid index, -1712 AppleEvent timed out) — blind pagination
+/// classifies failures by number. nil after success / non-script failures.
+public var lastErrorNumber: Int? {
+    get { lastErrorLock.lock(); defer { lastErrorLock.unlock() }; return _lastErrorNumber }
+    set { lastErrorLock.lock(); defer { lastErrorLock.unlock() }; _lastErrorNumber = newValue }
 }
 
 // Message record keywords (sdef four-char codes, validated live on macOS 27).
@@ -81,20 +90,21 @@ final class OSAExecutor {
     private final class ResultBox {
         var reply: NSAppleEventDescriptor?
         var failure: String?
+        var number: Int?
     }
 
     /// Compile + execute one script. Runs on the executor queue only.
-    private func executeScript(_ source: String) -> (NSAppleEventDescriptor?, String?) {
+    private func executeScript(_ source: String) -> (NSAppleEventDescriptor?, String?, Int?) {
         let script = NSAppleScript(source: source)
         var err: NSDictionary?
         if let desc = script?.executeAndReturnError(&err) {
-            return (desc, nil)
+            return (desc, nil, nil)
         }
         // Documented NSAppleScriptErrorDictionary keys (the SDK's constant
         // declarations don't play well with dictionary subscripts here)
-        let num = (err?["NSAppleScriptErrorNumber"] as? Int).map(String.init) ?? "?"
+        let num = err?["NSAppleScriptErrorNumber"] as? Int
         let msg = (err?["NSAppleScriptErrorMessage"] as? String) ?? "unknown OSA failure"
-        return (nil, "AppleScript error \(num): \(msg)")
+        return (nil, "AppleScript error \(num.map(String.init) ?? "?"): \(msg)", num)
     }
 
     func run(_ source: String, timeoutSeconds: TimeInterval) -> NSAppleEventDescriptor? {
@@ -105,6 +115,7 @@ final class OSAExecutor {
             // would keep hammering Mail after the wedge clears.
             lock.unlock()
             lastError = "osa executor busy — previous script still in flight"
+            lastErrorNumber = nil
             return nil
         }
         inFlight = true
@@ -113,9 +124,10 @@ final class OSAExecutor {
         let sem = DispatchSemaphore(value: 0)
         let box = ResultBox()
         let work = DispatchWorkItem {
-            let (reply, failure) = self.executeScript(source)
+            let (reply, failure, number) = self.executeScript(source)
             box.reply = reply
             box.failure = failure
+            box.number = number
             self.lock.lock()
             self.inFlight = false
             self.lock.unlock()
@@ -129,13 +141,16 @@ final class OSAExecutor {
             // instead of a deadlock. The in-script `with timeout` guarantees
             // the blocked event errors out well before the watchdog would.
             lastError = "AppleScript timeout after \(Int(timeoutSeconds))s — Mail unresponsive"
+            lastErrorNumber = nil
             return nil
         }
         if let failure = box.failure {
             lastError = failure
+            lastErrorNumber = box.number
             return nil
         }
         lastError = nil
+        lastErrorNumber = nil
         return box.reply
     }
 }

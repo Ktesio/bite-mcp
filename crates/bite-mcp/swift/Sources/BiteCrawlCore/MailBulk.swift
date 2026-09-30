@@ -34,11 +34,14 @@ public struct BulkSelection {
 
 public enum MailBulk {
     /// Terminal-state table for one executed bulk operation:
-    /// ok + verified remaining 0 → "done"; ok + remaining > 0 → "partial"
-    /// (never "running" — the job is over either way); verification failed
-    /// (nil) or the operation errored → "failed".
+    /// ok → the operation SUCCEEDED — done when the verification count
+    /// agrees (remaining 0) or notes "partial" (remaining > 0); a
+    /// verification count that TIMES OUT (nil) must not fail a succeeded
+    /// destructive op — it reports done and the caller notes the unknown
+    /// remaining. Only an operation error → "failed".
     public static func terminalState(ok: Bool, remaining: Int?) -> String {
-        guard ok, let remaining else { return "failed" }
+        guard ok else { return "failed" }
+        guard let remaining else { return "done" }
         return remaining == 0 ? "done" : "partial"
     }
 
@@ -220,12 +223,20 @@ public enum MailBulk {
             let (ok, _) = MailAE.moveWhose(mailboxAt: src.index, account: src.account, selection: selection,
                                            toMailboxAt: dest.index, toAccount: dest.account)
             let remaining = ok ? MailAE.countWhose(mailboxAt: src.index, account: src.account, selection: selection) : nil
+            if ok, remaining == nil {
+                // succeeded, but the verification count timed out — don't
+                // hide that from the operator
+                CrawlState.shared.setWindow("bulk move done — verification count timed out, remaining unknown")
+            }
             writeState(terminalState(ok: ok, remaining: remaining), remaining ?? 0)
 
         case "delete":
             guard requireIdentity(src, estimated: estimated) else { return }
             let (ok, _) = MailAE.deleteWhose(mailboxAt: src.index, account: src.account, selection: selection)
             let remaining = ok ? MailAE.countWhose(mailboxAt: src.index, account: src.account, selection: selection) : nil
+            if ok, remaining == nil {
+                CrawlState.shared.setWindow("bulk delete done — verification count timed out, remaining unknown")
+            }
             writeState(terminalState(ok: ok, remaining: remaining), remaining ?? 0)
 
         default:

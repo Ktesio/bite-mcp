@@ -153,8 +153,71 @@ final class MailOSATests: XCTestCase {
     func testIsShortReadOnlyAppliesInBlindMode() {
         XCTAssertTrue(MailCrawler.isShortRead(rows: 5, requested: 12, blind: true))
         XCTAssertFalse(MailCrawler.isShortRead(rows: 12, requested: 12, blind: true))
+        // boundaries: 0 rows (unreachable via one AE but guarded), 1 row,
+        // and requested-1 are all short reads
+        XCTAssertTrue(MailCrawler.isShortRead(rows: 0, requested: 12, blind: true))
+        XCTAssertTrue(MailCrawler.isShortRead(rows: 1, requested: 12, blind: true))
+        XCTAssertTrue(MailCrawler.isShortRead(rows: 11, requested: 12, blind: true))
         // counted mode: a short read is just data, never an end marker
         XCTAssertFalse(MailCrawler.isShortRead(rows: 5, requested: 12, blind: false))
+    }
+
+    // ── blind chunk halving + error classification ──
+
+    func testHalveSplitsAndStopsAtWidthOne() {
+        let h12 = MailCrawler.halve(1...12)
+        XCTAssertEqual(h12?.lower, 1...6)
+        XCTAssertEqual(h12?.upper, 7...12)
+        XCTAssertNil(MailCrawler.halve(1...1), "width 1 cannot be halved")
+        // full depth: 12 → 6+6 → 3+3 → 1+2 → 1+1 → stop; no width-7 piece
+        // at ANY depth (7-wide bundle replies are structurally ambiguous)
+        var widths: [Int] = [12]
+        var queue: [ClosedRange<Int>] = [1...12]
+        while let range = queue.first {
+            queue.removeFirst()
+            guard let halves = MailCrawler.halve(range) else { continue }
+            queue.append(contentsOf: [halves.lower, halves.upper])
+            widths.append(contentsOf: [halves.lower.count, halves.upper.count])
+        }
+        XCTAssertFalse(widths.contains(7), "no halved piece may be 7 wide: \(widths)")
+        XCTAssertTrue(widths.allSatisfy { $0 >= 1 })
+    }
+
+    func testBlindReadDecisionClassifiesByErrorAndWidth() {
+        // -1719 (Invalid index) at the frontier: halve while wide…
+        XCTAssertEqual(MailCrawler.blindReadDecision(errorNumber: -1719, width: 12), .halve)
+        XCTAssertEqual(MailCrawler.blindReadDecision(errorNumber: -1719, width: 2), .halve)
+        // …and end-of-mailbox at the frontier's last position
+        XCTAssertEqual(MailCrawler.blindReadDecision(errorNumber: -1719, width: 1), .endOfMailbox)
+        // everything else is transient: -1712 timeouts, executor busy
+        // (nil number), unusable replies — strike budget, never halving
+        XCTAssertEqual(MailCrawler.blindReadDecision(errorNumber: -1712, width: 12), .transientStrike)
+        XCTAssertEqual(MailCrawler.blindReadDecision(errorNumber: nil, width: 6), .transientStrike)
+    }
+
+    // ── direction-aware window edge ──
+
+    func testRowDecisionDescendingEndsAtFromMs() {
+        let from: Int64 = 1_000, to: Int64 = 2_000
+        // newest-first walk (dates decrease): in-window collects…
+        XCTAssertEqual(MailCrawler.rowDecision(ms: 1_500, fromMs: from, toMs: to, descending: true, staleSoFar: 0).decision, .collect)
+        // …newer-than-window skips…
+        XCTAssertEqual(MailCrawler.rowDecision(ms: 2_500, fromMs: from, toMs: to, descending: true, staleSoFar: 0).decision, .skip)
+        // …and crossing below fromMs trips the edge after tolerance
+        XCTAssertEqual(MailCrawler.rowDecision(ms: 500, fromMs: from, toMs: to, descending: true, staleSoFar: 0).decision, .skip)
+        XCTAssertEqual(MailCrawler.rowDecision(ms: 500, fromMs: from, toMs: to, descending: true, staleSoFar: 2).decision, .edge)
+    }
+
+    func testRowDecisionAscendingEndsAtToMs() {
+        let from: Int64 = 1_000, to: Int64 = 2_000
+        // oldest-first walk (dates increase): pre-window rows are ordinary
+        // SKIPS — the stale edge must NOT fire on them…
+        XCTAssertEqual(MailCrawler.rowDecision(ms: 500, fromMs: from, toMs: to, descending: false, staleSoFar: 0).decision, .skip)
+        XCTAssertEqual(MailCrawler.rowDecision(ms: 500, fromMs: from, toMs: to, descending: false, staleSoFar: 5).decision, .skip)
+        // …in-window collects, and crossing ABOVE toMs trips the edge
+        XCTAssertEqual(MailCrawler.rowDecision(ms: 1_500, fromMs: from, toMs: to, descending: false, staleSoFar: 0).decision, .collect)
+        XCTAssertEqual(MailCrawler.rowDecision(ms: 2_500, fromMs: from, toMs: to, descending: false, staleSoFar: 0).decision, .skip)
+        XCTAssertEqual(MailCrawler.rowDecision(ms: 2_500, fromMs: from, toMs: to, descending: false, staleSoFar: 2).decision, .edge)
     }
 
     func testBlindPlanCutsFromTheCap() {
@@ -384,7 +447,11 @@ final class MailOSATests: XCTestCase {
         let keyed = NSAppleEventDescriptor.record()
         keyed.setDescriptor(NSAppleEventDescriptor(int32: 1), forKeyword: MailAE.kwMessageID)
         XCTAssertTrue(isRecordRow(keyed))
-        // lists and scalars are not record rows
+        // lists and scalars are not record rows — bundle rows (lists of
+        // scalars) must classify as NON-records so column replies repack
+        let bundleRow = NSAppleEventDescriptor.list()
+        for _ in 0..<7 { bundleRow.insert(NSAppleEventDescriptor(int32: 1), at: Int(bundleRow.numberOfItems) + 1) }
+        XCTAssertFalse(isRecordRow(bundleRow))
         XCTAssertFalse(isRecordRow(NSAppleEventDescriptor.list()))
         XCTAssertFalse(isRecordRow(NSAppleEventDescriptor(int32: 5)))
         XCTAssertFalse(isRecordRow(nil))
@@ -599,7 +666,9 @@ final class MailOSATests: XCTestCase {
     func testBulkTerminalStateTable() {
         XCTAssertEqual(MailBulk.terminalState(ok: true, remaining: 0), "done")
         XCTAssertEqual(MailBulk.terminalState(ok: true, remaining: 5), "partial")
-        XCTAssertEqual(MailBulk.terminalState(ok: true, remaining: nil), "failed")  // verification failed
+        // ok + verification-count timeout → done (a succeeded destructive op
+        // must not be reported failed; the caller notes the unknown remaining)
+        XCTAssertEqual(MailBulk.terminalState(ok: true, remaining: nil), "done")
         XCTAssertEqual(MailBulk.terminalState(ok: false, remaining: 0), "failed")
         XCTAssertEqual(MailBulk.terminalState(ok: false, remaining: nil), "failed")
     }
