@@ -17,9 +17,9 @@ Messages **history** additionally reads `~/Library/Messages/chat.db`, which
 needs **Full Disk Access** for the terminal/agent app. Without FDA,
 `messages_history` degrades to active-chats data; send/list always work.
 
-## Doctor: prompt-free by default
+## Doctor: status checks are prompt-free
 
-`bite doctor` reads TCC *status* only (no prompts):
+`bite doctor`'s status checks read TCC *status* only (no prompts):
 
 ```
 ✓ calendar     a system prompt appears on first use
@@ -29,6 +29,12 @@ needs **Full Disk Access** for the terminal/agent app. Without FDA,
 
 - `bite doctor --probe` additionally live-tests the Apple Events grants for
   Mail/Notes/Messages — this *does* trigger the prompts if pending.
+- Once the crawl worker is installed, plain `bite doctor` also runs its
+  one-shot Mail probe (`bite-crawl --probe-mail`) — a real Apple Event that
+  can raise the Mail automation prompt once. It distinguishes `authorized` /
+  `no_accounts` / `denied_or_empty`: a zero-account Mail is a configuration
+  state, not a TCC denial, and `denied_or_empty` also covers Mail simply not
+  running — launch Mail before permission-chasing.
 - `bite doctor --fix` opens the matching System Settings pane for anything
   denied.
 
@@ -62,3 +68,19 @@ stable:
 source-only (compilation happens on the user's machine), so Gatekeeper never
 stands between users and the helper; a notarized prebuilt channel is a
 considered Phase 2 addition (ROADMAP).
+
+## macOS 27+: Apple Events go through OSA
+
+From macOS 27, raw (non-OSA) Apple Event sends return silent empty replies.
+bite sends through OSA everywhere — the helper via ScriptingBridge, the Mail
+crawl worker via NSAppleScript — so prompts and grants behave exactly as
+documented above.
+
+One caveat: `bite-crawl` is a separate binary with its own TCC identity.
+Mail may be granted to the helper yet denied for the crawler — and that
+denial is silent: the crawl sits in `waiting_mail` (60 s heartbeats, 24 h
+cap) and then reports `failed`; it never returns a `permission_denied` tool
+error. If indexing keeps failing while live Mail tools work, run
+`bite doctor` — the crawler Mail automation line distinguishes
+`denied_or_empty` from `no_accounts` — and approve the Mail automation
+prompt once from a real terminal.

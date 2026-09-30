@@ -133,11 +133,20 @@ pub fn run(fix: bool, probe: bool) -> Result<i32, bite_core::BiteError> {
         match out {
             Ok(o) => {
                 let text = String::from_utf8_lossy(&o.stdout);
-                let authorized = text.contains("authorized");
-                status_line(authorized, "crawler Mail automation");
-                if !authorized {
-                    println!("        {YELLOW}{}{RESET}", text.trim());
-                    println!("        {DIM}→ approve the Mail automation prompt once, from your terminal{RESET}");
+                if text.contains("no_accounts") {
+                    // Mail answered fine — it just has nothing configured.
+                    // Not a TCC problem; don't send users permission-chasing.
+                    status_line(true, "crawler Mail automation");
+                    println!(
+                        "        {DIM}Mail has no accounts configured — nothing to index{RESET}"
+                    );
+                } else {
+                    let authorized = text.contains("authorized");
+                    status_line(authorized, "crawler Mail automation");
+                    if !authorized {
+                        println!("        {YELLOW}{}{RESET}", text.trim());
+                        println!("        {DIM}→ approve the Mail automation prompt once, from your terminal{RESET}");
+                    }
                 }
             }
             Err(_) => println!("        {DIM}probe failed to run{RESET}"),

@@ -2,8 +2,9 @@
 
 **Native Apple apps for AI agents** — Calendar, Reminders, Mail, Notes,
 Contacts and Messages over MCP. Rust control plane, native Swift helper
-(EventKit + ScriptingBridge). No `osascript`, no AppleScript strings, no
-Python.
+(EventKit + ScriptingBridge), plus a detached Swift crawl worker that
+compiles AppleScript through NSAppleScript (OSA) to index Mail. No
+`osascript` processes, no Python.
 
 > **Disclaimer:** bite is an independent open-source project. It is **not
 > affiliated with, sponsored, or endorsed by Apple Inc.** macOS, iMessage,
@@ -27,7 +28,7 @@ VS Code, Gemini CLI (whichever it detects).
 
 ## What you get
 
-38 MCP tools + mirrored CLI verbs:
+45 MCP tools + mirrored CLI verbs:
 
 | App | Engine | Tools |
 |-----|--------|-------|
@@ -37,6 +38,7 @@ VS Code, Gemini CLI (whichever it detects).
 | Notes | ScriptingBridge | folders, search, get (markdown+HTML), create, update (append), delete |
 | Contacts | Contacts.framework (native) | search, get, create, update, delete, groups |
 | Messages | ScriptingBridge + chat.db | send, recent chats, history |
+| Index | LanceDB + `bite-crawl` worker | index_rebuild, index_status, index_crawl_cancel, search, mail_bulk_* — plus index_wipe (callable via CLI/tools/call, not advertised in tools/list) |
 
 Plus MCP resources (`bite://calendars`, `bite://mail/mailboxes`, …) and
 prompts (`plan-my-week`, `triage-inbox`, `daily-brief`).
@@ -62,11 +64,17 @@ mode 0700) and answers searches locally — no Apple Events on the query path.
 | Index/ingest 100k messages | 7.1 s one-time | n/a (never completes) |
 | Full-text search | 8–10 ms | 120 s+ timeout at 100 messages |
 | Exact count (66k unread) | 8.9 ms | times out |
-| Bulk mark-unread-read | 1 Apple Event | 1,834+ events |
+| Bulk mark-unread-read | a handful of Apple Events total | 1,834+ events |
 
 Reproduce: `cargo run -p bite-index --example bench_100k --release`.
-Bulk ops (mark/move/delete, whole mailbox or filtered) likewise run as one
-Apple Event per operation — Mail iterates internally while bite waits.
+Bulk ops (mark/move/delete over a filtered selection — unfiltered
+whole-mailbox runs are refused) likewise run as a whose-clause script per
+operation plus verification counts — a handful of
+Apple Events total, still O(1) vs per-message: Mail iterates internally
+while bite waits.
+
+Mail crawl throughput depends on Mail's own Apple Event latency; the
+index-side numbers above are the LanceDB bench.
 
 ## Why this architecture
 
@@ -79,9 +87,22 @@ bite-helper (Swift, installed once at a stable path):
      ├─ EventKit            → Calendar, Reminders   (full CRUD)
      ├─ Contacts.framework  → Contacts              (full CRUD)
      └─ ScriptingBridge     → Mail, Notes, Messages (Apple Events, no osascript)
+
+bite (Rust) also spawns a background worker for the Mail index:
+bite-crawl (Swift, detached worker): Mail crawl → staged JSONL batches
+     │  batches/*.jsonl
+     ▼
+bite (Rust) ingests them into the entity index (LanceDB) — instant local search
 ```
 
-- **Native, not AppleScript.** Every call goes through Apple's own APIs.
+- **Native, not `osascript`.** Every call goes through Apple's own APIs
+  (EventKit, Contacts.framework, ScriptingBridge — and NSAppleScript for the
+  Mail crawl worker).
+- **OSA-mediated Apple Events.** From macOS 27, raw (non-OSA) Apple Event
+  senders get silent empty replies. Every bite component that sends Apple
+  Events goes through OSA — the helper via ScriptingBridge, the Mail crawl
+  worker via NSAppleScript — so events are answered normally; TCC behavior
+  is unchanged.
 - **Stable helper path** (`~/Library/Application Support/bite/bin/`) keeps
   macOS TCC permission grants valid across upgrades.
 - **One registry, two faces.** MCP `tools/list` schemas and CLI verbs are
@@ -96,7 +117,7 @@ bite-helper (Swift, installed once at a stable path):
 
 | Path | Command | Needs |
 |------|---------|-------|
-| crates.io (source) | `cargo install bite-mcp` | Xcode Command Line Tools (compiles the Swift helper) |
+| crates.io (source) | `cargo install bite-mcp` | Xcode Command Line Tools (compiles both Swift binaries — helper + crawl worker) |
 | marketplace (Claude/ZCode) | `/plugin marketplace add ktesio/bite-mcp` | `bite` on PATH first |
 | other agent CLIs | `bite setup` (writes their MCP config) | `bite` on PATH |
 
@@ -106,6 +127,9 @@ bite-helper (Swift, installed once at a stable path):
    agent CLIs, prints marketplace commands.
 2. First call per app shows macOS's own permission prompt once (Calendar,
    Reminders, Contacts, and one "wants to control Mail" prompt per SB app).
+   The crawl worker is a separate binary with its own TCC identity, so Mail
+   indexing raises one more "wants to control Mail" prompt of its own — see
+   [docs/permissions.md](docs/permissions.md).
 3. Denied something? `bite doctor --fix` opens the right System Settings panes.
 
 ## Privacy & intended use
@@ -131,7 +155,8 @@ bite-helper (Swift, installed once at a stable path):
 - [NOTICE.md](NOTICE.md) — attribution and trademark notices
 - [SECURITY.md](SECURITY.md) — how to report security issues
 - [docs/PLAN.md](docs/PLAN.md) — the full implementation plan
-- [docs/protocol.md](docs/protocol.md) — the Rust↔Swift bridge protocol
+- [docs/protocol.md](docs/protocol.md) — the Rust↔Swift helper protocol and
+  the crawl batch handoff
 - [docs/permissions.md](docs/permissions.md) — every TCC prompt and how to recover
 - [docs/adding-an-app.md](docs/adding-an-app.md) — add Music/Finder/anything
 - [docs/ROADMAP.md](docs/ROADMAP.md) — Phase 2 surface

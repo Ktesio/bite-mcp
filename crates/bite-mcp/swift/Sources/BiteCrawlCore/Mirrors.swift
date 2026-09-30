@@ -13,10 +13,14 @@ public final class SeqCounter {
 }
 
 public enum Mirrors {
-    public static func write(_ records: [CrawlRecord], staging: URL, jobID: String, seq: SeqCounter) {
-        guard !records.isEmpty else { return }
-        MailCrawler.writeBatch(staging: staging, jobID: jobID, seq: seq.value, records: records)
-        seq.value += 1
+    /// Stage one batch. Returns false (with lastError) on a write failure —
+    /// callers must fail the job rather than report done with holes.
+    @discardableResult
+    public static func write(_ records: [CrawlRecord], staging: URL, jobID: String, seq: SeqCounter) -> Bool {
+        guard !records.isEmpty else { return true }
+        let ok = MailCrawler.writeBatch(staging: staging, jobID: jobID, seq: seq.value, records: records)
+        if ok { seq.value += 1 }
+        return ok
     }
 
     /// Run `body` on a background queue with a hard deadline. Detached
@@ -40,8 +44,16 @@ public enum Mirrors {
     }
 
     /// Calendar mirror: events from -90d to +180d across all calendars.
-    public static func calendar(staging: URL, jobID: String, seq: SeqCounter, progress: @escaping (String, Int, Int) -> Void) {
-        withDeadline(300, "calendar", progress: progress, body: {
+    /// Returns false only when a batch WRITE failed (a withDeadline timeout
+    /// stays a tolerated skip, as before).
+    @discardableResult
+    public static func calendar(staging: URL, jobID: String, seq: SeqCounter, progress: @escaping (String, Int, Int) -> Void) -> Bool {
+        return withDeadline(300, "calendar", progress: progress, body: {
+        var allWritesOK = true
+        func stage(_ records: inout [CrawlRecord]) {
+            if !write(records, staging: staging, jobID: jobID, seq: seq) { allWritesOK = false }
+            records.removeAll(keepingCapacity: true)
+        }
         let store = EKEventStore()
         let sem = DispatchSemaphore(value: 0)
         if #available(macOS 14.0, *) {
@@ -74,18 +86,24 @@ public enum Mirrors {
                 props: e.location.map { "{\"location\":\(jsonString($0))}" }
             ))
             if records.count >= 500 {
-                write(records, staging: staging, jobID: jobID, seq: seq)
-                records.removeAll(keepingCapacity: true)
+                stage(&records)
             }
         }
-        write(records, staging: staging, jobID: jobID, seq: seq)
+        stage(&records)
         progress("running", CrawlState.shared.snapshot.processed, events.count)
-        })
+        return allWritesOK
+        }) ?? true
     }
 
     /// Reminders mirror: all lists, completed + incomplete.
-    public static func reminders(staging: URL, jobID: String, seq: SeqCounter, progress: @escaping (String, Int, Int) -> Void) {
-        withDeadline(300, "reminders", progress: progress, body: {
+    @discardableResult
+    public static func reminders(staging: URL, jobID: String, seq: SeqCounter, progress: @escaping (String, Int, Int) -> Void) -> Bool {
+        return withDeadline(300, "reminders", progress: progress, body: {
+        var allWritesOK = true
+        func stage(_ records: inout [CrawlRecord]) {
+            if !write(records, staging: staging, jobID: jobID, seq: seq) { allWritesOK = false }
+            records.removeAll(keepingCapacity: true)
+        }
         let store = EKEventStore()
         let sem = DispatchSemaphore(value: 0)
         if #available(macOS 14.0, *) {
@@ -123,18 +141,24 @@ public enum Mirrors {
                 props: nil
             ))
             if records.count >= 500 {
-                write(records, staging: staging, jobID: jobID, seq: seq)
-                records.removeAll(keepingCapacity: true)
+                stage(&records)
             }
         }
-        write(records, staging: staging, jobID: jobID, seq: seq)
+        stage(&records)
         progress("running", CrawlState.shared.snapshot.processed, all.count)
-        })
+        return allWritesOK
+        }) ?? true
     }
 
     /// Contacts mirror: all contacts in all containers.
-    public static func contacts(staging: URL, jobID: String, seq: SeqCounter, progress: @escaping (String, Int, Int) -> Void) {
-        withDeadline(300, "contacts", progress: progress, body: {
+    @discardableResult
+    public static func contacts(staging: URL, jobID: String, seq: SeqCounter, progress: @escaping (String, Int, Int) -> Void) -> Bool {
+        return withDeadline(300, "contacts", progress: progress, body: {
+        var allWritesOK = true
+        func stage(_ records: inout [CrawlRecord]) {
+            if !write(records, staging: staging, jobID: jobID, seq: seq) { allWritesOK = false }
+            records.removeAll(keepingCapacity: true)
+        }
         let store = CNContactStore()
         let sem = DispatchSemaphore(value: 0)
         store.requestAccess(for: .contacts) { _, _ in sem.signal() }
@@ -170,13 +194,13 @@ public enum Mirrors {
                 priority: nil, props: nil
             ))
             if records.count >= 500 {
-                write(records, staging: staging, jobID: jobID, seq: seq)
-                records.removeAll(keepingCapacity: true)
+                stage(&records)
             }
         }
-        write(records, staging: staging, jobID: jobID, seq: seq)
+        stage(&records)
         progress("running", CrawlState.shared.snapshot.processed, records.count)
-        })
+        return allWritesOK
+        }) ?? true
     }
 
     static func jsonString(_ s: String) -> String {
