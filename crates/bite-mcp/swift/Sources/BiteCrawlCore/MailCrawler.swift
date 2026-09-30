@@ -16,6 +16,11 @@ import Foundation
 public struct CrawlWindow {
     public let fromMs: Int64
     public let toMs: Int64
+
+    public init(fromMs: Int64, toMs: Int64) {
+        self.fromMs = fromMs
+        self.toMs = toMs
+    }
 }
 
 /// JSONL batch record — mirrors bite-index::store::Record (Rust).
@@ -477,10 +482,13 @@ public enum MailCrawler {
     /// indexing nothing, further chunks are wasted reads. The mailbox
     /// window is SKIPPED (diagnostic in the state label) — other mailboxes
     /// continue, and the job must not fail (a failure would loop-respawn
-    /// against unparseable data).
-    public static func zeroYieldSkipReason(unreadable: Int, indexed: Int, threshold: Int = 500) -> String? {
-        guard unreadable > threshold, indexed == 0 else { return nil }
-        return "skipped: zero yield after \(unreadable) unreadable rows"
+    /// against unparseable data). Out-of-window dated skips count too:
+    /// ascending-edge walks legitimately skip thousands of pre-window rows
+    /// on big old mailboxes, and that must trip the breaker, not burn
+    /// ~3-5 s-per-row reads forever.
+    public static func zeroYieldSkipReason(unreadable: Int, outOfWindow: Int, indexed: Int, threshold: Int = 500) -> String? {
+        guard unreadable + outOfWindow > threshold, indexed == 0 else { return nil }
+        return "skipped: zero yield after \(unreadable + outOfWindow) useless rows"
     }
 
     /// Order resolution with far-end resample. Returns the resolved
@@ -517,11 +525,69 @@ public enum MailCrawler {
         blind && rows < requested
     }
 
+    /// Result of scanning one chunk: the in-window records to collect (in
+    /// processing order), plus honest counters.
+    public struct ChunkScan {
+        public var records: [CrawlRecord]
+        public var scanned: Int
+        public var skipped: Int
+        public var unreadable: Int
+        public var skippedOutOfWindow: Int
+        public var edgeCrossed: Bool
+    }
+
+    /// Pure per-chunk core of the walk: maps one chunk's rows through the
+    /// record mapping and the direction-aware window decision. `reverseRows`
+    /// reverses within-chunk iteration (only counted oldest-first plans,
+    /// which are laid out far-end-first); `edgeAscending` selects the edge
+    /// polarity (only blind oldest-first walks end above toMs — everything
+    /// else ends below fromMs). Splitting these two roles was the round-2
+    /// critical fix: one combined flag mis-poled counted newest-first
+    /// backfill windows (0 rows indexed per window).
+    public static func scanChunk(_ rows: [NSAppleEventDescriptor?], window: CrawlWindow,
+                                 reverseRows: Bool, edgeAscending: Bool,
+                                 account: String, mailbox: String, includeContent: Bool,
+                                 edgeTolerance: Int = 2) -> ChunkScan {
+        var scan = ChunkScan(records: [], scanned: 0, skipped: 0, unreadable: 0,
+                             skippedOutOfWindow: 0, edgeCrossed: false)
+        var stale = 0
+        for row in reverseRows ? rows.reversed() : rows {
+            scan.scanned += 1
+            guard let record = MailAE.recordFromRow(row, account: account, mailbox: mailbox,
+                                                    includeContent: includeContent),
+                  let ms = record.start_ms else {
+                scan.skipped += 1
+                scan.unreadable += 1
+                continue
+            }
+            let (decision, newStale) = rowDecision(ms: ms, fromMs: window.fromMs, toMs: window.toMs,
+                                                   edgeAscending: edgeAscending,
+                                                   staleSoFar: stale, tolerance: edgeTolerance)
+            stale = newStale
+            switch decision {
+            case .edge:
+                scan.edgeCrossed = true
+                return scan
+            case .skip:
+                scan.skipped += 1
+                scan.skippedOutOfWindow += 1  // dated, but outside the window — feeds the zero-yield breaker
+                continue
+            case .collect:
+                scan.records.append(record)
+            }
+        }
+        return scan
+    }
+
     /// Halve a blind chunk on an out-of-range failure: the lower half is
     /// retried first, the upper half queued behind it. nil for a width-1
-    /// range (nothing left to halve). Halving a 12-wide chunk yields 6+6,
-    /// then 3+3, 2+1, 1+1 — never a 7-wide (bundle-ambiguous) piece.
+    /// range (nothing left to halve).
+    ///
+    /// The no-7 invariant is PROVEN only for widths ≤ 12 — the production
+    /// widths (chunkSize 12, halving 12→6+6→3+3→2+1→1+1). Wider inputs may
+    /// split into a 7-wide piece, so the caller contract pins width ≤ 12.
     public static func halve(_ range: ClosedRange<Int>) -> (lower: ClosedRange<Int>, upper: ClosedRange<Int>)? {
+        precondition(range.count <= 12, "halve() no-7 invariant is only proven for widths <= 12")
         guard range.count > 1 else { return nil }
         let mid = range.lowerBound + range.count / 2 - 1
         return (range.lowerBound...mid, (mid + 1)...range.upperBound)
@@ -547,31 +613,32 @@ public enum MailCrawler {
         return .transientStrike
     }
 
-    /// Direction-aware window decision for one dated row. Descending walks
-    /// (dates decrease with each step — newest-first mailboxes) end at
-    /// fromMs; ascending walks (oldest-first mailboxes — e.g. the forced
-    /// position-1 blind plan) end at toMs. Pre-window rows in ascending
-    /// walks are ordinary skips — the stale edge must NOT fire on them.
+    /// Direction-aware window decision for one dated row. Walks with the
+    /// ASCENDING edge (blind oldest-first — dates increase with position)
+    /// end ABOVE toMs, and their pre-window rows are ordinary skips (the
+    /// stale edge must not fire on them). All other walks (dates decrease
+    /// with each step — counted newest-first and counted oldest-first plan
+    /// layouts) end BELOW fromMs.
     public enum RowDecision: Equatable {
         case collect
         case skip
         case edge
     }
 
-    public static func rowDecision(ms: Int64, fromMs: Int64, toMs: Int64, descending: Bool,
+    public static func rowDecision(ms: Int64, fromMs: Int64, toMs: Int64, edgeAscending: Bool,
                                    staleSoFar: Int, tolerance: Int = 2) -> (decision: RowDecision, stale: Int) {
-        if descending {
-            if ms < fromMs {
+        if edgeAscending {
+            if ms > toMs {
                 let stale = staleSoFar + 1
                 return (stale > tolerance ? .edge : .skip, stale)
             }
-            return (ms < toMs ? .collect : .skip, staleSoFar)
+            return (ms >= fromMs ? .collect : .skip, staleSoFar)
         }
-        if ms > toMs {
+        if ms < fromMs {
             let stale = staleSoFar + 1
             return (stale > tolerance ? .edge : .skip, stale)
         }
-        return (ms >= fromMs ? .collect : .skip, staleSoFar)
+        return (ms < toMs ? .collect : .skip, staleSoFar)
     }
 
     /// Terminal state-file counters: failed bumps the failure streak
@@ -612,6 +679,7 @@ public enum MailCrawler {
         var indexed = 0
         var skipped = 0
         var unreadable = 0  // rows that produced no usable record (drives the zero-yield breaker)
+        var skippedOutOfWindow = 0  // dated rows outside the window (also feeds the breaker)
         var edgeCrossed = false
         var writeFailed = false
         var orderWasDefaulted = false  // set after the probe; drives the order-undetectable skip
@@ -640,8 +708,12 @@ public enum MailCrawler {
         // hours of failed counting).
         var total: Int? = nil
         var countAttempts = 0
-        var countDiagnostic = "unknown count failure"
         let memoizedBlind = blindMailboxes.contains(blindKey)
+        // a memoized-blind mailbox never attempts a count — the diagnostic
+        // must say so, not claim an unknown count failure
+        var countDiagnostic = memoizedBlind
+            ? "blind — count skipped by memoization"
+            : "unknown count failure"
         if !memoizedBlind {
             while total == nil {
                 if CrawlState.shared.isCancelled { break }
@@ -717,36 +789,24 @@ public enum MailCrawler {
         /// fromMs; ascending walks (oldest-first mailboxes, incl. the
         /// forced position-1 blind plan) end ABOVE toMs — pre-window rows
         /// there are ordinary skips, not an edge.
+        ///
+        /// Process one chunk: pure scan (mapping + direction-aware window
+        /// decision), then fold the results into the walk counters. Returns
+        /// true when the window edge is CONFIRMED: more than 2 out-of-window
+        /// rows (one mis-dated row must not end the whole window walk).
         @discardableResult
-        func process(_ rows: [NSAppleEventDescriptor?], descending: Bool) -> Bool {
-            let edgeTolerance = 2
-            var stale = 0
-            for row in descending ? rows.reversed() : rows {
-                scanned += 1
-                guard let record = MailAE.recordFromRow(row, account: account, mailbox: mailbox,
-                                                        includeContent: includeContent),
-                      let ms = record.start_ms else {
-                    skipped += 1
-                    unreadable += 1
-                    continue
-                }
-                let (decision, newStale) = MailCrawler.rowDecision(ms: ms, fromMs: window.fromMs,
-                                                                   toMs: window.toMs, descending: descending,
-                                                                   staleSoFar: stale, tolerance: edgeTolerance)
-                stale = newStale
-                switch decision {
-                case .edge:
-                    return true
-                case .skip:
-                    skipped += 1
-                    continue
-                case .collect:
-                    if !collect(record) {
-                        writeFailed = true
-                    }
-                }
+        func process(_ rows: [NSAppleEventDescriptor?], reverseRows: Bool, edgeAscending: Bool) -> Bool {
+            let scan = MailCrawler.scanChunk(rows, window: window, reverseRows: reverseRows,
+                                             edgeAscending: edgeAscending, account: account, mailbox: mailbox,
+                                             includeContent: includeContent)
+            scanned += scan.scanned
+            skipped += scan.skipped
+            unreadable += scan.unreadable
+            skippedOutOfWindow += scan.skippedOutOfWindow
+            for record in scan.records where !collect(record) {
+                writeFailed = true
             }
-            return false
+            return scan.edgeCrossed
         }
 
         /// Per-window breaker + order-ambiguity diagnostic. A zero-yield or
@@ -754,7 +814,8 @@ public enum MailCrawler {
         /// mailboxes continue and the job must not loop-respawn against
         /// unparseable data.
         func zeroYieldCheck() -> String? {
-            if let reason = MailCrawler.zeroYieldSkipReason(unreadable: unreadable, indexed: indexed) {
+            if let reason = MailCrawler.zeroYieldSkipReason(unreadable: unreadable, outOfWindow: skippedOutOfWindow,
+                                                            indexed: indexed) {
                 return reason
             }
             if orderWasDefaulted, indexed == 0 {
@@ -838,17 +899,28 @@ public enum MailCrawler {
 
         // Blind walks FORCE the newest-first plan shape (anchored at
         // position 1, ascending): a far-end-anchored plan would fabricate
-        // position `cap` and read out-of-range immediately. The resolved
-        // order only drives the PROCESS direction below. Counted walks keep
-        // the order-shaped plans.
+        // position `cap` and read out-of-range immediately. Counted walks
+        // keep the order-shaped plans.
+        //
+        // The resolved order drives TWO SEPARATE roles — do not merge them:
+        // - reverseRows: reverse within-chunk iteration. Only counted
+        //   oldest-first plans are laid out far-end-first (position-
+        //   descending), so only they reverse. Blind plans are anchored at
+        //   position 1 in BOTH orders and iterate as-is.
+        // - edgeAscending: which window bound ends the walk. Only blind
+        //   oldest-first walks (ascending dates with position) end ABOVE
+        //   toMs; every other walk ends BELOW fromMs. One combined flag
+        //   mis-poled counted newest-first backfill windows (0 rows per
+        //   window — the round-2 critical regression).
         var (walkRanges, _, processProbe) = MailAE.walkPlan(total: blind ? walkLimit : totalValue,
                                                             walkLimit: walkLimit,
                                                             chunkSize: chunkSize,
                                                             newestFirst: blind ? true : newestFirstResolved,
                                                             avoidWidth: 7)
-        let processDescending = blind ? newestFirstResolved : !newestFirstResolved
+        let reverseRows = !blind && !newestFirstResolved
+        let edgeAscending = blind && !newestFirstResolved
         if processProbe {
-            edgeCrossed = process(probe, descending: processDescending)
+            edgeCrossed = process(probe, reverseRows: reverseRows, edgeAscending: edgeAscending)
             if let reason = zeroYieldCheck() { return skip(scanned, indexed, reason) }
             // a SHRUNK blind probe succeeded below the full first chunk:
             // the unread tail would otherwise be skipped — re-queue it
@@ -914,7 +986,7 @@ public enum MailCrawler {
                 // gentle pacing: a pause between chunks keeps Mail's event
                 // queue responsive for the user's interactive Mail use
                 Thread.sleep(forTimeInterval: 1)
-                edgeCrossed = process(rows, descending: processDescending)
+                edgeCrossed = process(rows, reverseRows: reverseRows, edgeAscending: edgeAscending)
                 heartbeat()
                 if let reason = zeroYieldCheck() {
                     // skip this mailbox's window (diagnostic in the state

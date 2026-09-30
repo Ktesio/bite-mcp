@@ -199,25 +199,25 @@ final class MailOSATests: XCTestCase {
 
     func testRowDecisionDescendingEndsAtFromMs() {
         let from: Int64 = 1_000, to: Int64 = 2_000
-        // newest-first walk (dates decrease): in-window collects…
-        XCTAssertEqual(MailCrawler.rowDecision(ms: 1_500, fromMs: from, toMs: to, descending: true, staleSoFar: 0).decision, .collect)
+        // newest-first walk (edge below fromMs): in-window collects…
+        XCTAssertEqual(MailCrawler.rowDecision(ms: 1_500, fromMs: from, toMs: to, edgeAscending: false, staleSoFar: 0).decision, .collect)
         // …newer-than-window skips…
-        XCTAssertEqual(MailCrawler.rowDecision(ms: 2_500, fromMs: from, toMs: to, descending: true, staleSoFar: 0).decision, .skip)
+        XCTAssertEqual(MailCrawler.rowDecision(ms: 2_500, fromMs: from, toMs: to, edgeAscending: false, staleSoFar: 0).decision, .skip)
         // …and crossing below fromMs trips the edge after tolerance
-        XCTAssertEqual(MailCrawler.rowDecision(ms: 500, fromMs: from, toMs: to, descending: true, staleSoFar: 0).decision, .skip)
-        XCTAssertEqual(MailCrawler.rowDecision(ms: 500, fromMs: from, toMs: to, descending: true, staleSoFar: 2).decision, .edge)
+        XCTAssertEqual(MailCrawler.rowDecision(ms: 500, fromMs: from, toMs: to, edgeAscending: false, staleSoFar: 0).decision, .skip)
+        XCTAssertEqual(MailCrawler.rowDecision(ms: 500, fromMs: from, toMs: to, edgeAscending: false, staleSoFar: 2).decision, .edge)
     }
 
     func testRowDecisionAscendingEndsAtToMs() {
         let from: Int64 = 1_000, to: Int64 = 2_000
-        // oldest-first walk (dates increase): pre-window rows are ordinary
+        // oldest-first walk (edge above toMs): pre-window rows are ordinary
         // SKIPS — the stale edge must NOT fire on them…
-        XCTAssertEqual(MailCrawler.rowDecision(ms: 500, fromMs: from, toMs: to, descending: false, staleSoFar: 0).decision, .skip)
-        XCTAssertEqual(MailCrawler.rowDecision(ms: 500, fromMs: from, toMs: to, descending: false, staleSoFar: 5).decision, .skip)
+        XCTAssertEqual(MailCrawler.rowDecision(ms: 500, fromMs: from, toMs: to, edgeAscending: true, staleSoFar: 0).decision, .skip)
+        XCTAssertEqual(MailCrawler.rowDecision(ms: 500, fromMs: from, toMs: to, edgeAscending: true, staleSoFar: 5).decision, .skip)
         // …in-window collects, and crossing ABOVE toMs trips the edge
-        XCTAssertEqual(MailCrawler.rowDecision(ms: 1_500, fromMs: from, toMs: to, descending: false, staleSoFar: 0).decision, .collect)
-        XCTAssertEqual(MailCrawler.rowDecision(ms: 2_500, fromMs: from, toMs: to, descending: false, staleSoFar: 0).decision, .skip)
-        XCTAssertEqual(MailCrawler.rowDecision(ms: 2_500, fromMs: from, toMs: to, descending: false, staleSoFar: 2).decision, .edge)
+        XCTAssertEqual(MailCrawler.rowDecision(ms: 1_500, fromMs: from, toMs: to, edgeAscending: true, staleSoFar: 0).decision, .collect)
+        XCTAssertEqual(MailCrawler.rowDecision(ms: 2_500, fromMs: from, toMs: to, edgeAscending: true, staleSoFar: 0).decision, .skip)
+        XCTAssertEqual(MailCrawler.rowDecision(ms: 2_500, fromMs: from, toMs: to, edgeAscending: true, staleSoFar: 2).decision, .edge)
     }
 
     func testBlindPlanCutsFromTheCap() {
@@ -229,6 +229,18 @@ final class MailOSATests: XCTestCase {
         XCTAssertEqual(plan.reduce(0) { $0 + $1.count }, cap)
         XCTAssertEqual(probe, plan[0])  // probe range = first blind chunk
         XCTAssertTrue(processProbeFirst)
+    }
+
+    func testLastErrorNumberRoundtrip() {
+        // plumbing for blind-mode error classification: the number must be
+        // settable/clearable and independent of the message
+        lastErrorNumber = -1719
+        XCTAssertEqual(lastErrorNumber, -1719)
+        lastError = "unrelated"
+        XCTAssertEqual(lastErrorNumber, -1719)
+        lastErrorNumber = nil
+        XCTAssertNil(lastErrorNumber)
+        lastError = nil
     }
 
     // ── terminal counters (failures/skipped persistence) ──
@@ -376,13 +388,115 @@ final class MailOSATests: XCTestCase {
 
     func testZeroYieldSkipReason() {
         // mostly-unreadable rows with nothing indexed → skip diagnostic
-        XCTAssertEqual(MailCrawler.zeroYieldSkipReason(unreadable: 501, indexed: 0),
-                       "skipped: zero yield after 501 unreadable rows")
-        // under threshold → keep walking
-        XCTAssertNil(MailCrawler.zeroYieldSkipReason(unreadable: 500, indexed: 0))
+        XCTAssertEqual(MailCrawler.zeroYieldSkipReason(unreadable: 501, outOfWindow: 0, indexed: 0),
+                       "skipped: zero yield after 501 useless rows")
+        // out-of-window dated skips feed the breaker: 300 unreadable + 250
+        // pre-window rows with nothing indexed is a zero-yield walk too
+        XCTAssertEqual(MailCrawler.zeroYieldSkipReason(unreadable: 300, outOfWindow: 250, indexed: 0),
+                       "skipped: zero yield after 550 useless rows")
+        // under the combined threshold → keep walking
+        XCTAssertNil(MailCrawler.zeroYieldSkipReason(unreadable: 300, outOfWindow: 100, indexed: 0))
         // indexing something → keep walking
-        XCTAssertNil(MailCrawler.zeroYieldSkipReason(unreadable: 900, indexed: 1))
-        XCTAssertNil(MailCrawler.zeroYieldSkipReason(unreadable: 0, indexed: 0))
+        XCTAssertNil(MailCrawler.zeroYieldSkipReason(unreadable: 900, outOfWindow: 0, indexed: 1))
+        XCTAssertNil(MailCrawler.zeroYieldSkipReason(unreadable: 0, outOfWindow: 0, indexed: 0))
+    }
+
+    // ── scanChunk: the four mode × direction combinations (round-2 critical regression) ──
+
+    /// Build a dated row for a synthetic mailbox.
+    private func datedRow(id: Int, daysBeforeNow: Int) -> NSAppleEventDescriptor {
+        let row = NSAppleEventDescriptor.record()
+        row.setDescriptor(NSAppleEventDescriptor(int32: Int32(id)), forKeyword: MailAE.kwMessageID)
+        row.setDescriptor(NSAppleEventDescriptor(date: Date(timeIntervalSince1970: 1_790_000_000 - Double(daysBeforeNow) * 86_400)),
+                          forKeyword: MailAE.kwDateSent)
+        row.setDescriptor(stringDesc("subject \(id)"), forKeyword: MailAE.kwSubject)
+        return row
+    }
+
+    /// 40 dated rows. newest-first: position 1 = now (newest), position 40
+    /// = now-39d. oldest-first: position 1 = now-39d, position 40 = now.
+    private func syntheticMailbox(newestFirst: Bool, count: Int = 40) -> [NSAppleEventDescriptor?] {
+        (1...count).map { i in
+            let age = newestFirst ? (i - 1) : (count - i)
+            return datedRow(id: 100 + i, daysBeforeNow: age)
+        }
+    }
+
+    func testScanChunkFourCombinationTable() {
+        // window 1 = last 30 days; backfill = the preceding 30 days (half-
+        // open [from, to)). The 40 rows span now-39d…now with boundary rows
+        // landing exactly on fromMs (included).
+        let now: Double = 1_790_000_000
+        let day: Double = 86_400
+        let w1 = CrawlWindow(fromMs: Int64((now - 30 * day) * 1000), toMs: Int64(now * 1000))
+        let w2 = CrawlWindow(fromMs: Int64((now - 60 * day) * 1000), toMs: Int64((now - 30 * day) * 1000))
+
+        // counted newest-first: rows as-is (dates fall), below-fromMs edge.
+        // W1: ages 1-30 in window, age 0 == toMs skips, ages 31-33 trip the
+        // edge (the round-2 regression collected 0 here — the wrong polarity
+        // tripped on ages 0-2, which are ABOVE toMs).
+        // W2 (backfill): ages 0-29 are newer than toMs → skipped (no false
+        // edge — that was the regression); age 30 sits exactly ON toMs →
+        // excluded (half-open window); ages 31-39 are the slice → 9.
+        let expected: [(mode: String, order: String, window: String, collected: Int, scanned: Int, edge: Bool, outOfWindow: Int)] = [
+            ("counted", "NF", "W1", 30, 34, true, 3),
+            ("counted", "NF", "W2", 9, 40, false, 31),
+            ("counted", "OF", "W1", 30, 34, true, 3),
+            ("counted", "OF", "W2", 9, 40, false, 31),
+            ("blind", "NF", "W1", 30, 34, true, 3),
+            ("blind", "NF", "W2", 9, 40, false, 31),
+            ("blind", "OF", "W1", 31, 40, false, 9),
+            ("blind", "OF", "W2", 10, 13, true, 2),
+        ]
+        for (mode, order, windowName, wantCollected, wantScanned, wantEdge, wantOOW) in expected {
+            let blind = mode == "blind"
+            let newestFirst = order == "NF"
+            let reverseRows = !blind && !newestFirst
+            let edgeAscending = blind && !newestFirst
+            let window = windowName == "W1" ? w1 : w2
+            let scan = MailCrawler.scanChunk(syntheticMailbox(newestFirst: newestFirst), window: window,
+                                             reverseRows: reverseRows, edgeAscending: edgeAscending,
+                                             account: "a", mailbox: "m", includeContent: false)
+            XCTAssertEqual(scan.records.count, wantCollected,
+                           "\(mode)/\(order)/\(windowName): collected")
+            XCTAssertEqual(scan.scanned, wantScanned, "\(mode)/\(order)/\(windowName): scanned")
+            XCTAssertEqual(scan.edgeCrossed, wantEdge, "\(mode)/\(order)/\(windowName): edge")
+            XCTAssertEqual(scan.skippedOutOfWindow, wantOOW, "\(mode)/\(order)/\(windowName): out-of-window skips")
+        }
+    }
+
+    func testScanChunkUnreadableRowsFeedBreaker() {
+        // DESCENDING walk: pre-window rows trip the edge after tolerance —
+        // they still feed skippedOutOfWindow on the way (2 stale skips here).
+        let now: Double = 1_790_000_000
+        let w = CrawlWindow(fromMs: Int64((now - 30 * 86_400) * 1000), toMs: Int64(now * 1000))
+        var rows: [NSAppleEventDescriptor?] = []
+        rows.append(nil)  // unreadable
+        rows.append(NSAppleEventDescriptor.list())  // record-less → unreadable
+        for i in 0..<40 {
+            rows.append(datedRow(id: 200 + i, daysBeforeNow: 100 + i))  // all pre-window
+        }
+        let scan = MailCrawler.scanChunk(rows, window: w, reverseRows: false, edgeAscending: false,
+                                         account: "a", mailbox: "m", includeContent: false)
+        XCTAssertEqual(scan.records.count, 0)       // all pre-window → nothing indexed
+        XCTAssertEqual(scan.unreadable, 2)
+        XCTAssertEqual(scan.skippedOutOfWindow, 2)  // ages 100,101 before the edge
+        XCTAssertEqual(scan.scanned, 5)             // 2 unreadable + 3 pre-window
+        XCTAssertTrue(scan.edgeCrossed)
+
+        // ASCENDING walk (the no-tripwire case — e.g. a blind-memoized old
+        // mailbox): every pre-window row is a plain skip, ALL of them feed
+        // the breaker counter, and the breaker then fires on the totals.
+        let asc = MailCrawler.scanChunk(rows, window: w, reverseRows: false, edgeAscending: true,
+                                        account: "a", mailbox: "m", includeContent: false)
+        XCTAssertEqual(asc.records.count, 0)
+        XCTAssertEqual(asc.unreadable, 2)
+        XCTAssertEqual(asc.skippedOutOfWindow, 40)
+        XCTAssertFalse(asc.edgeCrossed)
+        XCTAssertNotNil(MailCrawler.zeroYieldSkipReason(unreadable: asc.unreadable,
+                                                        outOfWindow: asc.skippedOutOfWindow,
+                                                        indexed: asc.records.count,
+                                                        threshold: 40))
     }
 
     // ── walk order detection ──

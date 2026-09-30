@@ -514,6 +514,7 @@ public enum MailAE {
     public static func healthy(timeoutSeconds: Int32 = 15) -> Bool {
         guard mailRunning() else {
             lastError = "Mail is not running"
+            lastErrorNumber = nil
             return false
         }
         return run("""
@@ -532,7 +533,7 @@ public enum MailAE {
     }
 
     public static func countAccounts(timeoutSeconds: Int32 = 60) -> Int? {
-        guard mailRunning() else { lastError = "Mail is not running"; return nil }
+        guard mailRunning() else { lastError = "Mail is not running"; lastErrorNumber = nil; return nil }
         guard let reply = run("""
         \(tellPrefix(45))
         count accounts
@@ -543,7 +544,7 @@ public enum MailAE {
 
     /// Account names in Mail's own order (index = 1-based position).
     public static func accountList(timeoutSeconds: Int32 = 60) -> [String]? {
-        guard mailRunning() else { lastError = "Mail is not running"; return nil }
+        guard mailRunning() else { lastError = "Mail is not running"; lastErrorNumber = nil; return nil }
         guard let reply = run("""
         \(tellPrefix(45))
         get name of every account
@@ -558,7 +559,7 @@ public enum MailAE {
 
     /// Mailbox names of one account, in Mail's own order.
     public static func mailboxList(account: String, timeoutSeconds: Int32 = 60) -> [String]? {
-        guard mailRunning() else { lastError = "Mail is not running"; return nil }
+        guard mailRunning() else { lastError = "Mail is not running"; lastErrorNumber = nil; return nil }
         let src = """
         \(tellPrefix(45))
         get name of every mailbox of account \(quotedAppleString(account))
@@ -573,7 +574,7 @@ public enum MailAE {
     }
 
     public static func countMessages(mailboxAt: Int, account: String, timeoutSeconds: Int32 = 360) -> Int? {
-        guard mailRunning() else { lastError = "Mail is not running"; return nil }
+        guard mailRunning() else { lastError = "Mail is not running"; lastErrorNumber = nil; return nil }
         let src = """
         \(tellPrefix(240))
         count messages of \(mailboxRef(mailboxAt, account))
@@ -592,7 +593,7 @@ public enum MailAE {
     /// (see `lastError`).
     public static func readProperties(mailboxAt: Int, account: String, start: Int, end: Int,
                                       includeContent: Bool, timeoutSeconds: Int32 = 400) -> [NSAppleEventDescriptor?]? {
-        guard mailRunning() else { lastError = "Mail is not running"; return nil }
+        guard mailRunning() else { lastError = "Mail is not running"; lastErrorNumber = nil; return nil }
         let fetch: String
         if includeContent {
             fetch = "get properties of messages \(start) thru \(end) of mb"
@@ -610,8 +611,11 @@ public enum MailAE {
         // record-list shape ignores it); 7 = no-body bundle
         let rows = rowsFromReply(reply, expectedProps: includeContent ? 8 : 7)
         if rows.isEmpty {
-            // never fail silently: an unusable reply must carry diagnostics
+            // never fail silently: an unusable reply must carry diagnostics (and
+            // must NOT inherit a stale error number — it would misclassify the
+            // failure in blind-mode decisions)
             lastError = "unusable reply (type \(reply.descriptorType), items \(reply.numberOfItems), first item \(reply.atIndex(1)?.descriptorType ?? 0))"
+            lastErrorNumber = nil
             return nil
         }
         return rows
@@ -622,7 +626,7 @@ public enum MailAE {
     /// can shift between listing and use, and stale indices would silently
     /// mislabel records.
     public static func mailboxName(at index: Int, account: String, timeoutSeconds: Int32 = 60) -> String? {
-        guard mailRunning() else { lastError = "Mail is not running"; return nil }
+        guard mailRunning() else { lastError = "Mail is not running"; lastErrorNumber = nil; return nil }
         let src = """
         \(tellPrefix(45))
         get name of mailbox \(index) of account \(quotedAppleString(account))
@@ -637,7 +641,7 @@ public enum MailAE {
     /// timeoutSeconds; bulk counts on the big INBOX may run minutes.
     public static func countWhose(mailboxAt: Int, account: String, selection: BulkSelection,
                                   timeoutSeconds: Int32 = 900) -> Int? {
-        guard mailRunning() else { lastError = "Mail is not running"; return nil }
+        guard mailRunning() else { lastError = "Mail is not running"; lastErrorNumber = nil; return nil }
         let src = """
         \(tellPrefix(600))
         count (every message of \(mailboxRef(mailboxAt, account))\(whoseClause(selection)))
@@ -650,7 +654,7 @@ public enum MailAE {
     /// `set <property> of (every message … whose …) to value` — one script.
     public static func setWhose(mailboxAt: Int, account: String, selection: BulkSelection,
                                 property: String, value: Bool, timeoutSeconds: Int32 = 900) -> (ok: Bool, error: String?) {
-        guard mailRunning() else { return (false, "Mail is not running") }
+        guard mailRunning() else { lastError = "Mail is not running"; lastErrorNumber = nil; return (false, "Mail is not running") }
         let src = """
         \(tellPrefix(600))
         set \(property) of (every message of \(mailboxRef(mailboxAt, account))\(whoseClause(selection))) to \(value)
@@ -662,7 +666,7 @@ public enum MailAE {
     /// `move (every message … whose …) to mailbox …` — one script.
     public static func moveWhose(mailboxAt: Int, account: String, selection: BulkSelection,
                                  toMailboxAt: Int, toAccount: String, timeoutSeconds: Int32 = 900) -> (ok: Bool, error: String?) {
-        guard mailRunning() else { return (false, "Mail is not running") }
+        guard mailRunning() else { lastError = "Mail is not running"; lastErrorNumber = nil; return (false, "Mail is not running") }
         let src = """
         \(tellPrefix(600))
         move (every message of \(mailboxRef(mailboxAt, account))\(whoseClause(selection))) to \(mailboxRef(toMailboxAt, toAccount))
@@ -674,7 +678,7 @@ public enum MailAE {
     /// `delete (every message … whose …)` — one script.
     public static func deleteWhose(mailboxAt: Int, account: String, selection: BulkSelection,
                                    timeoutSeconds: Int32 = 900) -> (ok: Bool, error: String?) {
-        guard mailRunning() else { return (false, "Mail is not running") }
+        guard mailRunning() else { lastError = "Mail is not running"; lastErrorNumber = nil; return (false, "Mail is not running") }
         let src = """
         \(tellPrefix(600))
         delete (every message of \(mailboxRef(mailboxAt, account))\(whoseClause(selection)))
