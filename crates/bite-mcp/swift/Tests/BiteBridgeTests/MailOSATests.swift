@@ -137,6 +137,37 @@ final class MailOSATests: XCTestCase {
         XCTAssertFalse(ascending.defaulted)
     }
 
+    // ── blind pagination (count-timeout fallback) ──
+
+    func testCountAttemptDecisionBranches() {
+        // success → counted
+        XCTAssertEqual(MailCrawler.countAttemptDecision(tryNumber: 1, total: 124_284), .counted(total: 124_284))
+        XCTAssertEqual(MailCrawler.countAttemptDecision(tryNumber: 2, total: 0), .counted(total: 0))
+        // first failure → one bounded retry
+        XCTAssertEqual(MailCrawler.countAttemptDecision(tryNumber: 1, total: nil), .retryAfterBackoff)
+        // second failure → blind walk, NOT a job failure
+        XCTAssertEqual(MailCrawler.countAttemptDecision(tryNumber: 2, total: nil), .enterBlindWalk)
+        XCTAssertEqual(MailCrawler.countAttemptDecision(tryNumber: 3, total: nil), .enterBlindWalk)
+    }
+
+    func testIsShortReadOnlyAppliesInBlindMode() {
+        XCTAssertTrue(MailCrawler.isShortRead(rows: 5, requested: 12, blind: true))
+        XCTAssertFalse(MailCrawler.isShortRead(rows: 12, requested: 12, blind: true))
+        // counted mode: a short read is just data, never an end marker
+        XCTAssertFalse(MailCrawler.isShortRead(rows: 5, requested: 12, blind: false))
+    }
+
+    func testBlindPlanCutsFromTheCap() {
+        // blind walks plan from the walk cap alone (no total): the plan must
+        // cover 1…cap in chunkSize pieces, still avoiding the 7-wide ambiguity
+        let cap = 30
+        let (plan, probe, processProbeFirst) = MailAE.walkPlan(total: cap, walkLimit: cap, chunkSize: 12, newestFirst: true, avoidWidth: 7)
+        XCTAssertEqual(plan.map { "\($0.lowerBound)-\($0.upperBound)" }, ["1-12", "13-24", "25-30"])
+        XCTAssertEqual(plan.reduce(0) { $0 + $1.count }, cap)
+        XCTAssertEqual(probe, plan[0])  // probe range = first blind chunk
+        XCTAssertTrue(processProbeFirst)
+    }
+
     // ── terminal counters (failures/skipped persistence) ──
 
     func testTerminalCounters() {
@@ -317,10 +348,46 @@ final class MailOSATests: XCTestCase {
 
     func testRowsFromReplyListOfRecords() {
         let list = NSAppleEventDescriptor.list()
-        list.insert(NSAppleEventDescriptor.record(), at: 1)
-        list.insert(NSAppleEventDescriptor.record(), at: 2)
+        for i in 1...2 {
+            let rec = NSAppleEventDescriptor.record()
+            rec.setDescriptor(NSAppleEventDescriptor(int32: Int32(i)), forKeyword: MailAE.kwMessageID)
+            list.insert(rec, at: Int(list.numberOfItems) + 1)
+        }
         let rows = MailAE.rowsFromReply(list, expectedProps: 0)
         XCTAssertEqual(rows.count, 2)
+    }
+
+    func testRowsFromReplyMapsMssgTypedRows() {
+        // LIVE REGRESSION: Mail types `get properties` rows 'mssg' (the
+        // message class code), not 'reco' — a type-code gate returned no
+        // rows for every with-body read ("probe read failed … unknown
+        // error"). Rows must be classified and carried through.
+        let mssgType = DescType(0x6d737367)  // 'mssg' — observed live
+        let list = NSAppleEventDescriptor.list()
+        for i in 1...3 {
+            let rec = NSAppleEventDescriptor(descriptorType: mssgType, data: nil)!
+            rec.setDescriptor(NSAppleEventDescriptor(int32: 542_000 + Int32(i)), forKeyword: MailAE.kwMessageID)
+            rec.setDescriptor(stringDesc("subject \(i)"), forKeyword: MailAE.kwSubject)
+            rec.setDescriptor(NSAppleEventDescriptor(date: Date(timeIntervalSince1970: 1_790_000_000)), forKeyword: MailAE.kwDateSent)
+            list.insert(rec, at: Int(list.numberOfItems) + 1)
+        }
+        let rows = MailAE.rowsFromReply(list, expectedProps: 8)
+        XCTAssertEqual(rows.count, 3, "mssg-typed rows must survive reply mapping")
+        XCTAssertNotNil(rows[0])
+    }
+
+    func testIsRecordRowDetectsMailRowTypes() {
+        // Mail's row type 'mssg' and the generic 'reco' are both records
+        XCTAssertTrue(isRecordRow(NSAppleEventDescriptor(descriptorType: DescType(0x6d737367), data: nil)))
+        XCTAssertTrue(isRecordRow(NSAppleEventDescriptor(descriptorType: DescType(0x7265636f), data: nil)))
+        // a record carrying the id keyword is detected functionally too
+        let keyed = NSAppleEventDescriptor.record()
+        keyed.setDescriptor(NSAppleEventDescriptor(int32: 1), forKeyword: MailAE.kwMessageID)
+        XCTAssertTrue(isRecordRow(keyed))
+        // lists and scalars are not record rows
+        XCTAssertFalse(isRecordRow(NSAppleEventDescriptor.list()))
+        XCTAssertFalse(isRecordRow(NSAppleEventDescriptor(int32: 5)))
+        XCTAssertFalse(isRecordRow(nil))
     }
 
     func testRowsFromReplyRowMajorLists() {
@@ -508,8 +575,7 @@ final class MailOSATests: XCTestCase {
         let zero = NSAppleEventDescriptor.record()
         zero.setDescriptor(NSAppleEventDescriptor(int32: 0), forKeyword: MailAE.kwMessageID)
         XCTAssertNil(MailAE.recordFromRow(zero, account: "a", mailbox: "m", includeContent: true))
-        let emptyList = NSAppleEventDescriptor.list()
-        XCTAssertNil(MailAE.recordFromRow(emptyList, account: "a", mailbox: "m", includeContent: true))
+        XCTAssertNil(MailAE.recordFromRow(NSAppleEventDescriptor.list(), account: "a", mailbox: "m", includeContent: true))
     }
 
     func testRecordJSONLFieldNamesMatchContract() throws {

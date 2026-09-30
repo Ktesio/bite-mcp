@@ -53,9 +53,21 @@ let kwContentD = AEKeyword(0x63746e74)        // 'ctnt'  — content
 
 // Descriptor types we must tell apart when mapping replies.
 let typeListD = DescType(0x6c697374)          // 'list'
-let typeRecordD = DescType(0x7265636f)        // 'reco'
 let typeDoubleD = DescType(0x646f7562)        // 'doub'
 let typeCompD = DescType(0x636f6d70)          // 'comp' — 64-bit integer
+
+/// Mail types `get properties` rows 'mssg' (the message CLASS code), not
+/// generic 'reco' — a 'reco'-style type-code gate missed every with-body
+/// read. Detect record rows by their known type codes OR functionally by
+/// the id keyword (bundle/property-column lists carry no keywords).
+public func isRecordRow(_ d: NSAppleEventDescriptor?) -> Bool {
+    guard let d else { return false }
+    if d.descriptorType == 0x6d737367  // 'mssg' — Mail's row type (observed live)
+        || d.descriptorType == 0x7265636f {  // 'reco' — generic AE record
+        return true
+    }
+    return d.forKeyword(kwMessageIDD) != nil
+}
 
 /// Serialized NSAppleScript executor. All OSA work funnels through the one
 /// dedicated queue; `run` blocks the caller up to `timeoutSeconds` and
@@ -299,7 +311,7 @@ public enum MailAE {
         }
         let n = Int(reply.numberOfItems)
         guard n > 0, let first = reply.atIndex(1) else { return [] }
-        if first.descriptorType == typeRecordD {
+        if isRecordRow(first) {
             return (1...n).map { reply.atIndex($0) }  // one record per message
         }
         if first.descriptorType == typeListD {
@@ -359,7 +371,7 @@ public enum MailAE {
     /// shapes must be handled here.
     public static func dateFromRow(_ row: NSAppleEventDescriptor?) -> Date? {
         guard let row else { return nil }
-        if row.descriptorType == typeRecordD {
+        if isRecordRow(row) {
             return row.forKeyword(kwDateSentD)?.dateValue
         }
         return row.atIndex(4)?.dateValue
@@ -436,7 +448,7 @@ public enum MailAE {
     public static func recordFromRow(_ row: NSAppleEventDescriptor?, account: String, mailbox: String,
                                      includeContent: Bool) -> CrawlRecord? {
         guard let row else { return nil }
-        if row.descriptorType == typeRecordD {
+        if isRecordRow(row) {
             return recordFromProperties(row, account: account, mailbox: mailbox, includeContent: includeContent)
         }
         func at(_ i: Int) -> NSAppleEventDescriptor? { row.atIndex(i) }
@@ -582,7 +594,12 @@ public enum MailAE {
         // 8 = full record's property count for the flat-repack fallback (the
         // record-list shape ignores it); 7 = no-body bundle
         let rows = rowsFromReply(reply, expectedProps: includeContent ? 8 : 7)
-        return rows.isEmpty ? nil : rows
+        if rows.isEmpty {
+            // never fail silently: an unusable reply must carry diagnostics
+            lastError = "unusable reply (type \(reply.descriptorType), items \(reply.numberOfItems), first item \(reply.atIndex(1)?.descriptorType ?? 0))"
+            return nil
+        }
+        return rows
     }
 
     /// `name of mailbox «i» of account «A»` — used to re-validate

@@ -491,6 +491,27 @@ public enum MailCrawler {
         return (order ?? true, order == nil)
     }
 
+    /// Count failures: retry once with backoff, then fall back to blind
+    /// pagination for that mailbox-window — AE counts on large mailboxes
+    /// are O(n) and can exceed any timeout, while range reads on the same
+    /// mailbox work. A slow count must never fail the job.
+    public enum CountAttemptDecision: Equatable {
+        case counted(total: Int)
+        case retryAfterBackoff
+        case enterBlindWalk
+    }
+
+    public static func countAttemptDecision(tryNumber: Int, maxAttempts: Int = 2, total: Int?) -> CountAttemptDecision {
+        if let t = total { return .counted(total: t) }
+        return tryNumber >= maxAttempts ? .enterBlindWalk : .retryAfterBackoff
+    }
+
+    /// Blind pagination: a chunk returning fewer rows than requested means
+    /// the mailbox is exhausted — process what came back and stop cleanly.
+    public static func isShortRead(rows: Int, requested: Int, blind: Bool) -> Bool {
+        blind && rows < requested
+    }
+
     /// Terminal state-file counters: failed bumps the failure streak
     /// (drives the Rust respawn backoff), done zeroes it, cancelled
     /// preserves it; skipped-mailbox counts accumulate for operators.
@@ -517,17 +538,47 @@ public enum MailCrawler {
             CrawlState.shared.setFlushPending(nil)
             return WalkOutcome(scanned: scanned, indexed: indexed, transportError: nil, skipReason: reason)
         }
-        guard let initialTotal = MailAE.countMessages(mailboxAt: mailboxAt, account: account) else {
-            return abort(0, 0, "count failed for \(mailbox) — \(lastError ?? "unknown error")")
+
+        // ── count: up to 2 attempts, then BLIND WALK ──
+        // AE counts on large mailboxes are O(n) and can exceed any timeout,
+        // while range reads on the same mailbox work — a failed count enters
+        // blind pagination instead of failing the job.
+        var total: Int? = nil
+        var countAttempts = 0
+        var countDiagnostic = "unknown count failure"
+        while total == nil, countAttempts < 2 {
+            countAttempts += 1
+            if let t = MailAE.countMessages(mailboxAt: mailboxAt, account: account) {
+                total = t
+                break
+            }
+            countDiagnostic = lastError ?? countDiagnostic
+            switch MailCrawler.countAttemptDecision(tryNumber: countAttempts, total: total) {
+            case .counted, .enterBlindWalk:
+                break
+            case .retryAfterBackoff:
+                Thread.sleep(forTimeInterval: 5)  // bounded backoff between attempts
+            }
         }
-        guard initialTotal > 0 else { return WalkOutcome(scanned: 0, indexed: 0, transportError: nil, skipReason: nil) }
-        var total = initialTotal
+        let blind = (total == nil)
+
+        guard !blind || MailAE.mailRunning() else {
+            return abort(0, 0, "Mail stopped before the blind walk of \(mailbox)")
+        }
+        if let t = total {
+            guard t > 0 else { return WalkOutcome(scanned: 0, indexed: 0, transportError: nil, skipReason: nil) }
+        }
+        var totalValue = total ?? 0
 
         // 12 records per script keeps each execution (~3-5 s/message on the
         // big INBOX) well inside the script's own 240 s event timeout.
         let chunkSize = 12
-        let walkLimit = min(total, 20_000)
-        let baseLabel = "\(window.fromMs)-\(window.toMs)"
+        // Blind walks have no count: the cap alone bounds the plan, and the
+        // walk discovers the mailbox end via short/failed reads.
+        let walkLimit = blind ? 20_000 : min(totalValue, 20_000)
+        let baseLabel = blind
+            ? "blind walk (count failed) \(window.fromMs)-\(window.toMs)"
+            : "\(window.fromMs)-\(window.toMs)"
 
         let pending = PendingBatch()
         let flushLock = NSLock()
@@ -628,22 +679,43 @@ public enum MailCrawler {
         // arrives, but ids dedupe at ingest, so overlap is harmless).
         // walkPlan guarantees no chunk is exactly 7 wide (bundle property
         // count) — such replies are structurally ambiguous.
-        let (_, probeRange, _) = MailAE.walkPlan(total: total, walkLimit: walkLimit,
+        let (_, probeRange, _) = MailAE.walkPlan(total: blind ? walkLimit : totalValue,
+                                                 walkLimit: walkLimit,
                                                  chunkSize: chunkSize, newestFirst: true,
                                                  avoidWidth: 7)
-        guard let probe = MailAE.readProperties(mailboxAt: mailboxAt, account: account,
-                                                start: probeRange.lowerBound, end: probeRange.upperBound,
-                                                includeContent: includeContent), !probe.isEmpty else {
-            return abort(0, 0, "probe read failed for \(mailbox) — \(lastError ?? "unknown error")")
+        let probe: [NSAppleEventDescriptor?]?
+        if blind {
+            // no total: an out-of-range read ERRORS (-1719 Invalid index),
+            // so shrink the probe window until Mail answers
+            var rows: [NSAppleEventDescriptor?]? = nil
+            var end = probeRange.upperBound
+            while end >= 1, rows == nil {
+                rows = MailAE.readProperties(mailboxAt: mailboxAt, account: account, start: 1, end: end,
+                                             includeContent: includeContent)
+                if rows == nil { end = end / 2 }
+            }
+            probe = rows
+        } else {
+            probe = MailAE.readProperties(mailboxAt: mailboxAt, account: account,
+                                          start: probeRange.lowerBound, end: probeRange.upperBound,
+                                          includeContent: includeContent)
+        }
+        guard let probe, !probe.isEmpty else {
+            let why = blind
+                ? "count failed (\(countDiagnostic)) and the blind probe read failed for \(mailbox) — \(lastError ?? "unknown error")"
+                : "probe read failed for \(mailbox) — \(lastError ?? "unknown error")"
+            return abort(0, 0, why)
         }
         var secondSample: Date? = nil
         if probe.count >= 2 { secondSample = MailAE.dateFromRow(probe[1]) }
         var farEndSample: Date? = nil
-        // far-end resample only pays a read when the first pair is ambiguous
-        if MailAE.orderFromSamples(MailAE.dateFromRow(probe[0]), secondSample) == nil,
-           total > probeRange.upperBound,
+        // far-end resample only pays a read when the first pair is ambiguous;
+        // it needs a total, so blind mode skips it (resolveOrder tolerates nil)
+        if !blind,
+           MailAE.orderFromSamples(MailAE.dateFromRow(probe[0]), secondSample) == nil,
+           totalValue > probeRange.upperBound,
            let lastRows = MailAE.readProperties(mailboxAt: mailboxAt, account: account,
-                                                start: total, end: total, includeContent: includeContent),
+                                                start: totalValue, end: totalValue, includeContent: includeContent),
            !lastRows.isEmpty {
             farEndSample = MailAE.dateFromRow(lastRows[0])
         }
@@ -657,7 +729,8 @@ public enum MailCrawler {
 
         // re-plan under the resolved order; the probe range only applies to
         // newest-first walks (oldest-first probes are detection-only)
-        let (walkRanges, _, processProbe) = MailAE.walkPlan(total: total, walkLimit: walkLimit,
+        var (walkRanges, _, processProbe) = MailAE.walkPlan(total: blind ? walkLimit : totalValue,
+                                                            walkLimit: walkLimit,
                                                             chunkSize: chunkSize,
                                                             newestFirst: newestFirstResolved,
                                                             avoidWidth: 7)
@@ -676,7 +749,7 @@ public enum MailCrawler {
                 break
             }
             let range = walkRanges[i]
-            if range.lowerBound > total {
+            if !blind, range.lowerBound > totalValue {
                 i += 1
                 continue
             }
@@ -729,11 +802,30 @@ public enum MailCrawler {
                     }
                     return skip(scanned, indexed, reason)
                 }
+                if MailCrawler.isShortRead(rows: rows.count, requested: range.count, blind: blind) {
+                    // blind mode: a chunk returning FEWER rows than asked
+                    // means the mailbox is exhausted — what came back is
+                    // already processed; stop the walk cleanly
+                    break
+                }
+            } else if blind {
+                // Blind pagination with no known total: an out-of-range read
+                // ERRORS (-1719 Invalid index). Halve the failed chunk and
+                // retry the lower half — no strike, shrinking can't produce
+                // a 7-wide (bundle-ambiguous) piece from a 12-wide one. At
+                // width 1 the failure means "past the end": stop cleanly.
+                if range.count > 1 {
+                    let mid = range.lowerBound + range.count / 2 - 1
+                    walkRanges[i] = range.lowerBound...mid
+                    walkRanges.insert((mid + 1)...range.upperBound, at: i + 1)
+                } else {
+                    break  // walked off the end of the mailbox
+                }
             } else {
                 // refresh the count first: ranges beyond a shrunken mailbox
                 // evaporate instead of counting as transport failures
                 let refreshed = MailAE.countMessages(mailboxAt: mailboxAt, account: account)
-                if let nt = refreshed, nt != total { total = nt }
+                if let nt = refreshed, nt != totalValue { totalValue = nt }
                 switch MailAE.failureDecision(range: range, refreshedTotal: refreshed,
                                               consecutiveFailures: consecutiveFailures + 1) {
                 case .advance:
