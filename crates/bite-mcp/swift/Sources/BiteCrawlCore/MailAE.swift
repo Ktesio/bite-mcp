@@ -32,6 +32,7 @@ import AppKit
 
 private let lastErrorLock = NSLock()
 private var _lastError: String?
+private var _lastErrorNumber: Int?
 
 /// Last Mail transport error (script error message or watchdog overrun).
 /// Thread-safe: the SIGTERM handler thread can write it via flush-failure
@@ -39,6 +40,14 @@ private var _lastError: String?
 public var lastError: String? {
     get { lastErrorLock.lock(); defer { lastErrorLock.unlock() }; return _lastError }
     set { lastErrorLock.lock(); defer { lastErrorLock.unlock() }; _lastError = newValue }
+}
+
+/// The script error NUMBER of the last failed execution (e.g. -1719
+/// Invalid index, -1712 AppleEvent timed out) — blind pagination
+/// classifies failures by number. nil after success / non-script failures.
+public var lastErrorNumber: Int? {
+    get { lastErrorLock.lock(); defer { lastErrorLock.unlock() }; return _lastErrorNumber }
+    set { lastErrorLock.lock(); defer { lastErrorLock.unlock() }; _lastErrorNumber = newValue }
 }
 
 // Message record keywords (sdef four-char codes, validated live on macOS 27).
@@ -53,9 +62,21 @@ let kwContentD = AEKeyword(0x63746e74)        // 'ctnt'  — content
 
 // Descriptor types we must tell apart when mapping replies.
 let typeListD = DescType(0x6c697374)          // 'list'
-let typeRecordD = DescType(0x7265636f)        // 'reco'
 let typeDoubleD = DescType(0x646f7562)        // 'doub'
 let typeCompD = DescType(0x636f6d70)          // 'comp' — 64-bit integer
+
+/// Mail types `get properties` rows 'mssg' (the message CLASS code), not
+/// generic 'reco' — a 'reco'-style type-code gate missed every with-body
+/// read. Detect record rows by their known type codes OR functionally by
+/// the id keyword (bundle/property-column lists carry no keywords).
+public func isRecordRow(_ d: NSAppleEventDescriptor?) -> Bool {
+    guard let d else { return false }
+    if d.descriptorType == 0x6d737367  // 'mssg' — Mail's row type (observed live)
+        || d.descriptorType == 0x7265636f {  // 'reco' — generic AE record
+        return true
+    }
+    return d.forKeyword(kwMessageIDD) != nil
+}
 
 /// Serialized NSAppleScript executor. All OSA work funnels through the one
 /// dedicated queue; `run` blocks the caller up to `timeoutSeconds` and
@@ -69,20 +90,21 @@ final class OSAExecutor {
     private final class ResultBox {
         var reply: NSAppleEventDescriptor?
         var failure: String?
+        var number: Int?
     }
 
     /// Compile + execute one script. Runs on the executor queue only.
-    private func executeScript(_ source: String) -> (NSAppleEventDescriptor?, String?) {
+    private func executeScript(_ source: String) -> (NSAppleEventDescriptor?, String?, Int?) {
         let script = NSAppleScript(source: source)
         var err: NSDictionary?
         if let desc = script?.executeAndReturnError(&err) {
-            return (desc, nil)
+            return (desc, nil, nil)
         }
         // Documented NSAppleScriptErrorDictionary keys (the SDK's constant
         // declarations don't play well with dictionary subscripts here)
-        let num = (err?["NSAppleScriptErrorNumber"] as? Int).map(String.init) ?? "?"
+        let num = err?["NSAppleScriptErrorNumber"] as? Int
         let msg = (err?["NSAppleScriptErrorMessage"] as? String) ?? "unknown OSA failure"
-        return (nil, "AppleScript error \(num): \(msg)")
+        return (nil, "AppleScript error \(num.map(String.init) ?? "?"): \(msg)", num)
     }
 
     func run(_ source: String, timeoutSeconds: TimeInterval) -> NSAppleEventDescriptor? {
@@ -93,6 +115,7 @@ final class OSAExecutor {
             // would keep hammering Mail after the wedge clears.
             lock.unlock()
             lastError = "osa executor busy — previous script still in flight"
+            lastErrorNumber = nil
             return nil
         }
         inFlight = true
@@ -101,9 +124,10 @@ final class OSAExecutor {
         let sem = DispatchSemaphore(value: 0)
         let box = ResultBox()
         let work = DispatchWorkItem {
-            let (reply, failure) = self.executeScript(source)
+            let (reply, failure, number) = self.executeScript(source)
             box.reply = reply
             box.failure = failure
+            box.number = number
             self.lock.lock()
             self.inFlight = false
             self.lock.unlock()
@@ -117,13 +141,16 @@ final class OSAExecutor {
             // instead of a deadlock. The in-script `with timeout` guarantees
             // the blocked event errors out well before the watchdog would.
             lastError = "AppleScript timeout after \(Int(timeoutSeconds))s — Mail unresponsive"
+            lastErrorNumber = nil
             return nil
         }
         if let failure = box.failure {
             lastError = failure
+            lastErrorNumber = box.number
             return nil
         }
         lastError = nil
+        lastErrorNumber = nil
         return box.reply
     }
 }
@@ -299,7 +326,7 @@ public enum MailAE {
         }
         let n = Int(reply.numberOfItems)
         guard n > 0, let first = reply.atIndex(1) else { return [] }
-        if first.descriptorType == typeRecordD {
+        if isRecordRow(first) {
             return (1...n).map { reply.atIndex($0) }  // one record per message
         }
         if first.descriptorType == typeListD {
@@ -359,7 +386,7 @@ public enum MailAE {
     /// shapes must be handled here.
     public static func dateFromRow(_ row: NSAppleEventDescriptor?) -> Date? {
         guard let row else { return nil }
-        if row.descriptorType == typeRecordD {
+        if isRecordRow(row) {
             return row.forKeyword(kwDateSentD)?.dateValue
         }
         return row.atIndex(4)?.dateValue
@@ -436,7 +463,7 @@ public enum MailAE {
     public static func recordFromRow(_ row: NSAppleEventDescriptor?, account: String, mailbox: String,
                                      includeContent: Bool) -> CrawlRecord? {
         guard let row else { return nil }
-        if row.descriptorType == typeRecordD {
+        if isRecordRow(row) {
             return recordFromProperties(row, account: account, mailbox: mailbox, includeContent: includeContent)
         }
         func at(_ i: Int) -> NSAppleEventDescriptor? { row.atIndex(i) }
@@ -487,6 +514,7 @@ public enum MailAE {
     public static func healthy(timeoutSeconds: Int32 = 15) -> Bool {
         guard mailRunning() else {
             lastError = "Mail is not running"
+            lastErrorNumber = nil
             return false
         }
         return run("""
@@ -505,7 +533,7 @@ public enum MailAE {
     }
 
     public static func countAccounts(timeoutSeconds: Int32 = 60) -> Int? {
-        guard mailRunning() else { lastError = "Mail is not running"; return nil }
+        guard mailRunning() else { lastError = "Mail is not running"; lastErrorNumber = nil; return nil }
         guard let reply = run("""
         \(tellPrefix(45))
         count accounts
@@ -516,7 +544,7 @@ public enum MailAE {
 
     /// Account names in Mail's own order (index = 1-based position).
     public static func accountList(timeoutSeconds: Int32 = 60) -> [String]? {
-        guard mailRunning() else { lastError = "Mail is not running"; return nil }
+        guard mailRunning() else { lastError = "Mail is not running"; lastErrorNumber = nil; return nil }
         guard let reply = run("""
         \(tellPrefix(45))
         get name of every account
@@ -531,7 +559,7 @@ public enum MailAE {
 
     /// Mailbox names of one account, in Mail's own order.
     public static func mailboxList(account: String, timeoutSeconds: Int32 = 60) -> [String]? {
-        guard mailRunning() else { lastError = "Mail is not running"; return nil }
+        guard mailRunning() else { lastError = "Mail is not running"; lastErrorNumber = nil; return nil }
         let src = """
         \(tellPrefix(45))
         get name of every mailbox of account \(quotedAppleString(account))
@@ -546,7 +574,7 @@ public enum MailAE {
     }
 
     public static func countMessages(mailboxAt: Int, account: String, timeoutSeconds: Int32 = 360) -> Int? {
-        guard mailRunning() else { lastError = "Mail is not running"; return nil }
+        guard mailRunning() else { lastError = "Mail is not running"; lastErrorNumber = nil; return nil }
         let src = """
         \(tellPrefix(240))
         count messages of \(mailboxRef(mailboxAt, account))
@@ -565,7 +593,7 @@ public enum MailAE {
     /// (see `lastError`).
     public static func readProperties(mailboxAt: Int, account: String, start: Int, end: Int,
                                       includeContent: Bool, timeoutSeconds: Int32 = 400) -> [NSAppleEventDescriptor?]? {
-        guard mailRunning() else { lastError = "Mail is not running"; return nil }
+        guard mailRunning() else { lastError = "Mail is not running"; lastErrorNumber = nil; return nil }
         let fetch: String
         if includeContent {
             fetch = "get properties of messages \(start) thru \(end) of mb"
@@ -582,7 +610,15 @@ public enum MailAE {
         // 8 = full record's property count for the flat-repack fallback (the
         // record-list shape ignores it); 7 = no-body bundle
         let rows = rowsFromReply(reply, expectedProps: includeContent ? 8 : 7)
-        return rows.isEmpty ? nil : rows
+        if rows.isEmpty {
+            // never fail silently: an unusable reply must carry diagnostics (and
+            // must NOT inherit a stale error number — it would misclassify the
+            // failure in blind-mode decisions)
+            lastError = "unusable reply (type \(reply.descriptorType), items \(reply.numberOfItems), first item \(reply.atIndex(1)?.descriptorType ?? 0))"
+            lastErrorNumber = nil
+            return nil
+        }
+        return rows
     }
 
     /// `name of mailbox «i» of account «A»` — used to re-validate
@@ -590,7 +626,7 @@ public enum MailAE {
     /// can shift between listing and use, and stale indices would silently
     /// mislabel records.
     public static func mailboxName(at index: Int, account: String, timeoutSeconds: Int32 = 60) -> String? {
-        guard mailRunning() else { lastError = "Mail is not running"; return nil }
+        guard mailRunning() else { lastError = "Mail is not running"; lastErrorNumber = nil; return nil }
         let src = """
         \(tellPrefix(45))
         get name of mailbox \(index) of account \(quotedAppleString(account))
@@ -605,7 +641,7 @@ public enum MailAE {
     /// timeoutSeconds; bulk counts on the big INBOX may run minutes.
     public static func countWhose(mailboxAt: Int, account: String, selection: BulkSelection,
                                   timeoutSeconds: Int32 = 900) -> Int? {
-        guard mailRunning() else { lastError = "Mail is not running"; return nil }
+        guard mailRunning() else { lastError = "Mail is not running"; lastErrorNumber = nil; return nil }
         let src = """
         \(tellPrefix(600))
         count (every message of \(mailboxRef(mailboxAt, account))\(whoseClause(selection)))
@@ -618,7 +654,7 @@ public enum MailAE {
     /// `set <property> of (every message … whose …) to value` — one script.
     public static func setWhose(mailboxAt: Int, account: String, selection: BulkSelection,
                                 property: String, value: Bool, timeoutSeconds: Int32 = 900) -> (ok: Bool, error: String?) {
-        guard mailRunning() else { return (false, "Mail is not running") }
+        guard mailRunning() else { lastError = "Mail is not running"; lastErrorNumber = nil; return (false, "Mail is not running") }
         let src = """
         \(tellPrefix(600))
         set \(property) of (every message of \(mailboxRef(mailboxAt, account))\(whoseClause(selection))) to \(value)
@@ -630,7 +666,7 @@ public enum MailAE {
     /// `move (every message … whose …) to mailbox …` — one script.
     public static func moveWhose(mailboxAt: Int, account: String, selection: BulkSelection,
                                  toMailboxAt: Int, toAccount: String, timeoutSeconds: Int32 = 900) -> (ok: Bool, error: String?) {
-        guard mailRunning() else { return (false, "Mail is not running") }
+        guard mailRunning() else { lastError = "Mail is not running"; lastErrorNumber = nil; return (false, "Mail is not running") }
         let src = """
         \(tellPrefix(600))
         move (every message of \(mailboxRef(mailboxAt, account))\(whoseClause(selection))) to \(mailboxRef(toMailboxAt, toAccount))
@@ -642,7 +678,7 @@ public enum MailAE {
     /// `delete (every message … whose …)` — one script.
     public static func deleteWhose(mailboxAt: Int, account: String, selection: BulkSelection,
                                    timeoutSeconds: Int32 = 900) -> (ok: Bool, error: String?) {
-        guard mailRunning() else { return (false, "Mail is not running") }
+        guard mailRunning() else { lastError = "Mail is not running"; lastErrorNumber = nil; return (false, "Mail is not running") }
         let src = """
         \(tellPrefix(600))
         delete (every message of \(mailboxRef(mailboxAt, account))\(whoseClause(selection)))
