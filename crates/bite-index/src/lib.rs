@@ -15,9 +15,6 @@ pub fn ingest_staged(
     index: &EntityIndex,
     staging: &Path,
 ) -> Result<(usize, usize, usize), store::IndexError> {
-    let mut batches = 0usize;
-    let mut rows = 0usize;
-    let mut quarantined = 0usize;
     let mut files: Vec<_> = std::fs::read_dir(staging)
         .map(|it| {
             it.filter_map(|e| e.ok())
@@ -30,13 +27,14 @@ pub fn ingest_staged(
     // a single poison batch must not wedge the whole pipeline forever:
     // quarantine unreadable files and keep ingesting the rest
     let quarantine = staging.join("quarantine");
+    let mut staged_files: Vec<std::path::PathBuf> = Vec::new();
+    let mut all_records: Vec<Record> = Vec::new();
+    let mut quarantined = 0usize;
     for file in files {
         match store::parse_jsonl(&file) {
             Ok(records) => {
-                let stats = index.ingest(&records)?;
-                batches += 1;
-                rows += stats.rows;
-                std::fs::remove_file(&file).ok();
+                staged_files.push(file.clone());
+                all_records.extend(records);
             }
             Err(e) => {
                 eprintln!(
@@ -74,5 +72,36 @@ pub fn ingest_staged(
             }
         }
     }
-    Ok((batches, rows, quarantined))
+    // Cross-batch dedup by (app, id), keeping the LAST occurrence: the
+    // crawler legitimately produces duplicate keys across batch files
+    // (overlapping windows, restarts), and merge-insert PROHIBITS two
+    // source rows matching the same target key — without this, one
+    // duplicated message wedges the entire ingest forever. Keeping the
+    // last occurrence is exactly the documented idempotent-reingest
+    // semantics. First-seen order is preserved for determinism.
+    let mut key_index: std::collections::HashMap<(&str, &str), usize> =
+        std::collections::HashMap::new();
+    let mut unique: Vec<Record> = Vec::with_capacity(all_records.len());
+    for r in &all_records {
+        let key = (r.app.as_str(), r.id.as_str());
+        match key_index.get(&key) {
+            Some(&i) => unique[i] = r.clone(),
+            None => {
+                key_index.insert(key, unique.len());
+                unique.push(r.clone());
+            }
+        }
+    }
+    let dedup_dropped = all_records.len() - unique.len();
+    if dedup_dropped > 0 {
+        eprintln!(
+            "bite-index: deduplicated {dedup_dropped} duplicate (app,id) rows across batches"
+        );
+    }
+    let stats = index.ingest(&unique)?;
+    for file in &staged_files {
+        std::fs::remove_file(file).ok();
+    }
+    let batches = staged_files.len();
+    Ok((batches, stats.rows, quarantined))
 }

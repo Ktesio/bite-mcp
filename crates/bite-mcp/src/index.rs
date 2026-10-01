@@ -2,6 +2,7 @@
 //! staged-batch ingester, the local (non-helper) index tools, and the
 //! index-backed fast path for Mail search.
 
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::SystemTime;
 
@@ -15,6 +16,14 @@ use crate::helper::BridgeHandle;
 static INDEX: Mutex<Option<bite_index::EntityIndex>> = Mutex::new(None);
 /// Epoch-ms of the last crawl spawn attempt (auto-refresh or explicit).
 static LAST_SPAWN_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Epoch-ms of the last opportunistic auto-ingest attempt.
+static LAST_AUTO_INGEST_MS: AtomicU64 = AtomicU64::new(0);
+/// Set while `ingest_pending` runs its own (reporting) ingest, so the
+/// opportunistic pass inside `with_index` stands down and lets it report.
+static IN_INGEST_PENDING: AtomicBool = AtomicBool::new(false);
+
+/// Minimum gap between opportunistic auto-ingest attempts per process.
+const AUTO_INGEST_THROTTLE_MS: u64 = 30_000;
 
 fn dir() -> std::path::PathBuf {
     bite_core::config::data_dir().join("index.lance")
@@ -24,7 +33,38 @@ fn staging() -> std::path::PathBuf {
     bite_core::config::data_dir().join("batches")
 }
 
-/// Open (or reuse) the entity index and run `f`.
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Gate for the opportunistic auto-ingest: staged batches exist AND enough
+/// time has passed since this process's last attempt (hot tool loops must
+/// not dir-scan constantly).
+fn auto_ingest_due(last_attempt_ms: u64, now_ms: u64, staged: usize, min_interval_ms: u64) -> bool {
+    staged > 0 && now_ms.saturating_sub(last_attempt_ms) >= min_interval_ms
+}
+
+/// Top-level `*.jsonl` batch FILES in `dir` (quarantine/ is a subdir and
+/// never matches; directories with jsonl-ish names don't count).
+fn staged_batch_count_in(dir: &std::path::Path) -> usize {
+    std::fs::read_dir(dir)
+        .map(|it| {
+            it.filter_map(|e| e.ok())
+                .filter(|e| {
+                    e.file_type().map(|t| t.is_file()).unwrap_or(false)
+                        && e.path().extension().map(|x| x == "jsonl").unwrap_or(false)
+                })
+                .count()
+        })
+        .unwrap_or(0)
+}
+
+/// Open (or reuse) the entity index and run `f`. Opportunistically ingests
+/// staged batches first (throttled + cross-process locked — see
+/// `ingest_pending_if_due`), so queries and status see fresh data.
 pub fn with_index<T>(
     f: impl FnOnce(&bite_index::EntityIndex) -> Result<T, BiteError>,
 ) -> Result<T, BiteError> {
@@ -38,13 +78,58 @@ pub fn with_index<T>(
         })?;
         *guard = Some(index);
     }
-    f(guard.as_ref().unwrap())
+    let index = guard.as_ref().unwrap();
+    // Ordering: ingest BEFORE f, so queries see fresh data. Never fails the
+    // outer call. The detached bite-crawl worker stages batches via atomic
+    // rename, so this snapshot of the staging dir is always well-formed;
+    // batches that appear mid-ingest are picked up on a later call.
+    if !IN_INGEST_PENDING.load(Ordering::SeqCst) {
+        ingest_pending_if_due(index);
+    }
+    f(index)
+}
+
+/// Opportunistic auto-ingest: cheap gate (30 s throttle + staged-batch
+/// scan), then a non-blocking cross-process `.ingest.lock` so concurrent
+/// bite processes don't pile onto ingest_staged together. If anything at
+/// all goes wrong (lock held, Busy writer, ingest error), stand down
+/// silently — the next index touch after the throttle catches up, and
+/// `ingest_pending` (spawn/rebuild) remains the authoritative path.
+fn ingest_pending_if_due(index: &bite_index::EntityIndex) {
+    if IN_INGEST_PENDING.load(Ordering::SeqCst) {
+        return; // spawn/rebuild path is ingesting and wants its own reporting
+    }
+    let now = now_ms();
+    let last = LAST_AUTO_INGEST_MS.load(Ordering::SeqCst);
+    let staged = staged_batch_count_in(&staging());
+    if !auto_ingest_due(last, now, staged, AUTO_INGEST_THROTTLE_MS) {
+        return;
+    }
+    LAST_AUTO_INGEST_MS.store(now, Ordering::SeqCst);
+
+    let lock_path = bite_core::config::data_dir().join(".ingest.lock");
+    let Ok(lock) = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&lock_path)
+    else {
+        return; // cannot even open the lock file — stand down
+    };
+    if fs2::FileExt::try_lock_exclusive(&lock).is_err() {
+        return; // another bite process is mid-ingest — it will catch up
+    }
+    let _ = bite_index::ingest_staged(index, &staging())
+        .map_err(|e| eprintln!("bite auto-ingest error: {e}"));
+    let _ = fs2::FileExt::unlock(&lock);
+    crate::jobs::set_pending_batches(pending_batches());
 }
 
 /// Ingest any staged JSONL batches. Cheap when nothing is pending.
 pub fn ingest_pending() -> Result<Value, BiteError> {
+    IN_INGEST_PENDING.store(true, Ordering::SeqCst);
     let staging = staging();
-    with_index(|index| {
+    let result = with_index(|index| {
         // writer lock is per-ingest: a busy lock just means another bite
         // process is ingesting — skip and let the next poll pick it up
         match index.lock_writer() {
@@ -70,28 +155,34 @@ pub fn ingest_pending() -> Result<Value, BiteError> {
             "rows": rows,
             "quarantined": quarantined,
         }))
-    })
+    });
+    IN_INGEST_PENDING.store(false, Ordering::SeqCst);
+    result
 }
 
 /// Batches waiting for ingest — including quarantined ones, so operators
 /// can see stuck files from index_status instead of discovering them by
 /// rummaging through the data dir.
 fn pending_batches() -> usize {
-    let mut count = std::fs::read_dir(staging())
-        .map(|it| {
-            it.filter_map(|e| e.ok())
-                .filter(|e| e.path().extension().map(|x| x == "jsonl").unwrap_or(false))
-                .count()
-        })
-        .unwrap_or(0);
-    count += std::fs::read_dir(staging().join("quarantine"))
-        .map(|it| {
-            it.filter_map(|e| e.ok())
-                .filter(|e| e.path().extension().map(|x| x == "jsonl").unwrap_or(false))
-                .count()
-        })
-        .unwrap_or(0);
-    count
+    staged_batch_count_in(&staging()) + staged_batch_count_in(&staging().join("quarantine"))
+}
+
+/// Actionable, agent-relayable hint for `index_status`. None when healthy —
+/// don't noise up healthy output. `failures` is the crawl-state failure
+/// streak (reserved for future backoff wording).
+fn status_hint(state: &str, pending: usize, _failures: u64) -> Option<String> {
+    if state == "failed" {
+        Some(
+            "Mail indexing stopped: see crawl.window for the reason — call index_rebuild to resume"
+                .to_string(),
+        )
+    } else if pending > 0 {
+        Some(format!(
+            "{pending} staged batches will be ingested automatically within a minute"
+        ))
+    } else {
+        None
+    }
 }
 
 pub fn status() -> Result<Value, BiteError> {
@@ -99,18 +190,29 @@ pub fn status() -> Result<Value, BiteError> {
         let stats = index
             .stats()
             .map_err(|e| BridgeError::new("index_error", e.to_string()))?;
-        Ok(json!({
+        let pending = pending_batches();
+        let crawl = crawl_state();
+        let state_str = crawl
+            .get("state")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
+        let failures = crawl.get("failures").and_then(|v| v.as_u64()).unwrap_or(0);
+        let mut base = json!({
             "total": stats.total,
             "per_app": stats.per_app.into_iter().map(|(a, n)| json!({"app": a, "rows": n})).collect::<Vec<_>>(),
             "newest_updated_ms": stats.newest_updated_ms,
             "fts_indexed": stats.fts_indexed,
-            "pending_batches": pending_batches(),
+            "pending_batches": pending,
             "crawl": {
-                "state": crawl_state(),
+                "state": crawl,
                 "alive": live_crawler_pid().is_some(),
             },
             "jobs": crate::jobs::snapshot(),
-        }))
+        });
+        if let Some(hint) = status_hint(state_str, pending, failures) {
+            base["hint"] = json!(hint);
+        }
+        Ok(base)
     })
 }
 
@@ -781,5 +883,84 @@ mod tests {
         assert!(!respawn_eligible("done", 5_000, H24, 3));
         assert!(respawn_eligible("done", DAY_MS, H24, 3));
         assert!(!respawn_eligible("running", 0, H24, 0));
+    }
+
+    #[test]
+    fn auto_ingest_due_gate() {
+        const THROTTLE: u64 = 30_000;
+        // nothing staged → never due, however stale the last attempt
+        assert!(!auto_ingest_due(0, u64::MAX, 0, THROTTLE));
+        // staged + first-ever attempt (last = 0) → due immediately
+        assert!(auto_ingest_due(0, 100_000, 3, THROTTLE));
+        // within the throttle window → not due
+        assert!(!auto_ingest_due(
+            100_000,
+            100_000 + THROTTLE - 1,
+            3,
+            THROTTLE
+        ));
+        // exactly at the interval → due
+        assert!(auto_ingest_due(100_000, 100_000 + THROTTLE, 3, THROTTLE));
+        // long overdue → due
+        assert!(auto_ingest_due(
+            100_000,
+            100_000 + 10 * THROTTLE,
+            3,
+            THROTTLE
+        ));
+        // saturating math: a huge last-attempt must not panic/underflow
+        assert!(!auto_ingest_due(u64::MAX, 0, 3, THROTTLE));
+    }
+
+    #[test]
+    fn status_hint_table() {
+        let failed =
+            "Mail indexing stopped: see crawl.window for the reason — call index_rebuild to resume";
+        // failed wins over pending, failures are currently informational only
+        assert_eq!(status_hint("failed", 19, 5).as_deref(), Some(failed));
+        assert_eq!(status_hint("failed", 0, 0).as_deref(), Some(failed));
+        // pending batches: agent-relayable count
+        assert_eq!(
+            status_hint("running", 19, 0).as_deref(),
+            Some("19 staged batches will be ingested automatically within a minute")
+        );
+        assert_eq!(
+            status_hint("done", 1, 0).as_deref(),
+            Some("1 staged batches will be ingested automatically within a minute")
+        );
+        // healthy → no hint at all (don't noise up healthy output)
+        assert_eq!(status_hint("done", 0, 0), None);
+        assert_eq!(status_hint("running", 0, 0), None);
+        assert_eq!(status_hint("cancelled", 0, 0), None);
+        assert_eq!(status_hint("partial", 0, 0), None);
+        assert_eq!(status_hint("waiting_mail", 0, 0), None);
+    }
+
+    #[test]
+    fn staged_batch_count_scans_top_level_only() {
+        let base = std::env::temp_dir().join(format!("bite-test-staging-{}", std::process::id()));
+        let quarantine = base.join("quarantine");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&quarantine).unwrap();
+        // no files yet
+        assert_eq!(staged_batch_count_in(&base), 0);
+        // three top-level batches
+        for name in ["a-0.jsonl", "a-1.jsonl", "b-0.jsonl"] {
+            std::fs::write(base.join(name), b"{}\n").unwrap();
+        }
+        // non-jsonl and tmp files don't count
+        std::fs::write(base.join("a-0.jsonl.tmp"), b"").unwrap();
+        std::fs::write(base.join("notes.txt"), b"").unwrap();
+        // quarantine is a subdir: its jsonl files must NOT count here
+        std::fs::write(quarantine.join("poison.jsonl"), b"garbage").unwrap();
+        assert_eq!(staged_batch_count_in(&base), 3);
+        // empty subdirectories with jsonl-ish names don't fool the scan
+        std::fs::create_dir_all(base.join("weird.jsonl")).unwrap();
+        assert_eq!(
+            staged_batch_count_in(&base),
+            3,
+            "directories must not count"
+        );
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

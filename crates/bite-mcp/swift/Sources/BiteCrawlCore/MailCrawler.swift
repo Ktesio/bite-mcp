@@ -390,7 +390,7 @@ public enum MailCrawler {
             }
         }
         guard anyListSucceeded else {
-            let diag = lastError ?? "unknown error"
+            let diag = transportDiagnostic("unknown error")
             writeState(jobID: jobID, state: "failed", processed: 0, found: 0,
                        window: "cannot list mailboxes — \(diag)", failures: existingFailureCount() + 1)
             progress("failed", 0, 0)
@@ -686,6 +686,16 @@ public enum MailCrawler {
         return (ms < toMs ? .collect : .skip, staleSoFar)
     }
 
+    /// Best-effort transport diagnostic for abort/skip reasons: prefers
+    /// the last MailAE error (message + error number), falls back to
+    /// `fallback` when nothing was recorded. Testable seam for the
+    /// abort-reason formatting.
+    public static func transportDiagnostic(_ fallback: String) -> String {
+        guard let err = lastError, !err.isEmpty else { return fallback }
+        guard let n = lastErrorNumber, !err.contains("\(n)") else { return err }
+        return "\(err) (\(n))"
+    }
+
     /// Terminal state-file counters: failed bumps the failure streak
     /// (drives the Rust respawn backoff), done zeroes it, cancelled
     /// preserves it; skipped-mailbox counts accumulate for operators.
@@ -909,7 +919,7 @@ public enum MailCrawler {
                 } else {
                     probeStrikes += 1
                     if probeStrikes >= 2 {
-                        return abort(0, 0, "blind probe read failed for \(mailbox) — \(lastError ?? "unknown error")")
+                        return abort(0, 0, "blind probe read failed for \(mailbox) — \(transportDiagnostic("unknown error"))")
                     }
                     heartbeat()
                     Thread.sleep(forTimeInterval: min(60, Double(5 * probeStrikes)))
@@ -923,8 +933,8 @@ public enum MailCrawler {
         }
         guard let probe, !probe.isEmpty else {
             let why = blind
-                ? "count failed (\(countDiagnostic)) and the blind probe read failed for \(mailbox) — \(lastError ?? "unknown error")"
-                : "probe read failed for \(mailbox) — \(lastError ?? "unknown error")"
+                ? "count failed (\(countDiagnostic)) and the blind probe read failed for \(mailbox) — \(transportDiagnostic("unknown error"))"
+                : "probe read failed for \(mailbox) — \(transportDiagnostic("unknown error"))"
             return abort(0, 0, why)
         }
         var secondSample: Date? = nil
@@ -976,7 +986,7 @@ public enum MailCrawler {
                 let flushed = flush()
                 CrawlState.shared.setFlushPending(nil)
                 if !flushed {
-                    return abort(scanned, indexed, "batch write failed for \(mailbox) — \(lastError ?? "unknown error")")
+                    return abort(scanned, indexed, "batch write failed for \(mailbox) — \(transportDiagnostic("unknown error"))")
                 }
                 return skip(scanned, indexed, "skipped: order mis-detected mid-walk — the defaulted order ran against the real layout (\(scanned) rows scanned, \(indexed) indexed)")
             }
@@ -1016,7 +1026,7 @@ public enum MailCrawler {
             if !MailAE.healthy() {
                 consecutiveFailures += 1
                 if consecutiveFailures >= 3 {
-                    abortReason = "3 consecutive health-check failures in \(mailbox) — \(lastError ?? "Mail unresponsive")"
+                    abortReason = "3 consecutive health-check failures in \(mailbox) — \(transportDiagnostic("Mail unresponsive"))"
                     break
                 }
                 heartbeat()
@@ -1050,7 +1060,7 @@ public enum MailCrawler {
                     let flushed = flush()
                     CrawlState.shared.setFlushPending(nil)
                     if !flushed {
-                        return abort(scanned, indexed, "batch write failed for \(mailbox) — \(lastError ?? "unknown error")")
+                        return abort(scanned, indexed, "batch write failed for \(mailbox) — \(transportDiagnostic("unknown error"))")
                     }
                     return skip(scanned, indexed, "skipped: order mis-detected mid-walk — the defaulted order ran against the real layout (\(scanned) rows scanned, \(indexed) indexed)")
                 }
@@ -1062,7 +1072,7 @@ public enum MailCrawler {
                     let flushed = flush()
                     CrawlState.shared.setFlushPending(nil)
                     if !flushed {
-                        return abort(scanned, indexed, "batch write failed for \(mailbox) — \(lastError ?? "unknown error")")
+                        return abort(scanned, indexed, "batch write failed for \(mailbox) — \(transportDiagnostic("unknown error"))")
                     }
                     return skip(scanned, indexed, reason)
                 }
@@ -1093,7 +1103,7 @@ public enum MailCrawler {
                 case .transientStrike:
                     consecutiveFailures += 1
                     if consecutiveFailures >= 3 {
-                        abortReason = "3 consecutive blind-read failures in \(mailbox) at \(range.lowerBound)-\(range.upperBound) — \(lastError ?? "unknown error")"
+                        abortReason = "3 consecutive blind-read failures in \(mailbox) at \(range.lowerBound)-\(range.upperBound) — \(transportDiagnostic("unknown error"))"
                     } else {
                         Thread.sleep(forTimeInterval: min(60, Double(5 * consecutiveFailures)))
                     }
@@ -1110,7 +1120,7 @@ public enum MailCrawler {
                     consecutiveFailures = 0  // fresh strike budget for the next range
                 case .abort:
                     consecutiveFailures = 3
-                    abortReason = "3 consecutive chunk-read failures in \(mailbox) at \(range.lowerBound)-\(range.upperBound) — \(lastError ?? "unknown error")"
+                    abortReason = "3 consecutive chunk-read failures in \(mailbox) at \(range.lowerBound)-\(range.upperBound) — \(transportDiagnostic("unknown error"))"
                 case .retrySame:
                     consecutiveFailures += 1
                     heartbeat()
@@ -1124,7 +1134,7 @@ public enum MailCrawler {
         let flushed = flush()
         CrawlState.shared.setFlushPending(nil)
         if writeFailed || !flushed {
-            return abort(scanned, indexed, "batch write failed for \(mailbox) — \(lastError ?? "unknown error")")
+            return abort(scanned, indexed, "batch write failed for \(mailbox) — \(transportDiagnostic("unknown error"))")
         }
         if let abortReason {
             return abort(scanned, indexed, abortReason)

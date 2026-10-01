@@ -160,7 +160,12 @@ when the store-body posture is off / `--no-body`), written 0600 via unique
 tmp + atomic rename. Mail batches hold at most 50 records; the
 Calendar/Reminders/Contacts mirrors stage up to 500. Stale `*.tmp` files are
 swept at job start (10 min age). Ingest deletes batches on success
-(merge-insert makes re-ingest idempotent).
+(merge-insert makes re-ingest idempotent). Staged batches are ingested
+automatically: every index touch (`index_status`, `search`, any index
+tool) opportunistically ingests pending batches first — throttled to once
+per 30 s per process and serialized across processes by an exclusive
+`.ingest.lock` — and spawn/rebuild still ingest immediately; unparseable
+batches quarantine as below either way.
 
 Coverage: the newest 30 days first, then 10-day backfill batches to a
 365-day horizon (~34 windows per job); each mailbox×window walk covers at

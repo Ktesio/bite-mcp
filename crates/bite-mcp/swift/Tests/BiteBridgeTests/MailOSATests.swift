@@ -243,6 +243,33 @@ final class MailOSATests: XCTestCase {
         lastError = nil
     }
 
+    // ── transport diagnostics (abort-reason formatting) ──
+
+    func testTransportDiagnostic() {
+        // message already carries the number → not duplicated
+        lastError = "AppleScript error -1712: Mail got an error: AppleEvent timed out."
+        lastErrorNumber = -1712
+        XCTAssertEqual(
+            MailCrawler.transportDiagnostic("fallback"),
+            "AppleScript error -1712: Mail got an error: AppleEvent timed out."
+        )
+        // message without a number, number set → appended once
+        lastError = "Mail got an error"
+        lastErrorNumber = -1712
+        XCTAssertEqual(MailCrawler.transportDiagnostic("fallback"), "Mail got an error (-1712)")
+        lastError = "Mail got an error"
+        lastErrorNumber = -1719
+        XCTAssertEqual(MailCrawler.transportDiagnostic("fallback"), "Mail got an error (-1719)")
+        // number cleared → message only
+        lastError = "some failure"
+        lastErrorNumber = nil
+        XCTAssertEqual(MailCrawler.transportDiagnostic("fallback"), "some failure")
+        // nothing recorded → the caller's fallback
+        lastError = nil
+        lastErrorNumber = nil
+        XCTAssertEqual(MailCrawler.transportDiagnostic("unknown error"), "unknown error")
+    }
+
     // ── terminal counters (failures/skipped persistence) ──
 
     func testTerminalCounters() {
