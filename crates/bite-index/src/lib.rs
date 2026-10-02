@@ -7,15 +7,30 @@ pub use store::{
     WriteGuard,
 };
 
-/// Numeric trailing seq of a batch filename (`crawl-<job>-<seq>.jsonl` →
-/// seq). Lexicographic filename order LIES once seq >= 10 (`crawl-…-10`
-/// sorts before `crawl-…-9`), so batch order is decided from the number —
-/// keep-last dedup below would otherwise keep the OLDER batch's row.
-/// `None` for files without a `-<int>` suffix.
-fn batch_seq(path: &Path) -> Option<u64> {
-    let stem = path.file_stem()?.to_str()?;
-    let (_, seq) = stem.rsplit_once('-')?;
-    seq.parse::<u64>().ok()
+/// Total-order sort key for batch files: `(job_ts, seq, path)`. Batch names
+/// are `crawl-<job_ts>-<seq>.jsonl`; ordering by the job timestamp FIRST
+/// keeps a dead crashed job's leftovers (`crawl-<T1>-40`) from out-ranking
+/// the live job's batches (`crawl-<T2>-0`) after a rebuild — seq-first
+/// would invert them and keep-last dedup would keep the DEAD job's row for
+/// overlapping keys. Within a job the numeric seq orders correctly
+/// (lexicographic filename order lies once seq >= 10). Names that don't
+/// parse as `<…>-<int>-<int>` sort LAST (u64::MAX sentinels). The key is a
+/// TOTAL order, so `sort_by_key` can never panic on an inconsistent
+/// comparator (Rust >= 1.81 aborts non-total `sort_by`s — a panic here
+/// would poison the caller's INDEX mutex).
+fn batch_order_key(path: &Path) -> (u64, u64, std::path::PathBuf) {
+    const UNPARSED: u64 = u64::MAX;
+    let (job_ts, seq) = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .and_then(|stem| {
+            // last TWO `-<int>` groups of the stem: (timestamp, seq)
+            let (head, seq) = stem.rsplit_once('-')?;
+            let (_, ts) = head.rsplit_once('-')?;
+            Some((ts.parse::<u64>().ok()?, seq.parse::<u64>().ok()?))
+        })
+        .unwrap_or((UNPARSED, UNPARSED));
+    (job_ts, seq, path.to_path_buf())
 }
 
 /// Ingest every un-ingested `*.jsonl` batch in the staging dir (deleting each
@@ -36,12 +51,9 @@ pub fn ingest_staged(
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
-    // Oldest batch first, by NUMERIC trailing seq (see `batch_seq`); files
-    // without a parseable seq fall back to lexicographic order.
-    files.sort_by(|a, b| match (batch_seq(a), batch_seq(b)) {
-        (Some(x), Some(y)) => x.cmp(&y).then_with(|| a.cmp(b)),
-        _ => a.cmp(b),
-    });
+    // Oldest batch first: by job timestamp, then numeric seq within the
+    // job (see `batch_order_key` for why both matter).
+    files.sort_by_key(|p| batch_order_key(p));
     // a single poison batch must not wedge the whole pipeline forever:
     // quarantine unreadable files and keep ingesting the rest
     let quarantine = staging.join("quarantine");
@@ -254,25 +266,94 @@ mod tests {
 
     #[test]
     fn dedup_keep_last_orders_by_numeric_seq() {
-        // `crawl-…-10` sorts BEFORE `crawl-…-9` lexicographically; keep-last
-        // dedup must still keep the -10 (NEWER) batch's row.
+        // Within one job, `crawl-…-10` sorts BEFORE `crawl-…-9`
+        // lexicographically; keep-last dedup must still keep the -10
+        // (NEWER) batch's row.
         let staging = temp_staging("seq");
         let idx = EntityIndex::open(&staging.join("index.lance")).unwrap();
         // write the OLDER batch last so read_dir order cannot mask the fix
         write_batch(
             &staging,
-            "crawl-1-10.jsonl",
+            "crawl-1790958250-10.jsonl",
             &[mail_record("77", Some("Work"), "newer")],
         );
         write_batch(
             &staging,
-            "crawl-1-9.jsonl",
+            "crawl-1790958250-9.jsonl",
             &[mail_record("77", Some("Work"), "older")],
         );
         let _ = ingest_staged(&idx, &staging).unwrap();
         assert_eq!(idx.count(Some("app = 'mail'")).unwrap(), 1);
         let got = mail_hits(&idx);
         assert_eq!(got, vec![("Work".to_string(), "newer".to_string())]);
+        std::fs::remove_dir_all(&staging).ok();
+    }
+
+    #[test]
+    fn dedup_keep_last_orders_dead_job_behind_live_job() {
+        // After a crash → rebuild, a dead job's leftover `crawl-<T1>-40`
+        // must rank BEHIND the live job's `crawl-<T2>-0` (T2 > T1): a
+        // seq-first sort inverted them, and keep-last kept the DEAD job's
+        // row for overlapping keys.
+        let staging = temp_staging("jobs");
+        let idx = EntityIndex::open(&staging.join("index.lance")).unwrap();
+        let dead = 1790958250u64;
+        let live = dead + 60;
+        // write the DEAD job's batch last so read_dir order cannot mask the fix
+        write_batch(
+            &staging,
+            &format!("crawl-{live}-0.jsonl"),
+            &[mail_record("77", Some("Work"), "live job")],
+        );
+        write_batch(
+            &staging,
+            &format!("crawl-{dead}-40.jsonl"),
+            &[mail_record("77", Some("Work"), "dead job")],
+        );
+        let _ = ingest_staged(&idx, &staging).unwrap();
+        assert_eq!(idx.count(Some("app = 'mail'")).unwrap(), 1);
+        let got = mail_hits(&idx);
+        assert_eq!(got, vec![("Work".to_string(), "live job".to_string())]);
+        std::fs::remove_dir_all(&staging).ok();
+    }
+
+    #[test]
+    fn malformed_batch_names_no_panic_and_sort_last() {
+        // A hand-crafted name with a non-numeric tail (`-2zz`) must not be
+        // able to break the ordering — a non-total comparator panics
+        // `sort_by` on Rust >= 1.81, which would poison the caller's INDEX
+        // mutex. `sort_by_key` over a total-order key cannot; unparseable
+        // names sort LAST (pinned via keep-last: they win key overlaps).
+        let staging = temp_staging("malformed");
+        let idx = EntityIndex::open(&staging.join("index.lance")).unwrap();
+        let ts = 1790958300u64;
+        write_batch(
+            &staging,
+            &format!("crawl-{ts}-1.jsonl"),
+            &[mail_record("5", Some("Work"), "valid")],
+        );
+        write_batch(
+            &staging,
+            &format!("crawl-{ts}-2zz.jsonl"),
+            &[mail_record("5", Some("Work"), "malformed")],
+        );
+        write_batch(
+            &staging,
+            "notes.jsonl",
+            &[mail_record("6", Some("Work"), "no seq at all")],
+        );
+        let (batches, _rows, _quarantined) = ingest_staged(&idx, &staging).unwrap();
+        assert_eq!(batches, 3);
+        assert_eq!(idx.count(Some("app = 'mail'")).unwrap(), 2);
+        let mut got = mail_hits(&idx);
+        got.sort();
+        assert_eq!(
+            got,
+            vec![
+                ("Work".to_string(), "malformed".to_string()),
+                ("Work".to_string(), "no seq at all".to_string()),
+            ]
+        );
         std::fs::remove_dir_all(&staging).ok();
     }
 

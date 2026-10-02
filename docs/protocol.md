@@ -173,14 +173,17 @@ interleave — and spawn/rebuild still ingest immediately.
 auto-ingest. Unparseable batches quarantine as below either way.
 
 Merge/dedup key: `(app, account, id)`, keep-last across staged files
-(ordered by numeric trailing seq, so `crawl-…-10` beats `crawl-…-9` even
-though filename order sorts it first). The account is part of the key
-because Mail AppleScript ids are ACCOUNT-scoped integers — two accounts
-holding id "4127" are two distinct messages. Two known wrinkles:
-`mail_message_get` with a raw id may resolve either account's copy
-(pre-existing helper behavior — findMessage scans accounts), and rows
-written under the old two-column key can persist alongside their
-re-ingested replacements until the next crawl rewrites them.
+(ordered by job timestamp, then numeric seq — a dead crashed job's
+leftover batches rank behind the live job's, and `-10` beats `-9` within
+a job; names that don't parse as `…-<ts>-<seq>` sort last). The account
+is part of the key because Mail AppleScript ids are ACCOUNT-scoped
+integers — two accounts holding id "4127" are two distinct messages. Two
+known wrinkles: `mail_message_get` with a raw id may resolve either
+account's copy (pre-existing helper behavior — findMessage scans
+accounts), and rows written under the old two-column key have a NULL
+account that merge-insert can never match against the normalized "" —
+they persist alongside their re-ingested replacements until `index_wipe`
+(or a manual delete) removes them; no crawl rewrites them.
 
 Coverage: the newest 30 days first, then 10-day backfill batches to a
 365-day horizon (~34 windows per job); each mailbox×window walk covers at

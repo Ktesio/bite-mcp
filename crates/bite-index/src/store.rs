@@ -268,9 +268,11 @@ impl EntityIndex {
     /// normalized to "" (never NULL) on write: NULL values in a merge key
     /// column never match, so a NULL-account row could never be upserted.
     /// Idempotent per batch — re-ingesting the same batch file is a no-op.
-    /// (Legacy rows written under the old 2-column key can persist
-    /// alongside their re-ingested replacements until the next crawl
-    /// rewrites them.)
+    /// (Legacy rows written under the old 2-column key have a NULL account,
+    /// and merge-insert can never match a NULL key column against the
+    /// normalized "" — so those rows persist alongside their re-ingested
+    /// replacements until `index_wipe` removes them; no crawl rewrites
+    /// them.)
     pub fn ingest(&self, records: &[Record]) -> Result<IngestStats, IndexError> {
         if records.is_empty() {
             return Ok(IngestStats::default());
