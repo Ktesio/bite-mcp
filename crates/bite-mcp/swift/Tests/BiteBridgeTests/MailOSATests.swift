@@ -243,6 +243,60 @@ final class MailOSATests: XCTestCase {
         lastError = nil
     }
 
+    // ── transport diagnostics (abort-reason formatting) ──
+
+    func testTransportDiagnostic() {
+        // message already carries the PAREN-delimited number → not duplicated
+        lastError = "Mail got an error (-1712)"
+        lastErrorNumber = -1712
+        XCTAssertEqual(MailCrawler.transportDiagnostic("fallback"), "Mail got an error (-1712)")
+        // a BARE substring never suppresses: "-17120" must not hide "-1712"
+        // (and "error -1712:" without parens still gets the number appended)
+        lastError = "AppleScript error -17120: Mail got an error"
+        lastErrorNumber = -1712
+        XCTAssertEqual(
+            MailCrawler.transportDiagnostic("fallback"),
+            "AppleScript error -17120: Mail got an error (-1712)"
+        )
+        // production's executeScript format carries the number without
+        // parens → paren-appended once (honest, never suppressible)
+        lastError = "AppleScript error -1712: Mail got an error: AppleEvent timed out."
+        lastErrorNumber = -1712
+        XCTAssertEqual(
+            MailCrawler.transportDiagnostic("fallback"),
+            "AppleScript error -1712: Mail got an error: AppleEvent timed out. (-1712)"
+        )
+        // message without a number, number set → appended once
+        lastError = "Mail got an error"
+        lastErrorNumber = -1719
+        XCTAssertEqual(MailCrawler.transportDiagnostic("fallback"), "Mail got an error (-1719)")
+        // number cleared → message only
+        lastError = "some failure"
+        lastErrorNumber = nil
+        XCTAssertEqual(MailCrawler.transportDiagnostic("fallback"), "some failure")
+        // nothing recorded → the caller's fallback
+        lastError = nil
+        lastErrorNumber = nil
+        XCTAssertEqual(MailCrawler.transportDiagnostic("unknown error"), "unknown error")
+    }
+
+    func testTransportDiagnosticSnapshotIsAtomic() {
+        // (message, number) must be captured under ONE lock acquisition so
+        // the pair always comes from the same execution: write the number
+        // via the snapshot-visible path and verify a read sees a consistent
+        // pair (message cleared + number set would be a mixed pair).
+        lastError = "paired failure"
+        lastErrorNumber = -42
+        let snap = lastTransportError()
+        XCTAssertEqual(snap.message, "paired failure")
+        XCTAssertEqual(snap.number, -42)
+        lastError = nil
+        lastErrorNumber = nil
+        let cleared = lastTransportError()
+        XCTAssertNil(cleared.message)
+        XCTAssertNil(cleared.number)
+    }
+
     // ── terminal counters (failures/skipped persistence) ──
 
     func testTerminalCounters() {

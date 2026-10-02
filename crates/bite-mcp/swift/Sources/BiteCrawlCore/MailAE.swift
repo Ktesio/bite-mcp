@@ -50,6 +50,15 @@ public var lastErrorNumber: Int? {
     set { lastErrorLock.lock(); defer { lastErrorLock.unlock() }; _lastErrorNumber = newValue }
 }
 
+/// (message, number) of the last transport failure, captured under ONE
+/// lock acquisition — two separate getter calls could interleave with a
+/// concurrent execution and mix a message from one failure with a number
+/// from another.
+public func lastTransportError() -> (message: String?, number: Int?) {
+    lastErrorLock.lock(); defer { lastErrorLock.unlock() }
+    return (_lastError, _lastErrorNumber)
+}
+
 // Message record keywords (sdef four-char codes, validated live on macOS 27).
 let kwMessageIDD = AEKeyword(0x49442020)      // 'ID  '  — id
 let kwSubjectD = AEKeyword(0x7375626a)        // 'subj'  — subject
@@ -460,6 +469,10 @@ public enum MailAE {
     /// bundleProps order) to a CrawlRecord with the exact field mapping the
     /// JSONL contract pins (docs/protocol.md, bite-index::store::Record).
     /// Returns nil for rows without a usable id.
+    /// `account` is non-optional here BY CONTRACT: Mail ids are
+    /// account-scoped and the index's merge/dedup key is
+    /// (app, account, id) — a nil account would silently cross-account
+    /// collapse records at merge time.
     public static func recordFromRow(_ row: NSAppleEventDescriptor?, account: String, mailbox: String,
                                      includeContent: Bool) -> CrawlRecord? {
         guard let row else { return nil }

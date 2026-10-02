@@ -635,6 +635,7 @@ dependencies = [
  "chrono",
  "clap",
  "dirs",
+ "fs2",
  "serde",
  "serde_json",
  "toml_edit",

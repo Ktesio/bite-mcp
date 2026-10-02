@@ -32,6 +32,10 @@ pub struct Record {
     pub app: String,
     /// App-native stable identifier (Mail message id, EK identifier, CN identifier, …)
     pub id: String,
+    /// Owning account. Optional in the JSONL contract, but NORMALIZED to
+    /// Some("") before dedup/merge (in-memory only): Mail ids are
+    /// account-scoped, so the merge/dedup key is (app, account, id) and a
+    /// NULL key value would never match.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub account: Option<String>,
     /// Mailbox / calendar / list / folder / chat
@@ -257,8 +261,18 @@ impl EntityIndex {
         Ok(self.conn.open_table(TABLE).execute().await?)
     }
 
-    /// Upsert records keyed on (app, id). Idempotent per batch — re-ingesting
-    /// the same batch file is a no-op.
+    /// Upsert records keyed on (app, account, id). The account is part of
+    /// the key because Mail message ids are ACCOUNT-scoped integers — two
+    /// accounts holding id "4127" are two distinct messages, and the old
+    /// (app, id) key silently collapsed cross-account mail. `account` is
+    /// normalized to "" (never NULL) on write: NULL values in a merge key
+    /// column never match, so a NULL-account row could never be upserted.
+    /// Idempotent per batch — re-ingesting the same batch file is a no-op.
+    /// (Legacy rows written under the old 2-column key have a NULL account,
+    /// and merge-insert can never match a NULL key column against the
+    /// normalized "" — so those rows persist alongside their re-ingested
+    /// replacements until `index_wipe` removes them; no crawl rewrites
+    /// them.)
     pub fn ingest(&self, records: &[Record]) -> Result<IngestStats, IndexError> {
         if records.is_empty() {
             return Ok(IngestStats::default());
@@ -269,7 +283,7 @@ impl EntityIndex {
             for chunk in records.chunks(512) {
                 let batch = record_batch(chunk)?;
                 let reader = arrow_array::RecordBatchIterator::new(vec![Ok(batch)], schema());
-                let mut mi = table.merge_insert(&["app", "id"]);
+                let mut mi = table.merge_insert(&["app", "account", "id"]);
                 mi.when_matched_update_all(None)
                     .when_not_matched_insert_all();
                 let result = mi.execute(Box::new(reader)).await?;
@@ -495,7 +509,9 @@ fn record_batch(records: &[Record]) -> Result<RecordBatch, IndexError> {
     for r in records {
         app.append_value(&r.app);
         id.append_value(&r.id);
-        account.append_option(r.account.as_deref());
+        // account normalized to "" (never NULL) at the write boundary:
+        // merge-insert key columns must not carry NULLs (they never match)
+        account.append_option(Some(r.account.as_deref().unwrap_or("")));
         container.append_option(r.container.as_deref());
         title.append_option(r.title.as_deref());
         content.append_option(r.content.as_deref());

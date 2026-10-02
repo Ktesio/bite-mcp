@@ -155,12 +155,35 @@ respawn-eligible).
 `<data-dir>/batches/<jobID>-<seq>.jsonl` (job IDs look like
 `crawl-<unix time>`; the Calendar/Reminders/Contacts mirrors continue the
 same job's numbering). NDJSON, one `Record` per line matching
-`bite_index::store::Record` (`app`/`id` required; `content` omitted entirely
+`bite_index::store::Record` (`app`/`id` required; `account` optional —
+normalized to `""` at ingest, see below; `content` omitted entirely
 when the store-body posture is off / `--no-body`), written 0600 via unique
 tmp + atomic rename. Mail batches hold at most 50 records; the
 Calendar/Reminders/Contacts mirrors stage up to 500. Stale `*.tmp` files are
 swept at job start (10 min age). Ingest deletes batches on success
-(merge-insert makes re-ingest idempotent).
+(merge-insert makes re-ingest idempotent). Staged batches are ingested
+automatically: index touches that read the index (`index_status`,
+`search`, `index_wipe`) opportunistically ingest pending batches first —
+throttled to once per 30 s per process (the throttle is checked before any
+staging-dir scan), serialized across processes by an exclusive
+`.ingest.lock` PLUS the store's writer lock — the same writer lock the
+spawn/rebuild ingest and `index_wipe` hold, so LanceDB writes never
+interleave — and spawn/rebuild still ingest immediately.
+`index_crawl_cancel` and `mail_bulk_*` never touch the index and do not
+auto-ingest. Unparseable batches quarantine as below either way.
+
+Merge/dedup key: `(app, account, id)`, keep-last across staged files
+(ordered by job timestamp, then numeric seq — a dead crashed job's
+leftover batches rank behind the live job's, and `-10` beats `-9` within
+a job; names that don't parse as `…-<ts>-<seq>` sort last). The account
+is part of the key because Mail AppleScript ids are ACCOUNT-scoped
+integers — two accounts holding id "4127" are two distinct messages. Two
+known wrinkles: `mail_message_get` with a raw id may resolve either
+account's copy (pre-existing helper behavior — findMessage scans
+accounts), and rows written under the old two-column key have a NULL
+account that merge-insert can never match against the normalized "" —
+they persist alongside their re-ingested replacements until `index_wipe`
+(or a manual delete) removes them; no crawl rewrites them.
 
 Coverage: the newest 30 days first, then 10-day backfill batches to a
 365-day horizon (~34 windows per job); each mailbox×window walk covers at
@@ -193,9 +216,14 @@ live process afterwards), `waiting_mail`, and a crashed worker's residual
 terminal write refreshes `updated_at`, resetting that clock.
 
 `bite index status` reports `pending_batches` (staged + quarantined batch
-files), `crawl.state` (the crawl-state.json state) and `crawl.alive` (a live
-bite-crawl process owns the pidfile). `waiting_mail` or `running` with
-`alive: false` means the worker is gone — run `bite index rebuild` to
+files) and a `hint` only when it is accurate: staged batches are claimed
+for auto-ingestion only when TOP-LEVEL batch files exist (auto-ingest
+reads `batches/`' top level only — `quarantine/` is never ingested), and
+quarantined batches are flagged for inspection
+(`… quarantined batches need inspection (batches/quarantine/)`). It also
+reports `crawl.state` (the crawl-state.json state) and `crawl.alive` (a
+live bite-crawl process owns the pidfile). `waiting_mail` or `running`
+with `alive: false` means the worker is gone — run `bite index rebuild` to
 respawn immediately.
 
 Skipped mailboxes are not persisted per-mailbox: the reason lives transiently
