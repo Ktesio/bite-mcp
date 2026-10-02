@@ -25,6 +25,24 @@ static IN_INGEST_PENDING: AtomicBool = AtomicBool::new(false);
 /// Minimum gap between opportunistic auto-ingest attempts per process.
 const AUTO_INGEST_THROTTLE_MS: u64 = 30_000;
 
+/// RAII guard for `IN_INGEST_PENDING`: set on acquire, cleared on drop —
+/// panic-safe, so a panicking ingest can never wedge this process's
+/// opportunistic ingest path permanently.
+struct IngestPendingGuard;
+
+impl IngestPendingGuard {
+    fn acquire() -> Self {
+        IN_INGEST_PENDING.store(true, Ordering::SeqCst);
+        Self
+    }
+}
+
+impl Drop for IngestPendingGuard {
+    fn drop(&mut self) {
+        IN_INGEST_PENDING.store(false, Ordering::SeqCst);
+    }
+}
+
 fn dir() -> std::path::PathBuf {
     bite_core::config::data_dir().join("index.lance")
 }
@@ -89,18 +107,26 @@ pub fn with_index<T>(
     f(index)
 }
 
-/// Opportunistic auto-ingest: cheap gate (30 s throttle + staged-batch
-/// scan), then a non-blocking cross-process `.ingest.lock` so concurrent
-/// bite processes don't pile onto ingest_staged together. If anything at
-/// all goes wrong (lock held, Busy writer, ingest error), stand down
-/// silently — the next index touch after the throttle catches up, and
-/// `ingest_pending` (spawn/rebuild) remains the authoritative path.
+/// Opportunistic auto-ingest: cheap gate (30 s throttle FIRST — inside the
+/// window we don't even dir-scan the staging dir), then a non-blocking
+/// cross-process `.ingest.lock`, then the store's writer lock so LanceDB
+/// writes serialize against the spawn/rebuild ingest path and `index_wipe`
+/// (which hold ONLY the writer lock). If anything at all goes wrong (lock
+/// held, Busy writer, ingest error), stand down silently — the next index
+/// touch after the throttle catches up, and `ingest_pending`
+/// (spawn/rebuild) remains the authoritative path.
 fn ingest_pending_if_due(index: &bite_index::EntityIndex) {
     if IN_INGEST_PENDING.load(Ordering::SeqCst) {
         return; // spawn/rebuild path is ingesting and wants its own reporting
     }
     let now = now_ms();
     let last = LAST_AUTO_INGEST_MS.load(Ordering::SeqCst);
+    // Throttle BEFORE the scan: the staging-dir scan is exactly what the
+    // throttle exists to keep out of hot tool loops, so it only runs once
+    // the window has elapsed.
+    if now.saturating_sub(last) < AUTO_INGEST_THROTTLE_MS {
+        return;
+    }
     let staged = staged_batch_count_in(&staging());
     if !auto_ingest_due(last, now, staged, AUTO_INGEST_THROTTLE_MS) {
         return;
@@ -119,6 +145,15 @@ fn ingest_pending_if_due(index: &bite_index::EntityIndex) {
     if fs2::FileExt::try_lock_exclusive(&lock).is_err() {
         return; // another bite process is mid-ingest — it will catch up
     }
+    // The staging lock only serializes auto-ingests against EACH OTHER.
+    // The spawn/rebuild ingest path and `index_wipe` hold only the store's
+    // writer lock, so without taking it too, auto-ingest could run
+    // concurrent LanceDB merge-inserts against them (spurious
+    // index_ingest_failed / wipe failures). Busy → the explicit path owns
+    // the table right now; stand down silently and let a later touch retry.
+    let Ok(_writer) = index.lock_writer() else {
+        return;
+    };
     let _ = bite_index::ingest_staged(index, &staging())
         .map_err(|e| eprintln!("bite auto-ingest error: {e}"));
     let _ = fs2::FileExt::unlock(&lock);
@@ -127,9 +162,9 @@ fn ingest_pending_if_due(index: &bite_index::EntityIndex) {
 
 /// Ingest any staged JSONL batches. Cheap when nothing is pending.
 pub fn ingest_pending() -> Result<Value, BiteError> {
-    IN_INGEST_PENDING.store(true, Ordering::SeqCst);
+    let _pending = IngestPendingGuard::acquire();
     let staging = staging();
-    let result = with_index(|index| {
+    with_index(|index| {
         // writer lock is per-ingest: a busy lock just means another bite
         // process is ingesting — skip and let the next poll pick it up
         match index.lock_writer() {
@@ -155,30 +190,53 @@ pub fn ingest_pending() -> Result<Value, BiteError> {
             "rows": rows,
             "quarantined": quarantined,
         }))
-    });
-    IN_INGEST_PENDING.store(false, Ordering::SeqCst);
-    result
+    })
+}
+
+/// Top-level batch files — the ONLY ones auto-ingest reads (`ingest_staged`
+/// scans the staging dir's top level; `quarantine/` is never ingested).
+fn staged_batches() -> usize {
+    staged_batch_count_in(&staging())
+}
+
+/// Quarantined (poison) batches — never auto-ingested; operators must
+/// inspect them.
+fn quarantined_batches() -> usize {
+    staged_batch_count_in(&staging().join("quarantine"))
 }
 
 /// Batches waiting for ingest — including quarantined ones, so operators
 /// can see stuck files from index_status instead of discovering them by
 /// rummaging through the data dir.
 fn pending_batches() -> usize {
-    staged_batch_count_in(&staging()) + staged_batch_count_in(&staging().join("quarantine"))
+    staged_batches() + quarantined_batches()
 }
 
 /// Actionable, agent-relayable hint for `index_status`. None when healthy —
-/// don't noise up healthy output. `failures` is the crawl-state failure
-/// streak (reserved for future backoff wording).
-fn status_hint(state: &str, pending: usize, _failures: u64) -> Option<String> {
+/// don't noise up healthy output. `staged` counts TOP-LEVEL batch files
+/// (the only ones auto-ingest reads — the hint must not claim automatic
+/// ingestion for quarantined batches it never touches); `quarantined`
+/// counts quarantine/ poison batches. `failures` is the crawl-state
+/// failure streak (reserved for future backoff wording).
+fn status_hint(state: &str, staged: usize, quarantined: usize, _failures: u64) -> Option<String> {
     if state == "failed" {
         Some(
             "Mail indexing stopped: see crawl.window for the reason — call index_rebuild to resume"
                 .to_string(),
         )
-    } else if pending > 0 {
+    } else if staged > 0 {
+        let mut hint = format!(
+            "{staged} staged batches will be ingested automatically on your next index call"
+        );
+        if quarantined > 0 {
+            hint.push_str(&format!(
+                "; {quarantined} quarantined batches need inspection (batches/quarantine/)"
+            ));
+        }
+        Some(hint)
+    } else if quarantined > 0 {
         Some(format!(
-            "{pending} staged batches will be ingested automatically within a minute"
+            "{quarantined} quarantined batches need inspection (batches/quarantine/)"
         ))
     } else {
         None
@@ -190,7 +248,9 @@ pub fn status() -> Result<Value, BiteError> {
         let stats = index
             .stats()
             .map_err(|e| BridgeError::new("index_error", e.to_string()))?;
-        let pending = pending_batches();
+        let staged = staged_batches();
+        let quarantined = quarantined_batches();
+        let pending = staged + quarantined;
         let crawl = crawl_state();
         let state_str = crawl
             .get("state")
@@ -209,7 +269,7 @@ pub fn status() -> Result<Value, BiteError> {
             },
             "jobs": crate::jobs::snapshot(),
         });
-        if let Some(hint) = status_hint(state_str, pending, failures) {
+        if let Some(hint) = status_hint(state_str, staged, quarantined, failures) {
             base["hint"] = json!(hint);
         }
         Ok(base)
@@ -917,23 +977,38 @@ mod tests {
         let failed =
             "Mail indexing stopped: see crawl.window for the reason — call index_rebuild to resume";
         // failed wins over pending, failures are currently informational only
-        assert_eq!(status_hint("failed", 19, 5).as_deref(), Some(failed));
-        assert_eq!(status_hint("failed", 0, 0).as_deref(), Some(failed));
-        // pending batches: agent-relayable count
+        assert_eq!(status_hint("failed", 19, 0, 5).as_deref(), Some(failed));
+        assert_eq!(status_hint("failed", 0, 3, 0).as_deref(), Some(failed));
+        // staged batches: agent-relayable count; auto-ingest only fires on
+        // an index touch, so the wording says so
         assert_eq!(
-            status_hint("running", 19, 0).as_deref(),
-            Some("19 staged batches will be ingested automatically within a minute")
+            status_hint("running", 19, 0, 0).as_deref(),
+            Some("19 staged batches will be ingested automatically on your next index call")
         );
         assert_eq!(
-            status_hint("done", 1, 0).as_deref(),
-            Some("1 staged batches will be ingested automatically within a minute")
+            status_hint("done", 1, 0, 0).as_deref(),
+            Some("1 staged batches will be ingested automatically on your next index call")
+        );
+        // quarantined batches ride along when staged batches exist…
+        assert_eq!(
+            status_hint("running", 2, 3, 0).as_deref(),
+            Some(
+                "2 staged batches will be ingested automatically on your next index call; \
+                 3 quarantined batches need inspection (batches/quarantine/)"
+            )
+        );
+        // …and get an inspection-only hint when nothing else is pending
+        // (accurate: quarantine is NEVER auto-ingested)
+        assert_eq!(
+            status_hint("done", 0, 4, 0).as_deref(),
+            Some("4 quarantined batches need inspection (batches/quarantine/)")
         );
         // healthy → no hint at all (don't noise up healthy output)
-        assert_eq!(status_hint("done", 0, 0), None);
-        assert_eq!(status_hint("running", 0, 0), None);
-        assert_eq!(status_hint("cancelled", 0, 0), None);
-        assert_eq!(status_hint("partial", 0, 0), None);
-        assert_eq!(status_hint("waiting_mail", 0, 0), None);
+        assert_eq!(status_hint("done", 0, 0, 0), None);
+        assert_eq!(status_hint("running", 0, 0, 0), None);
+        assert_eq!(status_hint("cancelled", 0, 0, 0), None);
+        assert_eq!(status_hint("partial", 0, 0, 0), None);
+        assert_eq!(status_hint("waiting_mail", 0, 0, 0), None);
     }
 
     #[test]

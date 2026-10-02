@@ -688,11 +688,16 @@ public enum MailCrawler {
 
     /// Best-effort transport diagnostic for abort/skip reasons: prefers
     /// the last MailAE error (message + error number), falls back to
-    /// `fallback` when nothing was recorded. Testable seam for the
-    /// abort-reason formatting.
+    /// `fallback` when nothing was recorded. (message, number) are
+    /// snapshotted under ONE lock so the pair always comes from the same
+    /// execution; the number is appended unless the message already
+    /// carries it PAREN-DELIMITED — a bare substring check would let
+    /// "-17120" suppress "-1712". Testable seam for the abort-reason
+    /// formatting.
     public static func transportDiagnostic(_ fallback: String) -> String {
-        guard let err = lastError, !err.isEmpty else { return fallback }
-        guard let n = lastErrorNumber, !err.contains("\(n)") else { return err }
+        let snap = lastTransportError()
+        guard let err = snap.message, !err.isEmpty else { return fallback }
+        guard let n = snap.number, !err.contains("(\(n))") else { return err }
         return "\(err) (\(n))"
     }
 
