@@ -30,6 +30,7 @@ pub fn run(all_clients: bool, yes: bool) -> Result<i32, bite_core::BiteError> {
     println!();
     println!("agent clients");
     let mut any = false;
+    let mut failures: Vec<(&str, String)> = Vec::new();
     for spec in clients::clients() {
         let installed = spec.installed();
         if installed {
@@ -45,12 +46,26 @@ pub fn run(all_clients: bool, yes: bool) -> Result<i32, bite_core::BiteError> {
         if should {
             match spec.add() {
                 Ok(path) => println!("    → added (config: {})", path.display()),
-                Err(e) => println!("    ! failed: {e}"),
+                Err(e) => {
+                    println!("    ! failed: {e}");
+                    failures.push((spec.display, e));
+                }
             }
         }
     }
     if !any {
         println!("  (no agent CLIs detected — add them anytime with `bite setup`)");
+    }
+    // One client's failure must not hide the others' — and the files that
+    // could not be written safely (unparseable configs are left untouched)
+    // get a summary so nothing fails silently.
+    if !failures.is_empty() {
+        println!();
+        println!("  ! {} client config(s) left untouched:", failures.len());
+        for (name, e) in &failures {
+            println!("      {name}: {e}");
+        }
+        println!("      fix the reported file(s) and re-run `bite setup`");
     }
 
     // 4. marketplace instructions
