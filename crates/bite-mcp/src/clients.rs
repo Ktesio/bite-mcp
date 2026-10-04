@@ -68,6 +68,12 @@ fn resolve_xdg_config(env_val: Option<OsString>, home: &Path) -> PathBuf {
     }
 }
 
+/// The directory OpenCode actually reads: `~/.config/opencode`
+/// (`$XDG_CONFIG_HOME/opencode`) on every platform including macOS.
+pub fn opencode_config_root() -> PathBuf {
+    xdg_config_home().join("opencode")
+}
+
 /// Claude Code config dir (`$CLAUDE_CONFIG_DIR`, else `$HOME`); user- and
 /// local-scope MCP servers live in `<dir>/.claude.json` under `mcpServers`
 /// (code.claude.com/docs/en/mcp-quickstart).
@@ -157,7 +163,7 @@ pub struct ClientSpec {
 pub fn clients() -> Vec<ClientSpec> {
     let home = home();
     let app_support = dirs::data_dir().unwrap_or_else(|| home.join("Library/Application Support"));
-    let opencode_dir = xdg_config_home().join("opencode");
+    let opencode_dir = opencode_config_root();
     vec![
         ClientSpec {
             key: "claude",
@@ -328,7 +334,7 @@ impl ClientSpec {
     /// file fails strict JSON parsing.
     fn add_json(&self, path: &Path, root_key: &str, entry: Value) -> Result<(), String> {
         ensure_not_symlink(path)?;
-        let (existing, state) = read_existing(path)?;
+        let (existing, cap) = read_existing(path)?;
         let mut root = match &existing {
             Existing::Fresh => json!({}),
             Existing::Text(text) => {
@@ -348,16 +354,16 @@ impl ClientSpec {
         // backup only once every parse/shape check passed — a refusal must
         // leave no debris
         if let Some(original) = existing.text() {
-            backup_once(path, original)?;
+            backup_once(path, original, cap.mode)?;
         }
-        atomic_write(path, &format!("{text}\n"), Some(&state))
+        write_atomic(path, &format!("{text}\n"), Some(&cap.state), cap.mode)
     }
 
     /// Codex edit: `[mcp_servers.bite]` via toml_edit (formatting-preserving);
     /// same refuse-to-clobber and atomic-write guarantees.
     fn add_toml(&self, path: &Path) -> Result<(), String> {
         ensure_not_symlink(path)?;
-        let (existing, state) = read_existing(path)?;
+        let (existing, cap) = read_existing(path)?;
         let mut doc = match &existing {
             Existing::Fresh => toml_edit::DocumentMut::new(),
             Existing::Text(text) => text
@@ -393,9 +399,9 @@ impl ClientSpec {
             }
         }
         if let Some(original) = existing.text() {
-            backup_once(path, original)?;
+            backup_once(path, original, cap.mode)?;
         }
-        atomic_write(path, &doc.to_string(), Some(&state))
+        write_atomic(path, &doc.to_string(), Some(&cap.state), cap.mode)
     }
 
     /// OpenCode edit. `opencode.json[c]` may be JSONC — comments and
@@ -403,13 +409,13 @@ impl ClientSpec {
     /// only the `mcp.bite` key is inserted/replaced.
     fn add_opencode(&self, path: &Path) -> Result<(), String> {
         ensure_not_symlink(path)?;
-        let (existing, state) = read_existing(path)?;
+        let (existing, cap) = read_existing(path)?;
         match existing {
             Existing::Fresh => {
                 let mut root = json!({ "mcp": {} });
                 root["mcp"][SERVER_KEY] = opencode_entry();
                 let text = serde_json::to_string_pretty(&root).map_err(|e| e.to_string())?;
-                atomic_write(path, &format!("{text}\n"), Some(&state))
+                write_atomic(path, &format!("{text}\n"), Some(&cap.state), cap.mode)
             }
             Existing::Text(text) => {
                 let root =
@@ -432,8 +438,8 @@ impl ClientSpec {
                     }
                 }
                 // all shape checks done — safe to take the backup
-                backup_once(path, &text)?;
-                atomic_write(path, &root.to_string(), Some(&state))
+                backup_once(path, &text, cap.mode)?;
+                write_atomic(path, &root.to_string(), Some(&cap.state), cap.mode)
             }
         }
     }
@@ -475,7 +481,7 @@ impl ClientSpec {
 
     fn remove_json(&self, path: &Path, root_key: &str) -> Result<bool, String> {
         ensure_not_symlink(path)?;
-        let (existing, state) = read_existing(path)?;
+        let (existing, cap) = read_existing(path)?;
         let text = match &existing {
             Existing::Fresh => return Ok(false),
             Existing::Text(t) => t.clone(),
@@ -489,15 +495,15 @@ impl ClientSpec {
             .unwrap_or(false);
         if removed {
             let out = serde_json::to_string_pretty(&root).map_err(|e| e.to_string())?;
-            backup_once(path, &text)?;
-            atomic_write(path, &format!("{out}\n"), Some(&state))?;
+            backup_once(path, &text, cap.mode)?;
+            write_atomic(path, &format!("{out}\n"), Some(&cap.state), cap.mode)?;
         }
         Ok(removed)
     }
 
     fn remove_toml(&self, path: &Path) -> Result<bool, String> {
         ensure_not_symlink(path)?;
-        let (existing, state) = read_existing(path)?;
+        let (existing, cap) = read_existing(path)?;
         let text = match &existing {
             Existing::Fresh => return Ok(false),
             Existing::Text(t) => t.clone(),
@@ -519,15 +525,15 @@ impl ClientSpec {
             })
             .unwrap_or(false);
         if removed {
-            backup_once(path, &text)?;
-            atomic_write(path, &doc.to_string(), Some(&state))?;
+            backup_once(path, &text, cap.mode)?;
+            write_atomic(path, &doc.to_string(), Some(&cap.state), cap.mode)?;
         }
         Ok(removed)
     }
 
     fn remove_jsonc(&self, path: &Path) -> Result<bool, String> {
         ensure_not_symlink(path)?;
-        let (existing, state) = read_existing(path)?;
+        let (existing, cap) = read_existing(path)?;
         let text = match &existing {
             Existing::Fresh => return Ok(false),
             Existing::Text(t) => t.clone(),
@@ -542,8 +548,8 @@ impl ClientSpec {
             return Ok(false);
         };
         prop.remove();
-        backup_once(path, &text)?;
-        atomic_write(path, &root.to_string(), Some(&state))?;
+        backup_once(path, &text, cap.mode)?;
+        write_atomic(path, &root.to_string(), Some(&cap.state), cap.mode)?;
         Ok(true)
     }
 }
@@ -569,10 +575,36 @@ fn set_bite_entry(
 }
 
 /// Convert the old-bite inline `mcp_servers = { … }` into proper
-/// `[mcp_servers.*]` header tables, preserving entry order (and any
-/// comments around the assignment — inline tables themselves cannot carry
-/// comments).
+/// `[mcp_servers.*]` header tables, preserving entry order AND the
+/// assignment line's comments: the leading comment (key prefix decor)
+/// travels onto the first emitted header — the `[mcp_servers]` header itself
+/// when direct values force one, else the first `[mcp_servers.*]` — and the
+/// trailing comment (value suffix decor) onto the last sub-table header.
 fn migrate_inline_mcp_servers(doc: &mut toml_edit::DocumentMut) {
+    // capture the assignment-line decor before anything moves
+    let mut key_prefix: Option<String> = None;
+    let mut value_suffix: Option<String> = None;
+    {
+        let table = doc.as_table_mut();
+        if let Some(item) = table.get_mut("mcp_servers") {
+            if let Some(v) = item.as_value() {
+                value_suffix = v
+                    .decor()
+                    .suffix()
+                    .and_then(|s| s.as_str())
+                    .map(str::to_owned);
+            }
+        }
+        for (key, _) in table.iter_mut() {
+            if key.get() == "mcp_servers" {
+                key_prefix = key
+                    .leaf_decor()
+                    .prefix()
+                    .and_then(|s| s.as_str())
+                    .map(str::to_owned);
+            }
+        }
+    }
     let Some(item) = doc.get_mut("mcp_servers") else {
         return;
     };
@@ -580,13 +612,46 @@ fn migrate_inline_mcp_servers(doc: &mut toml_edit::DocumentMut) {
         return;
     }
     let inline = std::mem::replace(item, toml_edit::Item::None);
-    *item = match inline {
-        toml_edit::Item::Value(toml_edit::Value::InlineTable(it)) => {
-            toml_edit::Item::Table(inline_table_to_table(&it))
-        }
-        other => other,
+    let toml_edit::Item::Value(toml_edit::Value::InlineTable(it)) = inline else {
+        unreachable!("checked is_inline_table above");
     };
-    // drop the key decor inherited from the `mcp_servers = { … }` line
+    let mut table = toml_edit::Table::new();
+    let has_direct = it
+        .iter()
+        .any(|(_, v)| !matches!(v, toml_edit::Value::InlineTable(_)));
+    table.set_implicit(!has_direct);
+    for (k, v) in it.iter() {
+        table.insert(k, inline_value_to_item(v));
+    }
+    if has_direct {
+        // the explicit `[mcp_servers]` header carries the comment itself
+        if let Some(p) = key_prefix.as_deref() {
+            table.decor_mut().set_prefix(p);
+        }
+    }
+    *item = toml_edit::Item::Table(table);
+    if !has_direct {
+        // header decor lives on the SUB-TABLE: first gets the leading
+        // comment, last gets the trailing one
+        if let Some(toml_edit::Item::Table(mcp)) = doc.get_mut("mcp_servers") {
+            let n = mcp.len();
+            for (i, (_k, sub)) in mcp.iter_mut().enumerate() {
+                if let Some(st) = sub.as_table_mut() {
+                    if i == 0 {
+                        if let Some(p) = key_prefix.as_deref() {
+                            st.decor_mut().set_prefix(p);
+                        }
+                    }
+                    if i + 1 == n {
+                        if let Some(s) = value_suffix.as_deref() {
+                            st.decor_mut().set_suffix(s);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // the `mcp_servers = { … }` key decor would render inside `[ ]` — clear it
     for (mut key, _) in doc.as_table_mut().iter_mut() {
         if key.get() == "mcp_servers" {
             key.leaf_decor_mut().set_prefix("");
@@ -648,21 +713,34 @@ fn strip_bom(s: &str) -> &str {
     s.strip_prefix('\u{feff}').unwrap_or(s)
 }
 
-fn read_existing(path: &Path) -> Result<(Existing, FileState), String> {
-    // capture identity BEFORE reading — it guards the rename against
-    // concurrent writers
+fn read_existing(path: &Path) -> Result<(Existing, Capture), String> {
+    // capture identity AND mode BEFORE reading — the identity guards the
+    // rename against concurrent writers, the mode threads through to every
+    // write so we never re-stat through a possibly swapped symlink
     let state = file_state(path);
-    match std::fs::read_to_string(path) {
+    let mode = existing_mode(path);
+    let existing = match std::fs::read_to_string(path) {
         Ok(raw) => {
             if strip_bom(&raw).trim().is_empty() {
-                Ok((Existing::Fresh, state))
+                Existing::Fresh
             } else {
-                Ok((Existing::Text(raw), state))
+                Existing::Text(raw)
             }
         }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok((Existing::Fresh, state)),
-        Err(e) => Err(format!("cannot read {}: {e}", path.display())),
-    }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Existing::Fresh,
+        Err(e) => return Err(format!("cannot read {}: {e}", path.display())),
+    };
+    Ok((existing, Capture { state, mode }))
+}
+
+/// Everything captured about the config file BEFORE we read it: its
+/// identity (mtime + size — guards the rename against concurrent writers)
+/// and its permission bits (so writes never re-stat through a possibly
+/// swapped symlink, and never widen a 0600 config).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Capture {
+    state: FileState,
+    mode: Option<u32>,
 }
 
 /// Identity of the on-disk file (mtime + size, or absence). Captured before
@@ -739,22 +817,20 @@ static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 /// a failed write removes its temp file and leaves the target untouched.
 ///
 /// Safety details:
-/// - the replacement inherits the target's existing mode; a NEW file is
+/// - the replacement keeps the target's existing mode; a NEW file is
 ///   created 0600 (configs can hold credentials) unless `mode` says
-///   otherwise (backups pass the original config's mode);
+///   otherwise;
+/// - the intended mode is enforced with an explicit chmod after the tmp
+///   create — `OpenOptions::mode` is masked by the process umask, which
+///   would silently narrow preserved modes (0644 → 0600 under umask 077);
 /// - a symlinked target is refused — rename would sever the link;
 /// - when `guard` is given (the FileState captured before we read the
 ///   config), the target is re-checked just before the rename and the write
 ///   aborts if the file changed in between;
 /// - sibling `.{name}.bite-tmp-*` leftovers older than 24 h are swept.
+#[cfg_attr(not(test), allow(dead_code))] // exercised by tests; production paths pass an explicit captured mode
 fn atomic_write(path: &Path, contents: &str, guard: Option<&FileState>) -> Result<(), String> {
     write_atomic(path, contents, guard, None)
-}
-
-/// Atomic write that inherits `mode_source`'s permissions (used for
-/// backups: a 0600 config's backup must not be world-readable).
-fn atomic_write_inheriting(path: &Path, contents: &str, mode_source: &Path) -> Result<(), String> {
-    write_atomic(path, contents, None, existing_mode(mode_source))
 }
 
 fn write_atomic(
@@ -781,6 +857,9 @@ fn write_atomic(
     let write_tmp = || -> Result<(), std::io::Error> {
         let mut f = open_tmp(&tmp, mode)?;
         f.write_all(contents.as_bytes())?;
+        // chmod, not just open-mode: the open mode is ANDed with the umask;
+        // an explicit chmod pins the intended (never-widened) mode
+        enforce_mode(&mut f, mode)?;
         f.sync_all()?;
         drop(f);
         Ok(())
@@ -849,6 +928,19 @@ fn open_tmp(tmp: &Path, _mode: u32) -> std::io::Result<std::fs::File> {
     std::fs::File::create(tmp)
 }
 
+/// Pin a file's permission bits via chmod (immune to the process umask,
+/// unlike `OpenOptions::mode`). Unix-only; a no-op elsewhere.
+#[cfg(unix)]
+fn enforce_mode(f: &mut std::fs::File, mode: u32) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    f.set_permissions(std::fs::Permissions::from_mode(mode))
+}
+
+#[cfg(not(unix))]
+fn enforce_mode(_f: &mut std::fs::File, _mode: u32) -> std::io::Result<()> {
+    Ok(())
+}
+
 /// Best-effort removal of sibling temp files (`.{name}.bite-tmp-*`) older
 /// than 24 h — debris from killed runs; never a file another live writer
 /// just created.
@@ -887,16 +979,22 @@ fn backup_path(path: &Path) -> PathBuf {
     path.with_file_name(format!("{name}.bite-bak"))
 }
 
-/// Copy the ORIGINAL bytes of a non-empty config aside, once. Never
+/// Copy the ORIGINAL bytes of a non-empty config aside, once — in the
+/// ORIGINAL's permission bits (`mode` was captured at read time; never
+/// re-stat the config, which could by now be a swapped symlink). Never
 /// overwrites an existing backup: the first one — the state before bite ever
-/// touched the file — is the one worth keeping. The backup inherits the
-/// original config's permissions.
-fn backup_once(path: &Path, original: &str) -> Result<(), String> {
+/// touched the file — is the one worth keeping. A symlinked `.bite-bak` is
+/// refused (existence is checked via `symlink_metadata`, which does not
+/// follow links — a link must neither count as "a backup exists" nor be
+/// written through).
+fn backup_once(path: &Path, original: &str, mode: Option<u32>) -> Result<(), String> {
     let bak = backup_path(path);
-    if bak.exists() {
-        return Ok(());
+    match std::fs::symlink_metadata(&bak) {
+        Ok(m) if m.file_type().is_symlink() => return Err(refuse_symlink(&bak)),
+        Ok(_) => return Ok(()),
+        Err(_) => {}
     }
-    atomic_write_inheriting(&bak, original, path)
+    write_atomic(&bak, original, None, mode)
 }
 
 /// A file left behind by an old bite version — reported, never deleted
@@ -907,29 +1005,41 @@ pub struct LegacyScar {
 }
 
 /// Detect scars from pre-0.3.1 writers: (a) the OpenCode config written to
-/// `dirs::config_dir()/opencode/` (= `~/Library/Application Support/opencode/`
-/// on macOS) which OpenCode never reads, plus its extension-clobbered
-/// backup; (b) old-named `<stem>.bite-bak` backups (the `with_extension`
-/// naming) next to current candidates. Non-destructive.
-pub fn legacy_scars(clients: &[ClientSpec], legacy_opencode_root: &Path) -> Vec<LegacyScar> {
+/// `dirs::config_dir()/opencode/` — on macOS that is
+/// `~/Library/Application Support/opencode/`, which OpenCode never reads —
+/// plus its extension-clobbered backup; (b) old-named `<stem>.bite-bak`
+/// backups (the `with_extension` naming) next to current candidates.
+/// Non-destructive.
+///
+/// The wrong-directory scars only fire when `legacy_opencode_root` differs
+/// from `live_opencode_root`: on Linux `dirs::config_dir()` IS `~/.config`,
+/// i.e. the live directory — the "safe to delete" advice must never point at
+/// a user's live config.
+pub fn legacy_scars(
+    clients: &[ClientSpec],
+    legacy_opencode_root: &Path,
+    live_opencode_root: &Path,
+) -> Vec<LegacyScar> {
     let mut scars: Vec<LegacyScar> = Vec::new();
     let push = |scars: &mut Vec<LegacyScar>, path: PathBuf, note: &'static str| {
         if path.exists() && !scars.iter().any(|s| s.path == path) {
             scars.push(LegacyScar { path, note });
         }
     };
-    push(
-        &mut scars,
-        legacy_opencode_root.join("opencode.json"),
-        "config written to the wrong directory by an old bite version \
-         (OpenCode reads ~/.config/opencode) — safe to delete",
-    );
-    push(
-        &mut scars,
-        legacy_opencode_root.join("opencode.bite-bak"),
-        "old-style backup in the wrong directory, left by an old bite version — \
-         inspect and delete manually",
-    );
+    if legacy_opencode_root != live_opencode_root {
+        push(
+            &mut scars,
+            legacy_opencode_root.join("opencode.json"),
+            "config written to the wrong directory by an old bite version \
+             (OpenCode reads ~/.config/opencode) — safe to delete",
+        );
+        push(
+            &mut scars,
+            legacy_opencode_root.join("opencode.bite-bak"),
+            "old-style backup in the wrong directory, left by an old bite version — \
+             inspect and delete manually",
+        );
+    }
     for c in clients {
         for p in c.all_paths() {
             let old_bak = p.with_extension("bite-bak");
@@ -2085,6 +2195,7 @@ mod tests {
         let dir = tempdir("scars");
         // (a) wrong-directory OpenCode writes from the old bite version
         let legacy_root = dir.join("Library/Application Support/opencode");
+        let live_root = dir.join(".config/opencode"); // different → scars fire
         std::fs::create_dir_all(&legacy_root).unwrap();
         std::fs::write(legacy_root.join("opencode.json"), "{}").unwrap();
         std::fs::write(legacy_root.join("opencode.bite-bak"), "{}").unwrap();
@@ -2096,7 +2207,7 @@ mod tests {
         // the NEW backup naming must NOT be flagged
         std::fs::write(dir.join(".claude.json.bite-bak"), "{}").unwrap();
 
-        let scars = legacy_scars(&[spec], &legacy_root);
+        let scars = legacy_scars(&[spec], &legacy_root, &live_root);
         let paths: Vec<_> = scars.iter().map(|s| s.path.clone()).collect();
         assert!(
             paths.contains(&legacy_root.join("opencode.json")),
@@ -2112,5 +2223,184 @@ mod tests {
         for p in &paths {
             assert!(p.exists(), "{:?} must not be deleted", p);
         }
+    }
+
+    #[test]
+    fn legacy_scars_inert_when_legacy_dir_is_the_live_dir() {
+        // Linux: dirs::config_dir() == ~/.config == the CURRENT opencode
+        // directory — the "safe to delete" note must never fire there.
+        let dir = tempdir("scarslive");
+        let same = dir.join(".config/opencode");
+        std::fs::create_dir_all(&same).unwrap();
+        std::fs::write(
+            same.join("opencode.json"),
+            "{\n  \"mcp\": {\"bite\": {}}\n}",
+        )
+        .unwrap();
+        std::fs::write(same.join("opencode.bite-bak"), "{}").unwrap();
+        let spec = spec_in(&dir, ".claude.json", ConfigKind::McpServers);
+        std::fs::write(dir.join(".claude.json"), "{}").unwrap();
+
+        let scars = legacy_scars(&[spec], &same, &same);
+        let paths: Vec<_> = scars.iter().map(|s| s.path.clone()).collect();
+        assert!(
+            !paths.iter().any(|p| p.starts_with(&same)),
+            "live config must never be flagged as deletable: {paths:?}"
+        );
+        assert!(scars.is_empty(), "nothing else to flag: {paths:?}");
+    }
+
+    // ── umask hardening ──────────────────────────────────────────────────
+
+    #[cfg(unix)]
+    #[test]
+    fn umask_does_not_narrow_preserved_modes() {
+        extern "C" {
+            fn umask(mask: std::ffi::c_int) -> std::ffi::c_int;
+        }
+        // restrictive umask: OpenOptions::mode() alone would land 0644 as 0600
+        struct Restore(std::ffi::c_int);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                unsafe { umask(self.0) }; // restore for the other tests
+            }
+        }
+        let _restore = Restore(unsafe { umask(0o077) });
+        let dir = tempdir("umask");
+        let path = dir.join("mcp.json");
+        std::fs::write(&path, r#"{"a":1}"#).unwrap();
+        chmod(&path, 0o644);
+        spec_in(&dir, "mcp.json", ConfigKind::McpServers)
+            .add()
+            .unwrap();
+        assert_eq!(mode_of(&path), 0o644, "0644 must survive umask 077");
+        // new files stay 0600 under any umask
+        let fresh = dir.join("new.json");
+        spec_in(&dir, "new.json", ConfigKind::McpServers)
+            .add()
+            .unwrap();
+        assert_eq!(mode_of(&fresh), 0o600);
+    }
+
+    // ── symlinked backup ────────────────────────────────────────────────
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_backup_is_not_an_existing_backup() {
+        let dir = tempdir("baklink");
+        let real_bak_target = dir.join("elsewhere.json");
+        std::fs::write(&real_bak_target, "{}").unwrap();
+        let path = dir.join("mcp.json");
+        std::fs::write(&path, r#"{"a":1}"#).unwrap();
+        // a symlinked .bite-bak used to count as "backup exists" (exists()
+        // follows links) → the config was modified with NO real backup
+        std::os::unix::fs::symlink(&real_bak_target, backup_path(&path)).unwrap();
+
+        let err = spec_in(&dir, "mcp.json", ConfigKind::McpServers)
+            .add()
+            .unwrap_err();
+        assert!(err.contains("symlink"), "backup refusal: {err}");
+        // config untouched (backup happens before the config write), link intact
+        assert_eq!(read(&path), r#"{"a":1}"#);
+        assert!(std::fs::symlink_metadata(backup_path(&path))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(read(&real_bak_target), "{}");
+    }
+
+    // ── codex migration: decor fidelity + direct values ──────────────────
+
+    #[test]
+    fn codex_migration_carries_decor_and_direct_values() {
+        let dir = tempdir("codexdecor");
+
+        // implicit branch: leading comment → first sub-table header,
+        // trailing comment → last sub-table header
+        let dotted = dir.join("dotted.toml");
+        std::fs::write(
+            &dotted,
+            "model = \"gpt-5\"\n# my servers live here\nmcp_servers = { other.command = \"x\", other.args = [\"y\"] } # trailing note\n",
+        )
+        .unwrap();
+        spec_in(&dir, "dotted.toml", ConfigKind::CodexToml)
+            .add()
+            .unwrap();
+        let out = read(&dotted);
+        assert!(
+            out.contains("# my servers live here"),
+            "leading comment kept:\n{out}"
+        );
+        assert!(
+            out.contains("# trailing note"),
+            "trailing comment kept:\n{out}"
+        );
+        let doc: toml_edit::DocumentMut = out.parse().expect("re-parses");
+        assert_eq!(doc["mcp_servers"]["other"]["command"].as_str(), Some("x"));
+        assert_eq!(
+            doc["mcp_servers"][SERVER_KEY]["command"].as_str(),
+            Some("bite")
+        );
+
+        // explicit branch: direct value forces [mcp_servers]; the comment
+        // travels onto that header
+        let direct = dir.join("direct.toml");
+        std::fs::write(
+            &direct,
+            "model = \"gpt-5\"\n# my servers live here\nmcp_servers = { enabled = true, other.command = \"x\" } # trailing note\n",
+        )
+        .unwrap();
+        spec_in(&dir, "direct.toml", ConfigKind::CodexToml)
+            .add()
+            .unwrap();
+        let out = read(&direct);
+        assert!(
+            out.contains("# my servers live here"),
+            "comment before [mcp_servers]:\n{out}"
+        );
+        assert!(
+            out.contains("[mcp_servers]\n"),
+            "direct values force the header:\n{out}"
+        );
+        let doc: toml_edit::DocumentMut = out.parse().expect("re-parses");
+        assert_eq!(doc["mcp_servers"]["enabled"].as_bool(), Some(true));
+        assert_eq!(
+            doc["mcp_servers"][SERVER_KEY]["command"].as_str(),
+            Some("bite")
+        );
+    }
+
+    // ── pre-rename symlink-swap guard ───────────────────────────────────
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_swap_after_capture_refused_at_rename() {
+        let dir = tempdir("swap");
+        let path = dir.join("mcp.json");
+        let target = dir.join("real-target.json");
+        std::fs::write(&path, r#"{"v":"original"}"#).unwrap();
+        std::fs::write(&target, r#"{"v":"dotfiles"}"#).unwrap();
+
+        // simulate: capture (as read_existing does), then the config is
+        // swapped for a symlink before the rename lands
+        let (existing, cap) = read_existing(&path).unwrap();
+        assert!(matches!(existing, Existing::Text(_)));
+        std::fs::remove_file(&path).unwrap();
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+
+        let err = write_atomic(&path, "{\"v\":\"bite\"}", Some(&cap.state), cap.mode).unwrap_err();
+        assert!(err.contains("symlink"), "symlink refused at rename: {err}");
+        // the link and its target both survive untouched
+        assert!(std::fs::symlink_metadata(&path)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(read(&target), r#"{"v":"dotfiles"}"#);
+        let debris: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains("bite-tmp"))
+            .collect();
+        assert!(debris.is_empty(), "tmp cleaned: {debris:?}");
     }
 }

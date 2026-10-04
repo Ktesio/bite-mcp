@@ -57,11 +57,15 @@ pub fn run(all_clients: bool, yes: bool) -> Result<i32, bite_core::BiteError> {
     if !any {
         println!("  (no agent CLIs detected — add them anytime with `bite setup`)");
     }
-    // files left behind by pre-0.3.1 writers — reported, never deleted
+    // files left behind by pre-0.3.1 writers — reported, never deleted.
+    // On Linux dirs::config_dir() == ~/.config == the live directory; the
+    // equality guard inside legacy_scars keeps the "safe to delete" note
+    // away from live configs there.
     let legacy_opencode_root = dirs::config_dir()
         .unwrap_or_else(|| std::env::var("HOME").unwrap_or_default().into())
         .join("opencode");
-    for scar in clients::legacy_scars(&specs, &legacy_opencode_root) {
+    let live_opencode_root = clients::opencode_config_root();
+    for scar in clients::legacy_scars(&specs, &legacy_opencode_root, &live_opencode_root) {
         println!("  note: {} — {}", scar.path.display(), scar.note);
     }
     // One client's failure must not hide the others' — and the files that
