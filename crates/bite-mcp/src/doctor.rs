@@ -210,7 +210,6 @@ fn check(label: &str, f: impl FnOnce() -> Option<String>) -> bool {
 fn storage_report() {
     let data = bite_core::config::data_dir();
     let batches = data.join("batches");
-    let scratch = data.join("swift-build");
 
     let total = tree_size(&data);
     let index = tree_size(&data.join("index.lance"));
@@ -233,13 +232,55 @@ fn storage_report() {
         println!("        {DIM}batches: {pending} pending, {quarantined} quarantined{RESET}");
     }
 
-    // build scratch left behind by a failed/interrupted on-demand compile —
-    // successful installs wipe it (see helper::compile_on_demand)
-    if scratch.exists() {
-        println!(
-            "        {YELLOW}swift-build scratch present ({}) — kept for debugging; the next successful install removes it{RESET}",
-            human_size(tree_size(&scratch)),
-        );
+    // leftover on-demand build scratch (`swift-build*`). Once the stable
+    // helper exists the scratch is pure garbage (binaries live in bin/) and
+    // doctor removes STALE instances itself; fresh ones might belong to a
+    // concurrent install and are only reported.
+    let scratches = crate::helper::swift_build_scratches_in(&data);
+    if !scratches.is_empty() {
+        let helper_installed = bite_core::config::helper_install_path().exists();
+        let now = std::time::SystemTime::now();
+        let mut removed: (usize, u64) = (0, 0);
+        let mut in_progress = 0usize;
+        let mut pending: (usize, u64) = (0, 0);
+        for s in &scratches {
+            let size = tree_size(s);
+            let stale = std::fs::symlink_metadata(s)
+                .and_then(|m| m.modified())
+                .ok()
+                .is_some_and(|m| crate::helper::scratch_is_stale(m, now));
+            match scratch_action(true, helper_installed, stale) {
+                ScratchAction::Remove => {
+                    if std::fs::remove_dir_all(s).is_ok() {
+                        removed = (removed.0 + 1, removed.1 + size);
+                    }
+                }
+                ScratchAction::ReportInProgress => in_progress += 1,
+                ScratchAction::ReportPendingInstall => {
+                    pending = (pending.0 + 1, pending.1 + size);
+                }
+                ScratchAction::None => {}
+            }
+        }
+        if removed.0 > 0 {
+            println!(
+                "        {DIM}removed {} stale swift-build scratch ({}) — build garbage; binaries live in bin/{RESET}",
+                removed.0,
+                human_size(removed.1),
+            );
+        }
+        if in_progress > 0 {
+            println!(
+                "        {YELLOW}{in_progress} swift-build scratch present — a build may be in progress; left alone{RESET}",
+            );
+        }
+        if pending.0 > 0 {
+            println!(
+                "        {YELLOW}{} swift-build scratch present ({}) — the next `bite install-helper` run removes it{RESET}",
+                pending.0,
+                human_size(pending.1),
+            );
+        }
     }
 
     // leaked test scratch dirs (panicked/killed runs) accumulate in $TMPDIR
@@ -312,6 +353,39 @@ fn count_bite_prefixed(dir: &std::path::Path) -> usize {
         .unwrap_or(0)
 }
 
+/// What doctor should do with a leftover swift-build scratch dir.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScratchAction {
+    /// nothing present
+    None,
+    /// helper installed + stale: pure build garbage → doctor deletes it
+    Remove,
+    /// fresh scratch (helper or not): could be a concurrent install's
+    /// in-flight build → report only, never delete
+    ReportInProgress,
+    /// no installed helper + stale: report; install-helper's start sweep
+    /// will remove it on the next run
+    ReportPendingInstall,
+}
+
+/// Pure decision for one scratch dir. Deletion fires ONLY when the stable
+/// helper is installed (the scratch's whole purpose is producing that
+/// binary — with it present the scratch is garbage) AND the dir is stale
+/// (a fresh one may belong to a live concurrent build).
+fn scratch_action(present: bool, helper_installed: bool, stale: bool) -> ScratchAction {
+    if !present {
+        ScratchAction::None
+    } else if helper_installed && stale {
+        ScratchAction::Remove
+    } else if helper_installed {
+        ScratchAction::ReportInProgress
+    } else if stale {
+        ScratchAction::ReportPendingInstall
+    } else {
+        ScratchAction::ReportInProgress
+    }
+}
+
 fn status_line(ok: bool, label: &str) {
     let (icon, color) = if ok { ("✓", GREEN) } else { ("✗", RED) };
     println!("  {color}{icon}{RESET} {label}");
@@ -362,5 +436,22 @@ mod tests {
         std::fs::create_dir(dir.path().join("biteBUTnot")).unwrap();
         assert_eq!(count_bite_prefixed(dir.path()), 3);
         assert_eq!(count_bite_prefixed(&dir.path().join("missing")), 0);
+    }
+
+    #[test]
+    fn scratch_delete_only_when_installed_and_stale() {
+        use ScratchAction as A;
+        // nothing present → nothing to do, regardless of state
+        assert_eq!(scratch_action(false, false, false), A::None);
+        assert_eq!(scratch_action(false, true, true), A::None);
+        // installed + stale → doctor deletes the garbage
+        assert_eq!(scratch_action(true, true, true), A::Remove);
+        // installed + FRESH → possibly a concurrent install's live build:
+        // report only (deleting would reintroduce the concurrent-install race)
+        assert_eq!(scratch_action(true, true, false), A::ReportInProgress);
+        // not installed + stale → report; install-helper's start sweep removes it
+        assert_eq!(scratch_action(true, false, true), A::ReportPendingInstall);
+        // not installed + fresh → recent failed/in-progress compile: report only
+        assert_eq!(scratch_action(true, false, false), A::ReportInProgress);
     }
 }
