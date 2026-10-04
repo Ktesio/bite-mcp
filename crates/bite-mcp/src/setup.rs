@@ -29,9 +29,10 @@ pub fn run(all_clients: bool, yes: bool) -> Result<i32, bite_core::BiteError> {
     // 3. agent clients
     println!();
     println!("agent clients");
+    let specs = clients::clients();
     let mut any = false;
     let mut failures: Vec<(&str, String)> = Vec::new();
-    for spec in clients::clients() {
+    for spec in &specs {
         let installed = spec.installed();
         if installed {
             println!("  ✓ {} already configured", spec.display);
@@ -56,16 +57,25 @@ pub fn run(all_clients: bool, yes: bool) -> Result<i32, bite_core::BiteError> {
     if !any {
         println!("  (no agent CLIs detected — add them anytime with `bite setup`)");
     }
+    // files left behind by pre-0.3.1 writers — reported, never deleted
+    let legacy_opencode_root = dirs::config_dir()
+        .unwrap_or_else(|| std::env::var("HOME").unwrap_or_default().into())
+        .join("opencode");
+    for scar in clients::legacy_scars(&specs, &legacy_opencode_root) {
+        println!("  note: {} — {}", scar.path.display(), scar.note);
+    }
     // One client's failure must not hide the others' — and the files that
     // could not be written safely (unparseable configs are left untouched)
-    // get a summary so nothing fails silently.
-    if !failures.is_empty() {
-        println!();
-        println!("  ! {} client config(s) left untouched:", failures.len());
+    // get a summary so nothing fails silently. stdout stays clean for
+    // scripts; the summary is a failure report and goes to stderr.
+    let failed = !failures.is_empty();
+    if failed {
+        eprintln!();
+        eprintln!("  ! {} client config(s) left untouched:", failures.len());
         for (name, e) in &failures {
-            println!("      {name}: {e}");
+            eprintln!("      {name}: {e}");
         }
-        println!("      fix the reported file(s) and re-run `bite setup`");
+        eprintln!("      fix the reported file(s) and re-run `bite setup`");
     }
 
     // 4. marketplace instructions
@@ -79,7 +89,9 @@ pub fn run(all_clients: bool, yes: bool) -> Result<i32, bite_core::BiteError> {
     println!("  • bite doctor --fix   repair permissions");
     println!("  • bite reminders lists  first real call (system prompt appears once)");
     println!("  • restart your agent CLI after config changes");
-    Ok(0)
+    // doctor's convention: 2 = problems found (here: configs bite could not
+    // write safely). Everything that could be done was done.
+    Ok(if failed { 2 } else { 0 })
 }
 
 fn ask(prompt: &str) -> bool {
