@@ -95,8 +95,11 @@ mod tests {
 
     #[test]
     fn private_dir_and_file_modes() {
-        let base = std::env::temp_dir().join(format!("bite-privtest-{}", std::process::id()));
-        let dir = base.join("nested");
+        let base = tempfile::Builder::new()
+            .prefix("bite-privtest-")
+            .tempdir()
+            .unwrap();
+        let dir = base.path().join("nested");
         ensure_private_dir(&dir).unwrap();
         let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
         eprintln!("dir mode: {mode:o}");
@@ -110,6 +113,5 @@ mod tests {
         write_private(&file, b"x=2").unwrap();
         let fmode = std::fs::metadata(&file).unwrap().permissions().mode() & 0o777;
         assert_eq!(fmode, 0o600);
-        std::fs::remove_dir_all(&base).ok();
     }
 }

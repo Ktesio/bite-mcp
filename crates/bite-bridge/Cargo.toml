@@ -9,3 +9,7 @@ license.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+# self-cleaning test scratch files (Drop guard — panics can't leak them)
+tempfile = "3"

@@ -67,7 +67,7 @@ fn auto_ingest_due(last_attempt_ms: u64, now_ms: u64, staged: usize, min_interva
 
 /// Top-level `*.jsonl` batch FILES in `dir` (quarantine/ is a subdir and
 /// never matches; directories with jsonl-ish names don't count).
-fn staged_batch_count_in(dir: &std::path::Path) -> usize {
+pub(crate) fn staged_batch_count_in(dir: &std::path::Path) -> usize {
     std::fs::read_dir(dir)
         .map(|it| {
             it.filter_map(|e| e.ok())
@@ -1013,12 +1013,15 @@ mod tests {
 
     #[test]
     fn staged_batch_count_scans_top_level_only() {
-        let base = std::env::temp_dir().join(format!("bite-test-staging-{}", std::process::id()));
+        let base = tempfile::Builder::new()
+            .prefix("bite-test-staging-")
+            .tempdir()
+            .unwrap();
+        let base = base.path();
         let quarantine = base.join("quarantine");
-        let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(&quarantine).unwrap();
         // no files yet
-        assert_eq!(staged_batch_count_in(&base), 0);
+        assert_eq!(staged_batch_count_in(base), 0);
         // three top-level batches
         for name in ["a-0.jsonl", "a-1.jsonl", "b-0.jsonl"] {
             std::fs::write(base.join(name), b"{}\n").unwrap();
@@ -1028,14 +1031,9 @@ mod tests {
         std::fs::write(base.join("notes.txt"), b"").unwrap();
         // quarantine is a subdir: its jsonl files must NOT count here
         std::fs::write(quarantine.join("poison.jsonl"), b"garbage").unwrap();
-        assert_eq!(staged_batch_count_in(&base), 3);
+        assert_eq!(staged_batch_count_in(base), 3);
         // empty subdirectories with jsonl-ish names don't fool the scan
         std::fs::create_dir_all(base.join("weird.jsonl")).unwrap();
-        assert_eq!(
-            staged_batch_count_in(&base),
-            3,
-            "directories must not count"
-        );
-        let _ = std::fs::remove_dir_all(&base);
+        assert_eq!(staged_batch_count_in(base), 3, "directories must not count");
     }
 }

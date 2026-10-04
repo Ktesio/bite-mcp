@@ -142,7 +142,16 @@ fn compile_on_demand(stable: &PathBuf) -> Result<PathBuf, BridgeError> {
     if !built.exists() {
         return Err(BridgeError::spawn("swift build produced no bite-helper"));
     }
-    install_from(&built, stable)
+    let installed = install_from(&built, stable);
+    // The scratch dir is pure build state (module/SDK caches, object files):
+    // the binaries themselves now live in bin/. Wipe it on SUCCESS so it
+    // can't sit in the data dir forever (~100 MB); on failure leave it for
+    // debugging the next attempt. Tradeoff: the next successful install
+    // recompiles cold (~30 s slower, no incremental cache).
+    if installed.is_ok() {
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+    installed
 }
 
 fn path_exists_with_same_content(src: &PathBuf, dst: &PathBuf) -> bool {
