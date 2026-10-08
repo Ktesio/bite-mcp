@@ -1,0 +1,4 @@
+[tools]
+# Pinned to the dependency-enforced MSRV floor (see Cargo.toml rust-version
+# and the msrv CI lane) so local gates run on the floor, not just stable.
+rust = "1.91.0"
