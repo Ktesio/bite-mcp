@@ -32,6 +32,25 @@ jobs:
       - name: Rust tests (builds Swift helper via build.rs)
         run: cargo test --workspace
 
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install protoc (required by the Lance stack)
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
+      - uses: dtolnay/rust-toolchain@1.91.0
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Check workspace builds on the MSRV
+        # Floor set by the dependency graph: lancedb 0.39 / lance 12 declare
+        # rust-version = 1.91.0 (edition 2024); datafusion 54 declares 1.88.
+        # --all-targets so dev-dependencies compile on the floor too. Keep in
+        # lockstep with rust-version in the root Cargo.toml.
+        run: cargo check --workspace --all-targets
+
   mcp-inspector:
     runs-on: macos-14
     needs: rust
