@@ -7,7 +7,12 @@ version = "0.3.0"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/ktesio/bite-mcp"
-rust-version = "1.75"
+# MSRV floor is enforced by the dependency graph, not our own syntax:
+# lancedb 0.39 / lance 12 declare rust-version = 1.91.0 (edition 2024),
+# datafusion 54 declares 1.88, and the committed Cargo.lock is format v4
+# (unreadable by cargo < 1.78). Proven by the `msrv` CI lane; keep all four
+# in lockstep when any of them moves.
+rust-version = "1.91"
 
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }
