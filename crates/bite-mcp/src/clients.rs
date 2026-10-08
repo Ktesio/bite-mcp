@@ -1071,15 +1071,30 @@ mod tests {
     use super::*;
 
     /// Unique scratch dir per test (tests run in parallel in one process).
-    fn tempdir(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "bite-clients-tests-{name}-{}-{}",
-            std::process::id(),
-            TMP_SEQ.fetch_add(1, Ordering::Relaxed)
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+    /// Self-cleaning: the tempfile::TempDir inside is removed on drop —
+    /// including during panic unwind — so failed runs can't leak
+    /// `bite-clients-tests-*` dirs in $TMPDIR. Deref keeps call sites
+    /// reading like the old `PathBuf` helper.
+    struct ScratchDir(tempfile::TempDir);
+    impl std::ops::Deref for ScratchDir {
+        type Target = Path;
+        fn deref(&self) -> &Path {
+            self.0.path()
+        }
+    }
+    impl AsRef<Path> for ScratchDir {
+        fn as_ref(&self) -> &Path {
+            self.0.path()
+        }
+    }
+
+    fn tempdir(name: &str) -> ScratchDir {
+        ScratchDir(
+            tempfile::Builder::new()
+                .prefix(&format!("bite-clients-tests-{name}-"))
+                .tempdir()
+                .expect("create temp dir"),
+        )
     }
 
     fn spec_in(dir: &Path, name: &str, kind: ConfigKind) -> ClientSpec {

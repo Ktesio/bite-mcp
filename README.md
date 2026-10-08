@@ -132,6 +132,19 @@ bite (Rust) ingests them into the entity index (LanceDB) — instant local searc
    [docs/permissions.md](docs/permissions.md).
 3. Denied something? `bite doctor --fix` opens the right System Settings panes.
 
+## Development
+
+A note on disk usage: `target/` growing into many GB over weeks of `cargo
+build`/`cargo test` is normal Cargo behavior — every rebuild leaves a new
+hashed copy of each binary/rlib (the Lance/DataFusion debug tree is heavy).
+When it hurts, `cargo clean` and rebuild. The workspace pins
+`[profile.dev] debug = "line-tables-only"`, which keeps backtraces with
+file/line while cutting the debug-info weight of dependencies roughly by a
+third. Test scratch dirs are Drop-guarded (`tempfile`), so even panicking
+test runs leave nothing behind in `$TMPDIR` — and `bite doctor` shows a
+storage overview (index size, batch backlog, leftover scratch) if you
+suspect litter.
+
 ## Privacy & intended use
 
 - **Local-only.** bite runs entirely on your Mac. It makes no network calls

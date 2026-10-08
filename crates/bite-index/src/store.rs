@@ -672,16 +672,18 @@ mod tests {
         }
     }
 
-    fn temp_dir(tag: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!(
-            "bite-index-{tag}-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        d
+    /// Self-cleaning scratch dir (removed on drop — panics can't leak it).
+    fn temp_dir(tag: &str) -> crate::test_support::ScratchDir {
+        crate::test_support::scratch(&format!("bite-index-{tag}-"))
+    }
+
+    #[test]
+    #[should_panic(expected = "boom")]
+    fn panicking_test_cleans_up_its_temp_dir() {
+        // Proves the Drop guard runs during panic unwind: after this test
+        // (and any panicking sibling), no bite-index-* dir is left in $TMPDIR.
+        let _dir = temp_dir("panic");
+        panic!("boom");
     }
 
     #[test]
@@ -764,7 +766,6 @@ mod tests {
         // stats
         let stats = idx.stats().unwrap();
         assert_eq!(stats.total, 2);
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -802,7 +803,6 @@ mod tests {
             res.hits.iter().any(|h| h.id == "a2"),
             "FTS must see rows added after index creation"
         );
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -824,7 +824,6 @@ mod tests {
 
         idx.wipe().unwrap();
         assert_eq!(idx.count(None).unwrap(), 0);
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -834,6 +833,5 @@ mod tests {
         let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o700);
         drop(idx);
-        std::fs::remove_dir_all(&dir).ok();
     }
 }

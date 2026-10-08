@@ -11,17 +11,16 @@ fn fake_helper() -> &'static str {
     env!("CARGO_BIN_EXE_bite-fake-helper")
 }
 
-fn scenario_file(scenario: &serde_json::Value) -> std::path::PathBuf {
-    let path = std::env::temp_dir().join(format!(
-        "bite-fake-scenario-{}-{}.json",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    std::fs::write(&path, serde_json::to_string(scenario).unwrap()).unwrap();
-    path
+/// Scenario file in a self-cleaning temp path (removed on drop — panics
+/// can't leak `bite-fake-scenario-*` files in $TMPDIR).
+fn scenario_file(scenario: &serde_json::Value) -> tempfile::NamedTempFile {
+    let mut f = tempfile::Builder::new()
+        .prefix("bite-fake-scenario-")
+        .suffix(".json")
+        .tempfile()
+        .expect("create temp file");
+    write!(f, "{}", serde_json::to_string(scenario).unwrap()).unwrap();
+    f
 }
 
 #[test]
@@ -54,17 +53,16 @@ fn scripted_error_is_surfaced() {
             ]
         }
     }));
-    let bridge = Bridge::spawn_args(fake_helper(), &[path.display().to_string()]).unwrap();
+    let bridge = Bridge::spawn_args(fake_helper(), &[path.path().display().to_string()]).unwrap();
     let err: BridgeError = bridge.call("mail.accounts", &json!({})).unwrap_err();
     assert!(err.is_permission());
     assert_eq!(err.app.as_deref(), Some("Mail"));
-    let _ = std::fs::remove_file(path);
 }
 
 #[test]
 fn timeout_is_reported_and_bridge_survives() {
     let path = scenario_file(&json!({ "echo": true, "sleep_ms_per_call": 1500 }));
-    let bridge = Bridge::spawn_args(fake_helper(), &[path.display().to_string()]).unwrap();
+    let bridge = Bridge::spawn_args(fake_helper(), &[path.path().display().to_string()]).unwrap();
     let err = bridge
         .call_timeout("sys.ping", &json!({}), Duration::from_millis(200))
         .unwrap_err();
@@ -74,7 +72,6 @@ fn timeout_is_reported_and_bridge_survives() {
         .call_timeout("sys.ping", &json!({}), Duration::from_secs(5))
         .unwrap();
     assert_eq!(res["ok"], json!(true));
-    let _ = std::fs::remove_file(path);
 }
 
 #[test]
@@ -82,7 +79,7 @@ fn helper_exit_fails_pending_requests() {
     // helper prints hello then exits: either spawn reports the exit, or the
     // first call fails with helper_exited — never a silent success.
     let path = scenario_file(&json!({ "exit_after_hello": true }));
-    let err = match Bridge::spawn_args(fake_helper(), &[path.display().to_string()]) {
+    let err = match Bridge::spawn_args(fake_helper(), &[path.path().display().to_string()]) {
         Err(e) => e,
         Ok(bridge) => bridge
             .call("sys.ping", &json!({}))

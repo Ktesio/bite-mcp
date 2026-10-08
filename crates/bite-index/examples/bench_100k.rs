@@ -5,14 +5,20 @@ use bite_index::{EntityIndex, Record, SearchQuery};
 use std::time::Instant;
 
 fn main() {
-    let dir = std::env::temp_dir().join(format!("bite-bench-100k-{}", std::process::id()));
+    // TempDir: removed on drop, so repeated bench runs can't accumulate
+    // multi-GB lance stores in $TMPDIR.
+    let dir = tempfile::Builder::new()
+        .prefix("bite-bench-100k-")
+        .tempdir()
+        .expect("create temp dir");
+    let dir = dir.path();
     let n: usize = std::env::args()
         .nth(1)
         .and_then(|a| a.parse().ok())
         .unwrap_or(100_000);
 
     println!("opening index at {}", dir.display());
-    let idx = EntityIndex::open(&dir).unwrap();
+    let idx = EntityIndex::open(dir).unwrap();
 
     println!("generating + ingesting {n} synthetic records (5k batches)…");
     let t0 = Instant::now();
@@ -85,6 +91,5 @@ fn main() {
     let stats = idx.stats().unwrap();
     println!("stats: total={} per_app={:?}", stats.total, stats.per_app);
 
-    std::fs::remove_dir_all(&dir).ok();
     let _ = ingest;
 }

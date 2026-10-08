@@ -592,6 +592,7 @@ version = "0.3.0"
 dependencies = [
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror",
 ]
 
@@ -604,6 +605,7 @@ dependencies = [
  "dirs",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror",
  "toml",
 ]
@@ -621,6 +623,7 @@ dependencies = [
  "lancedb",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror",
  "tokio",
 ]
@@ -639,6 +642,7 @@ dependencies = [
  "jsonc-parser",
  "serde",
  "serde_json",
+ "tempfile",
  "toml_edit",
 ]
 
