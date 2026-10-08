@@ -1,4 +1,6 @@
 pub mod store;
+#[cfg(test)]
+pub mod test_support;
 
 use std::path::Path;
 
@@ -179,17 +181,9 @@ mod tests {
         }
     }
 
-    fn temp_staging(tag: &str) -> std::path::PathBuf {
-        let d = std::env::temp_dir().join(format!(
-            "bite-ingest-{tag}-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&d).unwrap();
-        d
+    /// Self-cleaning staging dir (removed on drop — panics can't leak it).
+    fn temp_staging(tag: &str) -> crate::test_support::ScratchDir {
+        crate::test_support::scratch(&format!("bite-ingest-{tag}-"))
     }
 
     fn write_batch(staging: &Path, name: &str, records: &[Record]) {
@@ -261,7 +255,6 @@ mod tests {
                 ("iCloud".to_string(), "from iCloud v2".to_string()),
             ]
         );
-        std::fs::remove_dir_all(&staging).ok();
     }
 
     #[test]
@@ -286,7 +279,6 @@ mod tests {
         assert_eq!(idx.count(Some("app = 'mail'")).unwrap(), 1);
         let got = mail_hits(&idx);
         assert_eq!(got, vec![("Work".to_string(), "newer".to_string())]);
-        std::fs::remove_dir_all(&staging).ok();
     }
 
     #[test]
@@ -314,7 +306,6 @@ mod tests {
         assert_eq!(idx.count(Some("app = 'mail'")).unwrap(), 1);
         let got = mail_hits(&idx);
         assert_eq!(got, vec![("Work".to_string(), "live job".to_string())]);
-        std::fs::remove_dir_all(&staging).ok();
     }
 
     #[test]
@@ -354,7 +345,6 @@ mod tests {
                 ("Work".to_string(), "no seq at all".to_string()),
             ]
         );
-        std::fs::remove_dir_all(&staging).ok();
     }
 
     #[test]
@@ -371,7 +361,6 @@ mod tests {
         let _ = ingest_staged(&idx, &staging).unwrap();
         assert_eq!(idx.count(Some("app = 'mail'")).unwrap(), 1);
         assert_eq!(idx.count(Some("account = ''")).unwrap(), 1);
-        std::fs::remove_dir_all(&staging).ok();
     }
 
     #[test]
@@ -382,6 +371,5 @@ mod tests {
         let (batches, _rows, quarantined) = ingest_staged(&idx, &staging).unwrap();
         assert_eq!((batches, quarantined), (0, 0));
         assert!(staging.join("weird.jsonl").is_dir(), "directory untouched");
-        std::fs::remove_dir_all(&staging).ok();
     }
 }

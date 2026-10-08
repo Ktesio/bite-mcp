@@ -62,7 +62,9 @@ Deviations from the original plan, with reasons:
   (initialize/tools/resources/prompts/ping); `setup`; `doctor [--fix|--probe]`;
   `install-helper`; `helper ping|version|raw`; config writers for 7 agent
   clients (Claude, ZCode, Codex, OpenCode, Cursor, VS Code, Gemini CLI) with
-  surgical read-modify-write (`.bite-bak` backup, `toml_edit` for Codex).
+  surgical read-modify-write (`<full-name>.bite-bak` backup, `toml_edit` for
+  Codex, comment-preserving CST for OpenCode JSONC), refuse-to-clobber on
+  unparseable configs, and atomic tmp+rename writes.
 - `build.rs` — compiles the embedded Swift package at build time
   (content-hash gated), exposes `BITE_HELPER_BUILT`; the binary also
   compiles-on-demand from the packaged sources when the artifact is absent.

@@ -24,17 +24,23 @@ struct McpProc {
     stdin: std::process::ChildStdin,
     reader: BufReader<std::process::ChildStdout>,
     next_id: i64,
+    /// Scenario file for the spawned server; lives (and is deleted) with the
+    /// proc — never read, held only for its Drop.
+    _scenario: Option<tempfile::NamedTempFile>,
 }
 
 impl McpProc {
     fn start() -> Self {
-        let scenario =
-            std::env::temp_dir().join(format!("bite-mcp-smoke-{}.json", std::process::id()));
-        std::fs::write(&scenario, json!({ "echo": true }).to_string()).unwrap();
+        let mut scenario = tempfile::Builder::new()
+            .prefix("bite-mcp-smoke-")
+            .suffix(".json")
+            .tempfile()
+            .expect("scenario temp file");
+        write!(scenario, "{}", json!({ "echo": true })).unwrap();
         let mut child = Command::new(env!("CARGO_BIN_EXE_bite"))
             .args(["mcp"])
             .env("BITE_HELPER_BIN", fake_helper_path())
-            .env("BITE_FAKE_SCENARIO", &scenario)
+            .env("BITE_FAKE_SCENARIO", scenario.path())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
@@ -47,6 +53,7 @@ impl McpProc {
             stdin,
             reader: BufReader::new(stdout),
             next_id: 0,
+            _scenario: Some(scenario),
         }
     }
 

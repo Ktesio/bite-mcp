@@ -20,6 +20,13 @@ serde_json = "1"
 thiserror = "2"
 chrono = { version = "0.4", features = ["serde"] }
 
+# Full DWARF makes debug/test binaries enormous (~700 MB each once Lance /
+# DataFusion are linked in); line-tables-only keeps backtraces with file+line
+# while dropping most of that weight. `[profile.test]` inherits from `dev`,
+# so test binaries shrink too. `cargo clean` remains the hammer for target/.
+[profile.dev]
+debug = "line-tables-only"
+
 [profile.release]
 lto = "thin"
 strip = true
