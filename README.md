@@ -124,7 +124,9 @@ bite (Rust) ingests them into the entity index (LanceDB) — instant local searc
 ## First run
 
 1. `bite setup` — installs the helper, runs `bite doctor`, configures detected
-   agent CLIs, prints marketplace commands.
+   agent CLIs, prints marketplace commands. The full walkthrough, including
+   exactly what gets written where and how to recover from anything unusual:
+   [docs/setup.md](docs/setup.md).
 2. First call per app shows macOS's own permission prompt once (Calendar,
    Reminders, Contacts, and one "wants to control Mail" prompt per SB app).
    The crawl worker is a separate binary with its own TCC identity, so Mail
@@ -167,6 +169,7 @@ suspect litter.
 - [PRIVACY.md](PRIVACY.md) — privacy statement and intended use
 - [NOTICE.md](NOTICE.md) — attribution and trademark notices
 - [SECURITY.md](SECURITY.md) — how to report security issues
+- [docs/setup.md](docs/setup.md) — first-time setup, end to end
 - [docs/PLAN.md](docs/PLAN.md) — the full implementation plan
 - [docs/protocol.md](docs/protocol.md) — the Rust↔Swift helper protocol and
   the crawl batch handoff
