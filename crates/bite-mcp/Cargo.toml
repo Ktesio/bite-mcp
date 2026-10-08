@@ -27,5 +27,7 @@ serde_json.workspace = true
 chrono.workspace = true
 dirs = "6"
 toml_edit = "0.23"
+# Lossless JSONC editing (comment-preserving CST) for OpenCode configs.
+jsonc-parser = { version = "0.34", features = ["cst", "serde"] }
 
 [build-dependencies]
