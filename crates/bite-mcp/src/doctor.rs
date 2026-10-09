@@ -83,8 +83,14 @@ pub struct StorageReport {
     /// `bite install-helper` run removes it.
     pub scratch_pending_install_count: usize,
     pub scratch_pending_install_bytes: u64,
-    /// `bite-*` entries in $TMPDIR (leaked test scratch; reported >50).
+    /// `bite-*` entries still in $TMPDIR after the sweep (fresh or unknown
+    /// mtime; reported >50).
     pub tmpdir_bite_entries: usize,
+    /// Stale `bite-*` $TMPDIR scratch doctor removed just now — leaked test
+    /// litter (killed/panicked runs) older than the same stale window the
+    /// swift-build sweep uses.
+    pub tmpdir_swept_count: usize,
+    pub tmpdir_swept_bytes: u64,
 }
 
 #[derive(serde::Serialize, Debug)]
@@ -347,9 +353,9 @@ fn collect_storage() -> StorageReport {
     let mut in_progress = 0usize;
     let mut scratch_pending: (usize, u64) = (0, 0);
     let scratches = crate::helper::swift_build_scratches_in(&data);
+    let now = std::time::SystemTime::now();
     if !scratches.is_empty() {
         let helper_installed = bite_core::config::helper_install_path().exists();
-        let now = std::time::SystemTime::now();
         for s in &scratches {
             let size = tree_size(s);
             let stale = std::fs::symlink_metadata(s)
@@ -371,8 +377,13 @@ fn collect_storage() -> StorageReport {
         }
     }
 
-    // leaked test scratch dirs (panicked/killed runs) accumulate in $TMPDIR
-    let tmp_bite = count_bite_prefixed(&std::env::temp_dir());
+    // leaked test scratch dirs (panicked/killed runs) accumulate in $TMPDIR.
+    // Same policy as the swift-build scratch above: only PROVABLY stale
+    // entries (mtime older than the shared stale window) are removed;
+    // anything fresh could belong to a concurrently running test binary
+    // and stays (counted, reported >50).
+    let now = std::time::SystemTime::now();
+    let (tmp_swept, tmp_bite) = sweep_stale_bite_tmpdir(&std::env::temp_dir(), now);
 
     StorageReport {
         data_dir: data.display().to_string(),
@@ -388,6 +399,8 @@ fn collect_storage() -> StorageReport {
         scratch_pending_install_count: scratch_pending.0,
         scratch_pending_install_bytes: scratch_pending.1,
         tmpdir_bite_entries: tmp_bite,
+        tmpdir_swept_count: tmp_swept.0,
+        tmpdir_swept_bytes: tmp_swept.1,
     }
 }
 
@@ -545,6 +558,13 @@ fn render_human(report: &DoctorReport, fix: bool) -> String {
             human_size(s.scratch_pending_install_bytes),
         );
     }
+    if s.tmpdir_swept_count > 0 {
+        line!(
+            "        {DIM}removed {} stale bite-* entry in $TMPDIR ({}) — leaked test scratch{RESET}",
+            s.tmpdir_swept_count,
+            human_size(s.tmpdir_swept_bytes),
+        );
+    }
     if s.tmpdir_bite_entries > 50 {
         line!(
             "        {YELLOW}{} bite-* entries in $TMPDIR — likely leaked test scratch dirs, safe to delete{RESET}",
@@ -633,20 +653,56 @@ fn human_size(bytes: u64) -> String {
     }
 }
 
-/// Count entries in `dir` whose names start with `bite-` (leaked scratch).
-fn count_bite_prefixed(dir: &std::path::Path) -> usize {
-    std::fs::read_dir(dir)
-        .map(|it| {
-            it.filter_map(|e| e.ok())
-                .filter(|e| {
-                    e.file_name()
-                        .to_str()
-                        .map(|n| n.starts_with("bite-"))
-                        .unwrap_or(false)
-                })
-                .count()
-        })
-        .unwrap_or(0)
+/// Sweep stale `bite-*` scratch out of `dir` ($TMPDIR). Leaked test scratch
+/// (panicked/killed runs) is litter, but deleting is gated on PROOF: only
+/// entries whose mtime is older than the stale window the swift-build sweep
+/// shares are removed. Fresh entries may belong to a concurrently running
+/// test binary; unknown mtime can't prove anything. Returns what was swept
+/// (count, bytes) and how many `bite-*` entries remain.
+fn sweep_stale_bite_tmpdir(
+    dir: &std::path::Path,
+    now: std::time::SystemTime,
+) -> ((usize, u64), usize) {
+    let mut swept = (0usize, 0u64);
+    let mut remaining = 0usize;
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return (swept, remaining);
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if !name.starts_with("bite-") {
+            continue;
+        }
+        let path = entry.path();
+        let Ok(meta) = std::fs::symlink_metadata(&path) else {
+            remaining += 1;
+            continue;
+        };
+        let stale = meta
+            .modified()
+            .ok()
+            .and_then(|m| now.duration_since(m).ok())
+            .is_some_and(|d| d.as_secs() > crate::helper::SCRATCH_STALE_AFTER_SECS);
+        if stale {
+            let size = if meta.is_dir() {
+                tree_size(&path)
+            } else {
+                meta.len()
+            };
+            let gone = if meta.is_dir() {
+                std::fs::remove_dir_all(&path).is_ok()
+            } else {
+                std::fs::remove_file(&path).is_ok()
+            };
+            if gone {
+                swept = (swept.0 + 1, swept.1 + size);
+                continue;
+            }
+        }
+        remaining += 1;
+    }
+    (swept, remaining)
 }
 
 /// What doctor should do with a leftover swift-build scratch dir.
@@ -720,18 +776,82 @@ mod tests {
     }
 
     #[test]
-    fn bite_prefix_count_is_name_based() {
+    fn tmpdir_sweep_only_provably_stale() {
         let dir = tempfile::Builder::new()
             .prefix("bite-doctor-tests-")
             .tempdir()
             .unwrap();
-        std::fs::create_dir(dir.path().join("bite-index-1")).unwrap();
-        std::fs::write(dir.path().join("bite-clients-tests-x"), b"").unwrap();
-        std::fs::write(dir.path().join("bite-fifo-42"), b"").unwrap();
-        std::fs::write(dir.path().join("unrelated"), b"").unwrap();
+        // fresh entries → kept (a concurrent test binary may own them)
+        std::fs::create_dir(dir.path().join("bite-clients-live")).unwrap();
+        std::fs::write(dir.path().join("bite-fresh-file"), b"").unwrap();
+        // non-bite entries → never touched, never counted
+        std::fs::create_dir(dir.path().join("unrelated")).unwrap();
         std::fs::create_dir(dir.path().join("biteBUTnot")).unwrap();
-        assert_eq!(count_bite_prefixed(dir.path()), 3);
-        assert_eq!(count_bite_prefixed(&dir.path().join("missing")), 0);
+
+        let (swept, remaining) = sweep_stale_bite_tmpdir(dir.path(), std::time::SystemTime::now());
+        assert_eq!(swept, (0, 0));
+        assert_eq!(remaining, 2); // only the fresh bite-* pair
+        assert!(dir.path().join("bite-clients-live").exists());
+        assert!(dir.path().join("bite-fresh-file").exists());
+        assert!(dir.path().join("unrelated").exists());
+
+        // stale dir + stale file (mtime forced past the window) → swept,
+        // with sizes (tree for dirs, len for files) and names still exact
+        #[cfg(unix)]
+        {
+            std::fs::create_dir(dir.path().join("bite-index-1")).unwrap();
+            std::fs::write(dir.path().join("bite-fifo-42"), vec![0u8; 100]).unwrap();
+            std::fs::write(dir.path().join("bite-index-1").join("leaf"), vec![0u8; 28]).unwrap();
+            let old = std::time::SystemTime::now() - std::time::Duration::from_secs(25 * 3600);
+            for name in ["bite-index-1", "bite-fifo-42"] {
+                let f = std::fs::File::open(dir.path().join(name)).unwrap();
+                f.set_times(std::fs::FileTimes::new().set_modified(old))
+                    .unwrap();
+            }
+            let (swept, remaining) =
+                sweep_stale_bite_tmpdir(dir.path(), std::time::SystemTime::now());
+            assert_eq!(swept, (2, 128)); // dir tree (28) + file (100)
+            assert_eq!(remaining, 2);
+            assert!(!dir.path().join("bite-index-1").exists());
+            assert!(!dir.path().join("bite-fifo-42").exists());
+        }
+
+        // missing dir → zero swept, zero remaining, no panic
+        let (swept, remaining) =
+            sweep_stale_bite_tmpdir(&dir.path().join("missing"), std::time::SystemTime::now());
+        assert_eq!(swept, (0, 0));
+        assert_eq!(remaining, 0);
+    }
+
+    #[test]
+    fn tmpdir_sweep_boundary_is_exclusive() {
+        #[cfg(unix)]
+        {
+            let dir = tempfile::Builder::new()
+                .prefix("bite-doctor-tests-")
+                .tempdir()
+                .unwrap();
+            let p = dir.path().join("bite-edge");
+            std::fs::write(&p, b"x").unwrap();
+            let mtime = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+            let f = std::fs::File::open(&p).unwrap();
+            f.set_times(std::fs::FileTimes::new().set_modified(mtime))
+                .unwrap();
+            drop(f);
+            let h24 = std::time::Duration::from_secs(crate::helper::SCRATCH_STALE_AFTER_SECS);
+            // exactly 24h old — the policy is strictly `>`, so it must stay
+            let (swept, remaining) = sweep_stale_bite_tmpdir(dir.path(), mtime + h24);
+            assert_eq!(swept, (0, 0));
+            assert_eq!(remaining, 1);
+            // one second past the window → gone
+            let (swept, remaining) = sweep_stale_bite_tmpdir(
+                dir.path(),
+                mtime + h24 + std::time::Duration::from_secs(1),
+            );
+            assert_eq!(swept, (1, 1));
+            assert_eq!(remaining, 0);
+            assert!(!p.exists());
+        }
     }
 
     #[test]
@@ -837,6 +957,8 @@ mod tests {
                 scratch_pending_install_count: 0,
                 scratch_pending_install_bytes: 0,
                 tmpdir_bite_entries: 3,
+                tmpdir_swept_count: 2,
+                tmpdir_swept_bytes: 900,
             },
             dev_target: Some(DevTarget {
                 root: "/ws".to_string(),

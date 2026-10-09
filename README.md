@@ -144,7 +144,10 @@ When it hurts, `cargo clean` and rebuild. The workspace pins
 `[profile.dev] debug = "line-tables-only"`, which keeps backtraces with
 file/line while cutting the debug-info weight of dependencies roughly by a
 third. Test scratch dirs are Drop-guarded (`tempfile`), so even panicking
-test runs leave nothing behind in `$TMPDIR` — and `bite doctor` shows a
+test runs leave nothing behind in `$TMPDIR` — and `bite doctor` now sweeps
+stale `bite-*` scratch there itself (the same 24h window it uses for
+swift-build leftovers; fresh entries that might belong to a running test
+binary are left alone) and shows a
 storage overview (index size, batch backlog, leftover scratch) if you
 suspect litter. When you run `bite` straight from a checkout
 (`target/debug`, `target/release`), doctor also reports the build tree's
