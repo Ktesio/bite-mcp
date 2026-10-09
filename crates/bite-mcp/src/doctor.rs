@@ -9,14 +9,116 @@ const YELLOW: &str = "\x1b[33m";
 const RED: &str = "\x1b[31m";
 const DIM: &str = "\x1b[2m";
 
-pub fn run(fix: bool, probe: bool) -> Result<i32, bite_core::BiteError> {
-    let mut problems = 0;
+/// Everything `bite doctor` learned about the environment, plus the sizes of
+/// the cleanup it performed. Collected once; rendered either as the classic
+/// human report or as one compact JSON object (`bite doctor --json`) for
+/// scripts/CI. The exit-code contract is shared: 0 = clean, 2 = problems.
+#[derive(serde::Serialize, Debug)]
+pub struct DoctorReport {
+    /// `sw_vers` detail, e.g. `macOS 15 (major 15)`; None = not macOS 13+.
+    pub os: Option<String>,
+    /// `xcrun -f swiftc` path; None = no Swift toolchain (informational —
+    /// only needed for source-compile installs, never counts as a problem).
+    pub toolchain: Option<String>,
+    pub helper: HelperStatus,
+    /// Per-app permission status. Empty when the helper is down (nothing was
+    /// probed) — check `helper.ok` before reading meaning into it.
+    pub apps: Vec<AppStatus>,
+    /// Crawler Mail-automation probe; None when `bite-crawl` isn't installed.
+    pub crawler_mail: Option<CrawlerMailStatus>,
+    pub storage: StorageReport,
+    pub clients: Vec<ClientStatus>,
+    /// Count of failed checks — the human `N issue(s) found` and exit code 2.
+    pub problems: usize,
+}
 
-    println!("bite doctor");
-    println!("{}", DIM.repeat(60));
+#[derive(serde::Serialize, Debug)]
+pub struct HelperStatus {
+    pub ok: bool,
+    /// Stable helper path when the bridge came up.
+    pub path: Option<String>,
+    pub capabilities: Vec<String>,
+    /// Rendered error when the helper is missing/broken.
+    pub error: Option<String>,
+}
+
+#[derive(serde::Serialize, Debug)]
+pub struct AppStatus {
+    pub app: String,
+    /// Raw `sys.probe` state (or `error` when the probe itself failed).
+    pub state: String,
+    /// Whether the state is workable (a pending first-use prompt is fine).
+    pub ok: bool,
+    /// Human context for the state, when there is any.
+    pub note: Option<String>,
+}
+
+#[derive(serde::Serialize, Debug)]
+pub struct CrawlerMailStatus {
+    /// `authorized` | `no_accounts` | `denied` | `failed`
+    pub state: String,
+    /// Raw probe output for the denied case.
+    pub detail: Option<String>,
+}
+
+#[derive(serde::Serialize, Debug)]
+pub struct StorageReport {
+    pub data_dir: String,
+    pub total_bytes: u64,
+    pub index_bytes: u64,
+    pub bin_bytes: u64,
+    pub batches_bytes: u64,
+    pub batches_pending: usize,
+    pub batches_quarantined: usize,
+    /// Stale swift-build scratch dirs doctor removed just now (it always
+    /// cleans those itself; the rest is reported, never deleted).
+    pub scratch_removed_count: usize,
+    pub scratch_removed_bytes: u64,
+    /// Fresh scratch present — a build may be in progress; left alone.
+    pub scratch_in_progress: usize,
+    /// Stale scratch but no installed helper; the next
+    /// `bite install-helper` run removes it.
+    pub scratch_pending_install_count: usize,
+    pub scratch_pending_install_bytes: u64,
+    /// `bite-*` entries in $TMPDIR (leaked test scratch; reported >50).
+    pub tmpdir_bite_entries: usize,
+}
+
+#[derive(serde::Serialize, Debug)]
+pub struct ClientStatus {
+    pub key: String,
+    pub display: String,
+    /// Binary on PATH or config file found.
+    pub detected: bool,
+    /// MCP server entry written into the client's config.
+    pub installed: bool,
+}
+
+pub fn run(fix: bool, probe: bool, json_out: bool) -> Result<i32, bite_core::BiteError> {
+    let report = collect(fix, probe)?;
+
+    if json_out {
+        // One compact JSON object on stdout; trailing newline via println.
+        println!("{}", serde_json::to_string(&report).unwrap_or_default());
+    } else {
+        print!("{}", render_human(&report, fix));
+    }
+    if report.problems == 0 {
+        Ok(0)
+    } else {
+        Ok(2)
+    }
+}
+
+/// Gather the full report. Side effects are unchanged from the classic
+/// behavior: `--fix` opens System Settings panes for denied permissions and
+/// stale swift-build scratch dirs are swept (they're pure garbage once the
+/// stable helper exists).
+fn collect(fix: bool, probe: bool) -> Result<DoctorReport, bite_core::BiteError> {
+    let mut problems = 0usize;
 
     // ── OS ──
-    let os_ok = check("macOS 13+", || {
+    let os = (|| {
         let out = std::process::Command::new("sw_vers")
             .args(["-productVersion"])
             .output()
@@ -24,44 +126,48 @@ pub fn run(fix: bool, probe: bool) -> Result<i32, bite_core::BiteError> {
         let v = String::from_utf8_lossy(&out.stdout).trim().to_string();
         let major: u32 = v.split('.').next()?.parse().ok()?;
         Some(format!("macOS {v} (major {major})"))
-    });
-    if !os_ok {
+    })();
+    if os.is_none() {
         problems += 1;
     }
 
     // ── Swift toolchain (only needed for source-compile installs) ──
-    let _toolchain = check("Xcode Command Line Tools", || {
+    fn probe_toolchain() -> Option<String> {
         std::process::Command::new("xcrun")
             .args(["-f", "swiftc"])
             .output()
             .ok()
             .filter(|o| o.status.success())
             .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-    });
+    }
+    let toolchain = probe_toolchain();
 
     // ── Helper ──
     let mut handle = BridgeHandle::new();
-    let helper_ok = match handle.get() {
+    let helper = match handle.get() {
         Ok(bridge) => {
             let caps = bridge.capabilities();
-            status_line(true, &format!("native helper ({})", bridge.helper_path));
-            println!("        {DIM}capabilities: {}{RESET}", caps.join(", "));
-            true
+            HelperStatus {
+                ok: true,
+                path: Some(bridge.helper_path.clone()),
+                capabilities: caps,
+                error: None,
+            }
         }
         Err(e) => {
-            status_line(false, "native helper");
-            println!("        {RED}{}{RESET}", bite_core::BiteError(e).render());
             problems += 1;
-            if fix {
-                println!("        {DIM}→ run: bite install-helper --force{RESET}");
+            HelperStatus {
+                ok: false,
+                path: None,
+                capabilities: Vec::new(),
+                error: Some(bite_core::BiteError(e).render()),
             }
-            false
         }
     };
 
     // ── Per-app permission probes (no prompts unless --probe) ──
-    println!();
-    if helper_ok {
+    let mut apps = Vec::new();
+    if helper.ok {
         for app in [
             "calendar",
             "reminders",
@@ -80,43 +186,40 @@ pub fn run(fix: bool, probe: bool) -> Result<i32, bite_core::BiteError> {
             });
             match result {
                 Ok(v) => {
-                    let state = v["state"].as_str().unwrap_or("unknown");
-                    let (ok, note) = match state {
-                        "authorized" | "write_only" => (true, ""),
-                        "not_determined" | "will_prompt_on_first_use" => {
-                            (true, "a system prompt appears on first use")
-                        }
-                        "denied" | "restricted" => (false, "denied in System Settings"),
-                        "denied_or_unavailable" => (false, "denied or app missing"),
-                        "app_missing" => (false, "app not installed"),
-                        _ => (true, state),
-                    };
-                    status_line(ok, app);
-                    if !note.is_empty() {
-                        let color = if ok { DIM } else { RED };
-                        println!("        {color}{note}{RESET}");
-                        if !ok {
-                            problems += 1;
-                        }
-                        if fix && !ok {
-                            let pane = match app {
-                                "calendar" => "Privacy_Calendars",
-                                "reminders" => "Privacy_Reminders",
-                                "contacts" => "Privacy_Contacts",
-                                _ => "Privacy_Automation",
-                            };
-                            let url = format!(
-                                "x-apple.systempreferences:com.apple.preference.security?{pane}"
-                            );
-                            println!("        {DIM}→ opening System Settings…{RESET}");
-                            let _ = std::process::Command::new("open").arg(url).status();
-                        }
+                    let state = v["state"].as_str().unwrap_or("unknown").to_string();
+                    let (ok, note) = app_state_note(&state);
+                    if !ok {
+                        problems += 1;
                     }
+                    if fix && !ok {
+                        let pane = match app {
+                            "calendar" => "Privacy_Calendars",
+                            "reminders" => "Privacy_Reminders",
+                            "contacts" => "Privacy_Contacts",
+                            _ => "Privacy_Automation",
+                        };
+                        let url = format!(
+                            "x-apple.systempreferences:com.apple.preference.security?{pane}"
+                        );
+                        // stderr on purpose: stdout may carry the JSON report
+                        eprintln!("        {DIM}→ opening System Settings…{RESET}");
+                        let _ = std::process::Command::new("open").arg(url).status();
+                    }
+                    apps.push(AppStatus {
+                        app: app.to_string(),
+                        state,
+                        ok,
+                        note,
+                    });
                 }
                 Err(e) => {
-                    status_line(false, app);
-                    println!("        {RED}{}{RESET}", bite_core::BiteError(e).render());
                     problems += 1;
+                    apps.push(AppStatus {
+                        app: app.to_string(),
+                        state: "error".to_string(),
+                        ok: false,
+                        note: Some(bite_core::BiteError(e).render()),
+                    });
                 }
             }
         }
@@ -125,81 +228,81 @@ pub fn run(fix: bool, probe: bool) -> Result<i32, bite_core::BiteError> {
     // ── Crawler Mail-automation identity ──
     // bite-crawl is a separate binary with its own TCC identity: Mail may be
     // granted to the helper but denied to the crawler (silent empty results).
+    let mut crawler_mail = None;
     let crawl_bin = bite_core::config::data_dir().join("bin").join("bite-crawl");
     if crawl_bin.exists() {
         let out = std::process::Command::new(&crawl_bin)
             .arg("--probe-mail")
             .output();
-        match out {
+        crawler_mail = Some(match out {
             Ok(o) => {
                 let text = String::from_utf8_lossy(&o.stdout);
                 if text.contains("no_accounts") {
                     // Mail answered fine — it just has nothing configured.
                     // Not a TCC problem; don't send users permission-chasing.
-                    status_line(true, "crawler Mail automation");
-                    println!(
-                        "        {DIM}Mail has no accounts configured — nothing to index{RESET}"
-                    );
+                    CrawlerMailStatus {
+                        state: "no_accounts".to_string(),
+                        detail: None,
+                    }
+                } else if text.contains("authorized") {
+                    CrawlerMailStatus {
+                        state: "authorized".to_string(),
+                        detail: None,
+                    }
                 } else {
-                    let authorized = text.contains("authorized");
-                    status_line(authorized, "crawler Mail automation");
-                    if !authorized {
-                        println!("        {YELLOW}{}{RESET}", text.trim());
-                        println!("        {DIM}→ approve the Mail automation prompt once, from your terminal{RESET}");
+                    CrawlerMailStatus {
+                        state: "denied".to_string(),
+                        detail: Some(text.trim().to_string()),
                     }
                 }
             }
-            Err(_) => println!("        {DIM}probe failed to run{RESET}"),
-        }
+            Err(_) => CrawlerMailStatus {
+                state: "failed".to_string(),
+                detail: None,
+            },
+        });
     }
 
     // ── Storage ──
-    println!();
-    storage_report();
+    let storage = collect_storage();
 
     // ── Agent clients ──
-    println!();
+    let mut client_status = Vec::new();
     for spec in clients::clients() {
-        let detected = spec.detect();
-        let installed = spec.installed();
-        let (icon, color) = if installed {
-            ("✓", GREEN)
-        } else if detected {
-            ("○", YELLOW)
-        } else {
-            (" ", DIM)
-        };
-        println!(
-            "  {color}{icon}{RESET} {deg:<11} {DIM}{key}{RESET}",
-            deg = spec.display,
-            key = spec.key
-        );
-        if detected && !installed {
-            println!("      {DIM}→ run `bite setup` to register the MCP server{RESET}");
-        }
+        client_status.push(ClientStatus {
+            key: spec.key.to_string(),
+            display: spec.display.to_string(),
+            detected: spec.detect(),
+            installed: spec.installed(),
+        });
     }
 
-    println!("{}", DIM.repeat(60));
-    if problems == 0 {
-        println!("{GREEN}all checks passed{RESET}");
-        Ok(0)
-    } else {
-        println!("{YELLOW}{problems} issue(s) found{RESET}");
-        Ok(2)
-    }
+    Ok(DoctorReport {
+        os,
+        toolchain,
+        helper,
+        apps,
+        crawler_mail,
+        storage,
+        clients: client_status,
+        problems,
+    })
 }
 
-fn check(label: &str, f: impl FnOnce() -> Option<String>) -> bool {
-    match f() {
-        Some(detail) => {
-            status_line(true, label);
-            println!("        {DIM}{detail}{RESET}");
-            true
-        }
-        None => {
-            status_line(false, label);
-            false
-        }
+/// Map a raw `sys.probe` state to (workable?, human note). A pending
+/// first-use prompt is fine; denials and missing apps are not. Unknown
+/// states stay workable and surface themselves as the note.
+fn app_state_note(state: &str) -> (bool, Option<String>) {
+    match state {
+        "authorized" | "write_only" => (true, None),
+        "not_determined" | "will_prompt_on_first_use" => (
+            true,
+            Some("a system prompt appears on first use".to_string()),
+        ),
+        "denied" | "restricted" => (false, Some("denied in System Settings".to_string())),
+        "denied_or_unavailable" => (false, Some("denied or app missing".to_string())),
+        "app_missing" => (false, Some("app not installed".to_string())),
+        _ => (true, Some(state.to_string())),
     }
 }
 
@@ -207,7 +310,7 @@ fn check(label: &str, f: impl FnOnce() -> Option<String>) -> bool {
 /// litter. Informational (never prompts, never counts as a problem) — only
 /// du-style sizes of the known top-level paths; nothing descends into lance
 /// file formats.
-fn storage_report() {
+fn collect_storage() -> StorageReport {
     let data = bite_core::config::data_dir();
     let batches = data.join("batches");
 
@@ -216,33 +319,20 @@ fn storage_report() {
     let bin_dir = tree_size(&data.join("bin"));
     let batches_sz = tree_size(&batches);
 
-    status_line(true, "storage");
-    println!(
-        "        {DIM}data dir {} — {} (index.lance {}, bin {}, batches {}){RESET}",
-        data.display(),
-        human_size(total),
-        human_size(index),
-        human_size(bin_dir),
-        human_size(batches_sz),
-    );
-
     let pending = crate::index::staged_batch_count_in(&batches);
     let quarantined = crate::index::staged_batch_count_in(&batches.join("quarantine"));
-    if pending > 0 || quarantined > 0 {
-        println!("        {DIM}batches: {pending} pending, {quarantined} quarantined{RESET}");
-    }
 
     // leftover on-demand build scratch (`swift-build*`). Once the stable
     // helper exists the scratch is pure garbage (binaries live in bin/) and
     // doctor removes STALE instances itself; fresh ones might belong to a
     // concurrent install and are only reported.
+    let mut removed: (usize, u64) = (0, 0);
+    let mut in_progress = 0usize;
+    let mut scratch_pending: (usize, u64) = (0, 0);
     let scratches = crate::helper::swift_build_scratches_in(&data);
     if !scratches.is_empty() {
         let helper_installed = bite_core::config::helper_install_path().exists();
         let now = std::time::SystemTime::now();
-        let mut removed: (usize, u64) = (0, 0);
-        let mut in_progress = 0usize;
-        let mut pending: (usize, u64) = (0, 0);
         for s in &scratches {
             let size = tree_size(s);
             let stale = std::fs::symlink_metadata(s)
@@ -257,39 +347,188 @@ fn storage_report() {
                 }
                 ScratchAction::ReportInProgress => in_progress += 1,
                 ScratchAction::ReportPendingInstall => {
-                    pending = (pending.0 + 1, pending.1 + size);
+                    scratch_pending = (scratch_pending.0 + 1, scratch_pending.1 + size);
                 }
                 ScratchAction::None => {}
             }
-        }
-        if removed.0 > 0 {
-            println!(
-                "        {DIM}removed {} stale swift-build scratch ({}) — build garbage; binaries live in bin/{RESET}",
-                removed.0,
-                human_size(removed.1),
-            );
-        }
-        if in_progress > 0 {
-            println!(
-                "        {YELLOW}{in_progress} swift-build scratch present — a build may be in progress; left alone{RESET}",
-            );
-        }
-        if pending.0 > 0 {
-            println!(
-                "        {YELLOW}{} swift-build scratch present ({}) — the next `bite install-helper` run removes it{RESET}",
-                pending.0,
-                human_size(pending.1),
-            );
         }
     }
 
     // leaked test scratch dirs (panicked/killed runs) accumulate in $TMPDIR
     let tmp_bite = count_bite_prefixed(&std::env::temp_dir());
-    if tmp_bite > 50 {
-        println!(
-            "        {YELLOW}{tmp_bite} bite-* entries in $TMPDIR — likely leaked test scratch dirs, safe to delete{RESET}",
+
+    StorageReport {
+        data_dir: data.display().to_string(),
+        total_bytes: total,
+        index_bytes: index,
+        bin_bytes: bin_dir,
+        batches_bytes: batches_sz,
+        batches_pending: pending,
+        batches_quarantined: quarantined,
+        scratch_removed_count: removed.0,
+        scratch_removed_bytes: removed.1,
+        scratch_in_progress: in_progress,
+        scratch_pending_install_count: scratch_pending.0,
+        scratch_pending_install_bytes: scratch_pending.1,
+        tmpdir_bite_entries: tmp_bite,
+    }
+}
+
+/// The classic human report, byte-for-byte the pre-JSON output.
+fn render_human(report: &DoctorReport, fix: bool) -> String {
+    let mut out = String::new();
+    macro_rules! line {
+        ($($arg:tt)*) => {{
+            out.push_str(&format!($($arg)*));
+            out.push('\n');
+        }};
+    }
+
+    line!("bite doctor");
+    line!("{}", DIM.repeat(60));
+
+    // ── OS / toolchain ──
+    match &report.os {
+        Some(detail) => {
+            line!("{}", status_line(true, "macOS 13+"));
+            line!("        {DIM}{detail}{RESET}");
+        }
+        None => line!("{}", status_line(false, "macOS 13+")),
+    }
+    match &report.toolchain {
+        Some(detail) => {
+            line!("{}", status_line(true, "Xcode Command Line Tools"));
+            line!("        {DIM}{detail}{RESET}");
+        }
+        None => line!("{}", status_line(false, "Xcode Command Line Tools")),
+    }
+
+    // ── Helper ──
+    if report.helper.ok {
+        let path = report.helper.path.as_deref().unwrap_or("?");
+        line!("{}", status_line(true, &format!("native helper ({path})")));
+        line!(
+            "        {DIM}capabilities: {}{RESET}",
+            report.helper.capabilities.join(", ")
+        );
+    } else {
+        line!("{}", status_line(false, "native helper"));
+        line!(
+            "        {RED}{}{RESET}",
+            report.helper.error.as_deref().unwrap_or_default()
+        );
+        if fix {
+            line!("        {DIM}→ run: bite install-helper --force{RESET}");
+        }
+    }
+
+    // ── Per-app permission probes ──
+    line!("");
+    for app in &report.apps {
+        line!("{}", status_line(app.ok, &app.app));
+        if let Some(note) = &app.note {
+            let color = if app.ok { DIM } else { RED };
+            line!("        {color}{note}{RESET}");
+        }
+    }
+
+    // ── Crawler Mail-automation identity ──
+    if let Some(crawl) = &report.crawler_mail {
+        match crawl.state.as_str() {
+            "no_accounts" => {
+                line!("{}", status_line(true, "crawler Mail automation"));
+                line!("        {DIM}Mail has no accounts configured — nothing to index{RESET}");
+            }
+            "authorized" => {
+                line!("{}", status_line(true, "crawler Mail automation"));
+            }
+            "denied" => {
+                line!("{}", status_line(false, "crawler Mail automation"));
+                line!(
+                    "        {YELLOW}{}{RESET}",
+                    crawl.detail.as_deref().unwrap_or_default()
+                );
+                line!("        {DIM}→ approve the Mail automation prompt once, from your terminal{RESET}");
+            }
+            _ => {
+                line!("        {DIM}probe failed to run{RESET}");
+            }
+        }
+    }
+
+    // ── Storage ──
+    line!("");
+    let s = &report.storage;
+    line!("{}", status_line(true, "storage"));
+    line!(
+        "        {DIM}data dir {} — {} (index.lance {}, bin {}, batches {}){RESET}",
+        s.data_dir,
+        human_size(s.total_bytes),
+        human_size(s.index_bytes),
+        human_size(s.bin_bytes),
+        human_size(s.batches_bytes),
+    );
+    if s.batches_pending > 0 || s.batches_quarantined > 0 {
+        line!(
+            "        {DIM}batches: {} pending, {} quarantined{RESET}",
+            s.batches_pending,
+            s.batches_quarantined
         );
     }
+    if s.scratch_removed_count > 0 {
+        line!(
+            "        {DIM}removed {} stale swift-build scratch ({}) — build garbage; binaries live in bin/{RESET}",
+            s.scratch_removed_count,
+            human_size(s.scratch_removed_bytes),
+        );
+    }
+    if s.scratch_in_progress > 0 {
+        line!(
+            "        {YELLOW}{} swift-build scratch present — a build may be in progress; left alone{RESET}",
+            s.scratch_in_progress,
+        );
+    }
+    if s.scratch_pending_install_count > 0 {
+        line!(
+            "        {YELLOW}{} swift-build scratch present ({}) — the next `bite install-helper` run removes it{RESET}",
+            s.scratch_pending_install_count,
+            human_size(s.scratch_pending_install_bytes),
+        );
+    }
+    if s.tmpdir_bite_entries > 50 {
+        line!(
+            "        {YELLOW}{} bite-* entries in $TMPDIR — likely leaked test scratch dirs, safe to delete{RESET}",
+            s.tmpdir_bite_entries,
+        );
+    }
+
+    // ── Agent clients ──
+    line!("");
+    for c in &report.clients {
+        let (icon, color) = if c.installed {
+            ("✓", GREEN)
+        } else if c.detected {
+            ("○", YELLOW)
+        } else {
+            (" ", DIM)
+        };
+        line!(
+            "  {color}{icon}{RESET} {deg:<11} {DIM}{key}{RESET}",
+            deg = c.display,
+            key = c.key
+        );
+        if c.detected && !c.installed {
+            line!("      {DIM}→ run `bite setup` to register the MCP server{RESET}");
+        }
+    }
+
+    line!("{}", DIM.repeat(60));
+    if report.problems == 0 {
+        line!("{GREEN}all checks passed{RESET}");
+    } else {
+        line!("{YELLOW}{} issue(s) found{RESET}", report.problems);
+    }
+    out
 }
 
 /// du-style byte size of a path: metadata-only walk, symlinks not followed,
@@ -386,9 +625,9 @@ fn scratch_action(present: bool, helper_installed: bool, stale: bool) -> Scratch
     }
 }
 
-fn status_line(ok: bool, label: &str) {
+fn status_line(ok: bool, label: &str) -> String {
     let (icon, color) = if ok { ("✓", GREEN) } else { ("✗", RED) };
-    println!("  {color}{icon}{RESET} {label}");
+    format!("  {color}{icon}{RESET} {label}")
 }
 
 #[cfg(test)]
@@ -453,5 +692,200 @@ mod tests {
         assert_eq!(scratch_action(true, false, true), A::ReportPendingInstall);
         // not installed + fresh → recent failed/in-progress compile: report only
         assert_eq!(scratch_action(true, false, false), A::ReportInProgress);
+    }
+
+    #[test]
+    fn app_state_mapping_workable_vs_denied() {
+        // granted (incl. write-only Mail) → clean, no note
+        assert_eq!(app_state_note("authorized"), (true, None));
+        assert_eq!(app_state_note("write_only"), (true, None));
+        // pending first-use prompt is fine — that's the normal fresh install
+        assert_eq!(
+            app_state_note("not_determined"),
+            (
+                true,
+                Some("a system prompt appears on first use".to_string())
+            )
+        );
+        assert_eq!(
+            app_state_note("will_prompt_on_first_use"),
+            (
+                true,
+                Some("a system prompt appears on first use".to_string())
+            )
+        );
+        // denials and missing apps are the real problems
+        assert_eq!(
+            app_state_note("denied"),
+            (false, Some("denied in System Settings".to_string()))
+        );
+        assert_eq!(
+            app_state_note("restricted"),
+            (false, Some("denied in System Settings".to_string()))
+        );
+        assert_eq!(
+            app_state_note("denied_or_unavailable"),
+            (false, Some("denied or app missing".to_string()))
+        );
+        assert_eq!(
+            app_state_note("app_missing"),
+            (false, Some("app not installed".to_string()))
+        );
+        // unknown future states stay workable and surface themselves
+        assert_eq!(
+            app_state_note("someday_new_state"),
+            (true, Some("someday_new_state".to_string()))
+        );
+    }
+
+    fn sample_report() -> DoctorReport {
+        DoctorReport {
+            os: Some("macOS 15 (major 15)".to_string()),
+            toolchain: Some("/usr/bin/swiftc".to_string()),
+            helper: HelperStatus {
+                ok: true,
+                path: Some("/x/bite/bin/bite-helper".to_string()),
+                capabilities: vec!["calendar".to_string(), "mail".to_string()],
+                error: None,
+            },
+            apps: vec![
+                AppStatus {
+                    app: "calendar".to_string(),
+                    state: "authorized".to_string(),
+                    ok: true,
+                    note: None,
+                },
+                AppStatus {
+                    app: "reminders".to_string(),
+                    state: "denied".to_string(),
+                    ok: false,
+                    note: Some("denied in System Settings".to_string()),
+                },
+            ],
+            crawler_mail: Some(CrawlerMailStatus {
+                state: "denied".to_string(),
+                detail: Some("not authorized".to_string()),
+            }),
+            storage: StorageReport {
+                data_dir: "/x/bite".to_string(),
+                total_bytes: 4096,
+                index_bytes: 2048,
+                bin_bytes: 1024,
+                batches_bytes: 512,
+                batches_pending: 1,
+                batches_quarantined: 2,
+                scratch_removed_count: 1,
+                scratch_removed_bytes: 700,
+                scratch_in_progress: 0,
+                scratch_pending_install_count: 0,
+                scratch_pending_install_bytes: 0,
+                tmpdir_bite_entries: 3,
+            },
+            clients: vec![
+                ClientStatus {
+                    key: "claude".to_string(),
+                    display: "Claude Code".to_string(),
+                    detected: true,
+                    installed: true,
+                },
+                ClientStatus {
+                    key: "codex".to_string(),
+                    display: "Codex CLI".to_string(),
+                    detected: true,
+                    installed: false,
+                },
+            ],
+            problems: 1,
+        }
+    }
+
+    #[test]
+    fn json_report_has_every_section() {
+        let v = serde_json::to_value(sample_report()).unwrap();
+        for key in [
+            "os",
+            "toolchain",
+            "helper",
+            "apps",
+            "crawler_mail",
+            "storage",
+            "clients",
+            "problems",
+        ] {
+            assert!(v.get(key).is_some(), "missing top-level key {key}");
+        }
+        // helper shape: path + capabilities when up
+        assert_eq!(v["helper"]["path"], "/x/bite/bin/bite-helper");
+        assert_eq!(v["helper"]["capabilities"][0], "calendar");
+        // app rows carry the raw state next to the verdict
+        assert_eq!(v["apps"][1]["state"], "denied");
+        assert_eq!(v["apps"][1]["ok"], false);
+        // storage sizes are raw bytes (scripts do their own units)
+        assert_eq!(v["storage"]["total_bytes"], 4096);
+        assert_eq!(v["storage"]["batches_quarantined"], 2);
+        // clients expose the tri-state the human icons encode
+        assert_eq!(v["clients"][0]["installed"], true);
+        assert_eq!(v["clients"][1]["detected"], true);
+        assert_eq!(v["clients"][1]["installed"], false);
+        // problems mirrors the exit-code contract (0 clean / 2 problems)
+        assert_eq!(v["problems"], 1);
+    }
+
+    #[test]
+    fn json_report_helper_down_has_no_apps() {
+        let mut r = sample_report();
+        r.helper = HelperStatus {
+            ok: false,
+            path: None,
+            capabilities: Vec::new(),
+            error: Some("no Swift toolchain found".to_string()),
+        };
+        r.apps.clear();
+        let v = serde_json::to_value(&r).unwrap();
+        assert_eq!(v["helper"]["ok"], false);
+        assert_eq!(v["helper"]["error"], "no Swift toolchain found");
+        // empty apps = not probed (helper down), not "all granted"
+        assert_eq!(v["apps"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn human_render_keeps_the_classic_shape() {
+        let text = render_human(&sample_report(), false);
+        let lines: Vec<&str> = text.split('\n').collect();
+        assert_eq!(lines[0], "bite doctor");
+        // verdict line is the last content line (before the trailing "")
+        let last = lines[lines.len() - 2];
+        assert!(last.contains("1 issue(s) found"), "got: {last}");
+        // per-app note and fix-free helper failure text
+        assert!(text.contains("denied in System Settings"));
+        assert!(!text.contains("→ run: bite install-helper --force"));
+        // storage detail keeps the human units
+        assert!(text.contains("data dir /x/bite — 4.0 KB (index.lance 2.0 KB"));
+        // client tri-state renders with the setup hint for detected-only
+        assert!(text.contains("→ run `bite setup` to register the MCP server"));
+        // every line ends with a newline
+        assert!(text.ends_with('\n'));
+    }
+
+    #[test]
+    fn human_render_fix_hint_only_when_asked() {
+        let mut r = sample_report();
+        r.helper.ok = false;
+        r.helper.path = None;
+        r.helper.capabilities = Vec::new();
+        r.helper.error = Some("boom".to_string());
+        let with_fix = render_human(&r, true);
+        assert!(with_fix.contains("→ run: bite install-helper --force"));
+        let without_fix = render_human(&r, false);
+        assert!(!without_fix.contains("→ run: bite install-helper --force"));
+    }
+
+    #[test]
+    fn human_render_clean_report_passes() {
+        let mut r = sample_report();
+        r.problems = 0;
+        let text = render_human(&r, false);
+        assert!(text.contains("all checks passed"));
+        assert!(!text.contains("issue(s) found"));
     }
 }

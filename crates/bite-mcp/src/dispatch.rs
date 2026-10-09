@@ -44,7 +44,7 @@ fn dispatch(cli: crate::cli::Cli) -> Result<i32, BiteError> {
     match cli.cmd {
         Cmd::Mcp => Ok(mcp::serve()),
         Cmd::Setup { all_clients, yes } => setup::run(all_clients, yes),
-        Cmd::Doctor { fix, probe } => doctor::run(fix, probe),
+        Cmd::Doctor { fix, probe } => doctor::run(fix, probe, json_out),
         Cmd::InstallHelper { force } => {
             let path = crate::helper::install_helper(force)?;
             println!("helper installed at {}", path.display());

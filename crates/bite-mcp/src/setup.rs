@@ -24,7 +24,7 @@ pub fn run(all_clients: bool, yes: bool) -> Result<i32, bite_core::BiteError> {
 
     // 2. doctor (prompt-free)
     println!();
-    doctor::run(false, false)?;
+    doctor::run(false, false, false)?;
 
     // 3. agent clients
     println!();
