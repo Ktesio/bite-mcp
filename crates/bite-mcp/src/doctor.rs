@@ -27,6 +27,9 @@ pub struct DoctorReport {
     /// Crawler Mail-automation probe; None when `bite-crawl` isn't installed.
     pub crawler_mail: Option<CrawlerMailStatus>,
     pub storage: StorageReport,
+    /// Build-tree usage — Some only when this exe sits under a cargo
+    /// workspace `target/` (a dev checkout); None for installed copies.
+    pub dev_target: Option<DevTarget>,
     pub clients: Vec<ClientStatus>,
     /// Count of failed checks — the human `N issue(s) found` and exit code 2.
     pub problems: usize,
@@ -92,6 +95,18 @@ pub struct ClientStatus {
     pub detected: bool,
     /// MCP server entry written into the client's config.
     pub installed: bool,
+}
+
+/// Build-tree disk usage when this binary runs straight out of a cargo
+/// workspace checkout (`target/debug` / `target/release`). Informational —
+/// the README's "run `cargo clean` when it hurts" note now has a number
+/// next to it. None for installed copies (no `target/` ancestor).
+#[derive(serde::Serialize, Debug)]
+pub struct DevTarget {
+    /// The workspace root carrying the `Cargo.toml`.
+    pub root: String,
+    /// du-style size of `target/`, raw bytes.
+    pub target_bytes: u64,
 }
 
 pub fn run(fix: bool, probe: bool, json_out: bool) -> Result<i32, bite_core::BiteError> {
@@ -265,6 +280,7 @@ fn collect(fix: bool, probe: bool) -> Result<DoctorReport, bite_core::BiteError>
 
     // ── Storage ──
     let storage = collect_storage();
+    let dev_target = collect_dev_target();
 
     // ── Agent clients ──
     let mut client_status = Vec::new();
@@ -284,6 +300,7 @@ fn collect(fix: bool, probe: bool) -> Result<DoctorReport, bite_core::BiteError>
         apps,
         crawler_mail,
         storage,
+        dev_target,
         clients: client_status,
         problems,
     })
@@ -372,6 +389,39 @@ fn collect_storage() -> StorageReport {
         scratch_pending_install_bytes: scratch_pending.1,
         tmpdir_bite_entries: tmp_bite,
     }
+}
+
+/// Detect "this exe runs straight out of a cargo workspace build tree" and
+/// size that tree's `target/`. The dev note in README § Development says
+/// `target/` grows into many GB and `cargo clean` is the fix when it hurts
+/// — doctor now shows the number so "when it hurts" is a figure, not a
+/// feeling. Only matches a REAL checkout: the exe must live in
+/// `<workspace>/target/{debug,release}` and the workspace must carry a
+/// `Cargo.toml`; installed copies (homebrew, `~/.local/bin`, …) sit in bin
+/// dirs like `/usr/local/bin` and never match, so they stay quiet.
+/// Informational only — never a problem, never prompts.
+fn collect_dev_target() -> Option<DevTarget> {
+    detect_dev_target_at(&std::env::current_exe().ok()?)
+}
+
+/// Same detection with an explicit exe path (unit-testable).
+fn detect_dev_target_at(exe: &std::path::Path) -> Option<DevTarget> {
+    let profile = exe.parent()?; // …/target/<profile>
+    if !matches!(profile.file_name()?.to_str()?, "debug" | "release") {
+        return None;
+    }
+    let target = profile.parent()?; // …/target
+    if target.file_name()?.to_str()? != "target" {
+        return None;
+    }
+    let root = target.parent()?; // the workspace root
+    if !root.join("Cargo.toml").is_file() {
+        return None;
+    }
+    Some(DevTarget {
+        root: root.display().to_string(),
+        target_bytes: tree_size(&target.join("debug")) + tree_size(&target.join("release")),
+    })
 }
 
 /// The classic human report, byte-for-byte the pre-JSON output.
@@ -499,6 +549,13 @@ fn render_human(report: &DoctorReport, fix: bool) -> String {
         line!(
             "        {YELLOW}{} bite-* entries in $TMPDIR — likely leaked test scratch dirs, safe to delete{RESET}",
             s.tmpdir_bite_entries,
+        );
+    }
+    // ── cargo build tree (dev checkouts only; installed copies skip) ──
+    if let Some(dt) = &report.dev_target {
+        line!(
+            "        {DIM}cargo target {} — `cargo clean` reclaims it{RESET}",
+            human_size(dt.target_bytes)
         );
     }
 
@@ -781,6 +838,10 @@ mod tests {
                 scratch_pending_install_bytes: 0,
                 tmpdir_bite_entries: 3,
             },
+            dev_target: Some(DevTarget {
+                root: "/ws".to_string(),
+                target_bytes: 3 * 1024 * 1024 * 1024,
+            }),
             clients: vec![
                 ClientStatus {
                     key: "claude".to_string(),
@@ -846,6 +907,38 @@ mod tests {
         assert_eq!(v["helper"]["error"], "no Swift toolchain found");
         // empty apps = not probed (helper down), not "all granted"
         assert_eq!(v["apps"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn json_report_installed_copy_has_no_dev_target() {
+        let mut r = sample_report();
+        r.dev_target = None;
+        let v = serde_json::to_value(&r).unwrap();
+        assert!(v.get("dev_target").is_some(), "key must exist");
+        assert_eq!(v["dev_target"], serde_json::Value::Null);
+        let text = render_human(&r, false);
+        assert!(!text.contains("cargo target"), "got: {text}");
+    }
+
+    #[test]
+    fn dev_target_matches_only_real_workspace_checkouts() {
+        // …/ws/target/debug/bite — a real dev checkout: detected + sized.
+        let ws = tempfile::tempdir().unwrap();
+        let profile_dir = ws.path().join("target").join("debug");
+        std::fs::create_dir_all(&profile_dir).unwrap();
+        std::fs::write(ws.path().join("Cargo.toml"), "[workspace]\n").unwrap();
+        std::fs::write(profile_dir.join("bite"), b"bin").unwrap();
+        let dt = detect_dev_target_at(&profile_dir.join("bite")).expect("checkout detected");
+        assert_eq!(dt.root, ws.path().display().to_string());
+        assert_eq!(dt.target_bytes, 3); // the one file we wrote
+
+        // no Cargo.toml at the root → installed-copy layout, stays quiet
+        std::fs::remove_file(ws.path().join("Cargo.toml")).unwrap();
+        assert!(detect_dev_target_at(&profile_dir.join("bite")).is_none());
+
+        // exe in a plain bin dir (e.g. ~/.local/bin) → never matches
+        let bin = tempfile::tempdir().unwrap();
+        assert!(detect_dev_target_at(&bin.path().join("bite")).is_none());
     }
 
     #[test]
