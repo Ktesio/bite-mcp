@@ -385,7 +385,7 @@ fn render_human(report: &DoctorReport, fix: bool) -> String {
     }
 
     line!("bite doctor");
-    line!("{}", DIM.repeat(60));
+    line!("{DIM}{}{RESET}", "─".repeat(60));
 
     // ── OS / toolchain ──
     match &report.os {
@@ -522,7 +522,7 @@ fn render_human(report: &DoctorReport, fix: bool) -> String {
         }
     }
 
-    line!("{}", DIM.repeat(60));
+    line!("{DIM}{}{RESET}", "─".repeat(60));
     if report.problems == 0 {
         line!("{GREEN}all checks passed{RESET}");
     } else {
