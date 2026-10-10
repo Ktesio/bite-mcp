@@ -384,6 +384,15 @@ fn spawn_crawl(params: &Value) -> Result<Value, BiteError> {
     {
         cmd.arg("--no-body");
     }
+    // full: bypass the since-last-completed delta window and replay the
+    // entire 365-day schedule (the worker decides; forwarded verbatim)
+    if params
+        .get("full")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
+        cmd.arg("--full");
+    }
     let child = cmd
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -704,6 +713,14 @@ pub fn wipe(confirm: bool) -> Result<Value, BiteError> {
             .wipe()
             .map_err(|e| BridgeError::new("index_error", e.to_string()))?;
         let _ = std::fs::remove_dir_all(staging());
+        // crawl-state.json too: it carries the delta watermark
+        // (mail_completed_at). A wiped index must never look "already
+        // crawled up to <recent>" to the next run — that would skip the
+        // backfill entirely on a delta and leave the fresh index with a
+        // single recent window. Stale crawl.pid is also gone so nothing
+        // references the dead run.
+        let _ = std::fs::remove_file(bite_core::config::data_dir().join("crawl-state.json"));
+        let _ = std::fs::remove_file(bite_core::config::data_dir().join("crawl.pid"));
         Ok(json!({ "wiped": true }))
     })
 }

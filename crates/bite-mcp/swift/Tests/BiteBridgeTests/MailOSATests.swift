@@ -964,4 +964,94 @@ final class MailOSATests: XCTestCase {
         XCTAssertEqual(BulkSelection(unread: false).label, "read")
         XCTAssertEqual(BulkSelection(unread: true, olderThanDays: 7).label, "unread AND olderThanDays=7")
     }
+
+    // ── incremental crawl planning ──
+
+    func testCrawlPlanFullWithoutWatermark() {
+        let now: Int64 = 1_800_000_000_000
+        let plan = MailCrawler.crawlPlan(nowMs: now, lastCompletedAtMs: nil, forceFull: false, windowDays: 30)
+        // lead window + 34 backfill windows = 35 (historic schedule shape)
+        XCTAssertEqual(plan.count, 35)
+        XCTAssertEqual(plan[0].kind, "lead")
+        XCTAssertEqual(plan[0].window.toMs, now)
+        XCTAssertEqual(plan[0].window.fromMs, now - 30 * 86_400_000)
+        XCTAssertTrue(plan.dropFirst().allSatisfy { $0.kind == "backfill" })
+        // contiguous: each backfill window's toMs is the previous fromMs
+        for i in 1..<plan.count {
+            XCTAssertEqual(plan[i].toMs, plan[i - 1].fromMs)
+        }
+        // horizon: oldest edge never below now - 365d
+        XCTAssertGreaterThanOrEqual(plan.last!.window.fromMs, now - 365 * 86_400_000)
+    }
+
+    func testCrawlPlanDeltaWithFreshWatermark() {
+        let now: Int64 = 1_800_000_000_000
+        let day: Int64 = 86_400_000
+        // completed 3 days ago → one delta window [completed - 2d, now]
+        let completed = now - 3 * day
+        let plan = MailCrawler.crawlPlan(nowMs: now, lastCompletedAtMs: completed, forceFull: false, windowDays: 30)
+        XCTAssertEqual(plan.count, 1)
+        XCTAssertEqual(plan[0].kind, "delta")
+        XCTAssertEqual(plan[0].window.toMs, now)
+        XCTAssertEqual(plan[0].window.fromMs, completed - 2 * day)
+    }
+
+    func testCrawlPlanFallsBackWhenStale() {
+        let now: Int64 = 1_800_000_000_000
+        let day: Int64 = 86_400_000
+        // 8 days old > 7-day max age → full schedule again
+        let plan = MailCrawler.crawlPlan(nowMs: now, lastCompletedAtMs: now - 8 * day, forceFull: false, windowDays: 30)
+        XCTAssertEqual(plan.count, 35)
+        XCTAssertEqual(plan[0].kind, "lead")
+    }
+
+    func testCrawlPlanBoundaryIsInclusive() {
+        let now: Int64 = 1_800_000_000_000
+        let day: Int64 = 86_400_000
+        // exactly 7 days old: still a delta (the boundary is inclusive so a
+        // daily auto-refresh never degrades to a full replay by 1 ms of skew)
+        let plan = MailCrawler.crawlPlan(nowMs: now, lastCompletedAtMs: now - 7 * day, forceFull: false, windowDays: 30)
+        XCTAssertEqual(plan.count, 1)
+        XCTAssertEqual(plan[0].kind, "delta")
+    }
+
+    func testCrawlPlanForceFullOverridesWatermark() {
+        let now: Int64 = 1_800_000_000_000
+        let day: Int64 = 86_400_000
+        let plan = MailCrawler.crawlPlan(nowMs: now, lastCompletedAtMs: now - day, forceFull: true, windowDays: 30)
+        XCTAssertEqual(plan.count, 35)
+        XCTAssertEqual(plan[0].kind, "lead")
+    }
+
+    func testCrawlPlanFutureWatermarkRejected() {
+        let now: Int64 = 1_800_000_000_000
+        // clock skew (watermark in the future) must not fabricate a negative
+        // window — fall back to the full plan
+        let plan = MailCrawler.crawlPlan(nowMs: now, lastCompletedAtMs: now + 60_000, forceFull: false, windowDays: 30)
+        XCTAssertEqual(plan.count, 35)
+    }
+
+    func testCrawlPlanDeltaClampedToHorizon() {
+        let now: Int64 = 1_800_000_000_000
+        let day: Int64 = 86_400_000
+        // fresh watermark but absurdly far in the past can't happen via age
+        // gating; the clamp still guarantees the window bottom never drops
+        // below the 365-day horizon
+        let plan = MailCrawler.crawlPlan(nowMs: now, lastCompletedAtMs: now - 6 * day, forceFull: false, windowDays: 30)
+        XCTAssertEqual(plan.count, 1)
+        XCTAssertGreaterThanOrEqual(plan[0].window.fromMs, now - 365 * day)
+    }
+
+    func testCrawlPlanWindowDaysPinsLeadWidth() {
+        let now: Int64 = 1_800_000_000_000
+        let day: Int64 = 86_400_000
+        let plan = MailCrawler.crawlPlan(nowMs: now, lastCompletedAtMs: nil, forceFull: false, windowDays: 90)
+        XCTAssertEqual(plan[0].kind, "lead")
+        XCTAssertEqual(plan[0].window.fromMs, now - 90 * day)
+        // 90-day lead → 10-day backfill covers the remaining 275 days
+        XCTAssertEqual(plan.count, 29)
+        // non-positive windowDays falls back to the 30-day default
+        let def = MailCrawler.crawlPlan(nowMs: now, lastCompletedAtMs: nil, forceFull: false, windowDays: 0)
+        XCTAssertEqual(def[0].window.fromMs, now - 30 * day)
+    }
 }
