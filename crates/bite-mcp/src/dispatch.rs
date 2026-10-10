@@ -599,10 +599,14 @@ fn dispatch(cli: crate::cli::Cli) -> Result<i32, BiteError> {
                 crate::cli::IndexCmd::Rebuild {
                     window_days,
                     mailbox,
+                    full,
                 } => {
                     let mut p = Map::new();
                     insert_opt(&mut p, "window_days", window_days);
                     insert_opt(&mut p, "mailbox", mailbox);
+                    if full {
+                        p.insert("full".into(), json!(true));
+                    }
                     finish(crate::index::run_local_unwrapped(
                         "index_rebuild",
                         &Value::Object(p),

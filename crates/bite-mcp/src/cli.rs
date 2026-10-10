@@ -164,12 +164,16 @@ pub enum MailBulkCmd {
 
 #[derive(Subcommand, Debug)]
 pub enum IndexCmd {
-    /// Rebuild/refresh the entity index (30-day window + background backfill)
+    /// Rebuild/refresh the entity index (30-day window + background backfill;
+    /// delta window since the last completed crawl when fresh — --full replays
+    /// the whole 365-day schedule)
     Rebuild {
         #[arg(long)]
         window_days: Option<i64>,
         #[arg(long)]
         mailbox: Option<String>,
+        #[arg(long)]
+        full: bool,
     },
     /// Index state: rows, freshness, pending crawl batches
     Status,
