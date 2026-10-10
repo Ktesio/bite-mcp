@@ -49,7 +49,9 @@ One command, four stages, in order:
 3. **`bite doctor`** — a prompt-free environment check: macOS version,
    helper presence and capabilities, per-app permission status. This is
    read-only; it never triggers prompts (that's what `--probe` is for —
-   see [permissions.md](permissions.md)).
+   see [permissions.md](permissions.md)). Add `--json` for the same report
+   as one compact machine-readable object (exit codes unchanged:
+   0 clean, 2 problems).
 4. **Agent clients** — for every agent CLI it detects (by config file or
    binary on `PATH`), bite asks once:
 

@@ -37,6 +37,9 @@ needs **Full Disk Access** for the terminal/agent app. Without FDA,
   running — launch Mail before permission-chasing.
 - `bite doctor --fix` opens the matching System Settings pane for anything
   denied.
+- `bite doctor --json` prints the same report as one compact JSON object
+  (helper, per-app raw states, storage, clients) for scripts and CI; the
+  exit code (0 clean / 2 problems) is identical to the human form.
 
 ## Recovery flows
 
