@@ -978,7 +978,7 @@ final class MailOSATests: XCTestCase {
         XCTAssertTrue(plan.dropFirst().allSatisfy { $0.kind == "backfill" })
         // contiguous: each backfill window's toMs is the previous fromMs
         for i in 1..<plan.count {
-            XCTAssertEqual(plan[i].toMs, plan[i - 1].fromMs)
+            XCTAssertEqual(plan[i].window.toMs, plan[i - 1].window.fromMs)
         }
         // horizon: oldest edge never below now - 365d
         XCTAssertGreaterThanOrEqual(plan.last!.window.fromMs, now - 365 * 86_400_000)
