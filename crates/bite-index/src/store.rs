@@ -290,7 +290,8 @@ impl EntityIndex {
                 updated_rows += (result.num_updated_rows + result.num_inserted_rows) as usize;
             }
             // First-time FTS index creation once rows exist; afterwards the
-            // index is refreshed lazily by the crawler job completion path.
+            // control plane folds new rows in via `refresh_fts` once the
+            // crawl settles (see bite-mcp index.rs refresh_fts_if_crawl_settled).
             if !self.has_fts().await? {
                 self.create_fts().await?;
             }
