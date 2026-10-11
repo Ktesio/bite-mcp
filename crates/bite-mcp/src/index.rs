@@ -415,6 +415,20 @@ fn spawn_crawl(params: &Value) -> Result<Value, BiteError> {
 
 // ── index-backed search (fast path) ──
 
+/// Upper bound for client-supplied search limits. Each hit embeds a content
+/// snippet, so the limit trades response size against latency; 200 keeps a
+/// single MCP response well inside frame limits no matter what the client asks.
+pub const MAX_SEARCH_LIMIT: u64 = 200;
+const DEFAULT_SEARCH_LIMIT: u64 = 20;
+
+fn search_limit(params: &Value) -> usize {
+    params
+        .get("limit")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(DEFAULT_SEARCH_LIMIT)
+        .clamp(1, MAX_SEARCH_LIMIT) as usize
+}
+
 fn search_params_to_query(params: &Value) -> bite_index::SearchQuery {
     let g = |k: &str| params.get(k).and_then(|v| v.as_str()).map(String::from);
     bite_index::SearchQuery {
@@ -433,7 +447,7 @@ fn search_params_to_query(params: &Value) -> bite_index::SearchQuery {
             .get("until")
             .and_then(|v| v.as_str())
             .and_then(bite_core::dates::parse_to_epoch_ms),
-        limit: params.get("limit").and_then(|v| v.as_u64()).unwrap_or(20) as usize,
+        limit: search_limit(params),
         participant_like: None,
         title_like: g("subject").map(|s| format!("%{s}%")),
         content_like: g("body").map(|s| format!("%{s}%")),
@@ -921,6 +935,26 @@ fn bulk_spawn(name: &str, params: &Value) -> Result<Value, BiteError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn search_limit_defaults_to_20() {
+        assert_eq!(search_limit(&json!({})), 20);
+        assert_eq!(search_limit(&json!({ "limit": null })), 20);
+        assert_eq!(search_limit(&json!({ "limit": "50" })), 20); // non-number ignored
+    }
+
+    #[test]
+    fn search_limit_clamps_client_supplied_values() {
+        // within range passes through
+        assert_eq!(search_limit(&json!({ "limit": 1 })), 1);
+        assert_eq!(search_limit(&json!({ "limit": 50 })), 50);
+        assert_eq!(search_limit(&json!({ "limit": 200 })), 200);
+        // above the cap clamps down (was: u64::MAX → usize cast, unbounded scan)
+        assert_eq!(search_limit(&json!({ "limit": 100_000 })), 200);
+        assert_eq!(search_limit(&json!({ "limit": u64::MAX })), 200);
+        // zero floors to 1 (store.query() already floors; keep that contract)
+        assert_eq!(search_limit(&json!({ "limit": 0 })), 1);
+    }
 
     #[test]
     fn staleness_units_are_milliseconds() {

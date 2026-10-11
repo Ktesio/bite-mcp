@@ -244,7 +244,7 @@ pub static TOOLS: &[Tool] = &[
             ParamSpec::opt("flagged", ParamKind::Bool, "flag filter"),
             ParamSpec::opt("since", ParamKind::Date, "sent at/after"),
             ParamSpec::opt("until", ParamKind::Date, "sent before"),
-            ParamSpec::opt("limit", ParamKind::Int, "max results (default 20)"),
+            ParamSpec::opt("limit", ParamKind::Int, "max results (default 20, capped at 200)"),
             ParamSpec::opt("max_scan", ParamKind::Int, "max messages examined (default 400)"),
         ]),
     t("mail_message_get", App::Mail, "mail.message_get",
@@ -453,7 +453,7 @@ pub static TOOLS: &[Tool] = &[
         ps![
             ParamSpec::req("query", ParamKind::Str, "full-text query"),
             ParamSpec::opt("app", ParamKind::Str, "scope to one app (mail/calendar/reminders/contacts/notes/messages)"),
-            ParamSpec::opt("limit", ParamKind::Int, "max results (default 20)"),
+            ParamSpec::opt("limit", ParamKind::Int, "max results (default 20, capped at 200)"),
         ]),
 
     // ─── Messages ───────────────────────────────────────────────────────────
