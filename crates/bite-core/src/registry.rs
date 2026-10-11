@@ -436,10 +436,11 @@ pub static TOOLS: &[Tool] = &[
 
     // ─── Entity index ───────────────────────────────────────────────────────
     t("index_rebuild", App::Index, "index.crawl",
-        "Rebuild/refresh the bite entity index for Mail: crawls a 30-day window first, then 10-day backfill batches in the background. Poll index_status for progress. Fast local search serves from the index once populated.",
+        "Rebuild/refresh the bite entity index for Mail. When the last crawl completed recently (within 7 days), runs a fast delta window covering only what changed since — pass full: true for the entire 30-day window + 10-day backfill schedule. Poll index_status for progress. Fast local search serves from the index once populated.",
         ps![
             ParamSpec::opt("window_days", ParamKind::Int, "initial window in days (default 30; backfill continues in 10-day batches)"),
             ParamSpec::opt("mailbox", ParamKind::Str, "restrict crawl to one mailbox name"),
+            ParamSpec::opt("full", ParamKind::Bool, "skip the delta fast path and replay the full 365-day schedule"),
         ]),
     t("index_status", App::Index, "index.crawl_status",
         "Entity index state: rows per app, freshness, FTS index, pending crawl batches.",

@@ -185,11 +185,21 @@ account that merge-insert can never match against the normalized "" —
 they persist alongside their re-ingested replacements until `index_wipe`
 (or a manual delete) removes them; no crawl rewrites them.
 
-Coverage: the newest 30 days first, then 10-day backfill batches to a
-365-day horizon (~34 windows per job); each mailbox×window walk covers at
-most 20,000 messages and also stops at its window's date edge.
-`window_days` is currently accepted (tool param and `--window-days`) but
-ignored by the worker, and store-body-off (`--no-body`) is currently
+Coverage: the first crawl runs the newest 30 days first, then 10-day
+backfill batches to a 365-day horizon (35 windows per job); each
+mailbox×window walk covers at most 20,000 messages and also stops at its
+window's date edge. Every later crawl whose predecessor completed within 7
+days runs as a DELTA instead: one window reaching from the previous
+completion watermark (crawl-state `mail_completed_at`, stamped only by a
+genuinely `done` Mail crawl) minus a 2-day overlap margin to now. Re-reads
+are free — ingest upserts by `(app, account, id)` — and a stale, failed or
+cancelled predecessor automatically falls back to the full schedule, so a
+partial crawl can never advance the delta baseline. `index_wipe` clears the
+watermark along with the index (a wiped index always re-runs the full
+schedule); `index_rebuild` with `full: true` (CLI `bite index rebuild
+--full`, worker `--full`) forces the full replay explicitly.
+`window_days` is accepted (tool param and `--window-days`) and pins the
+lead window width of a full plan; store-body-off (`--no-body`) is currently
 reachable only via the undeclared `no_body` MCP param on `index_rebuild` —
 the CLI has no flag.
 

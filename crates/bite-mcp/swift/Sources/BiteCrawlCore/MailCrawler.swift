@@ -286,7 +286,8 @@ public enum MailCrawler {
     }
 
     public static func writeState(jobID: String, state: String, processed: Int, found: Int,
-                                  window: String?, failures: Int? = nil, skipped: Int? = nil) {
+                                  window: String?, failures: Int? = nil, skipped: Int? = nil,
+                                  mailCompletedAtMs: Int64? = nil) {
         // once cancellation is armed ONLY the terminal cancelled state may
         // be written: heartbeats must not clobber it, and a post-cancel
         // failure write must not undo a user cancel (auto-respawn treats
@@ -306,6 +307,17 @@ public enum MailCrawler {
         // (failed → existing+1, done → 0); everything else preserves
         dict["failures"] = failures ?? existingFailureCount()
         dict["skipped"] = skipped ?? existingSkippedCount()
+        // Mail watermark: only a genuinely done MAIL crawl stamps it — a
+        // partial (failed/cancelled) crawl must never advance the delta
+        // baseline, and neither may a completed bulk mark/move/delete job
+        // (bulk workers share this writer and use "bulk-*" job ids).
+        // Preserved as-is on every other write (incl. the post-mirror
+        // failed write, which reports a different failure).
+        if state == "done" && !jobID.hasPrefix("bulk-") {
+            dict["mail_completed_at"] = mailCompletedAtMs ?? Int64(Date().timeIntervalSince1970 * 1000)
+        } else {
+            dict["mail_completed_at"] = existingMailCompletedAtMs() ?? NSNull()
+        }
         guard let data = try? JSONSerialization.data(withJSONObject: dict, options: [.prettyPrinted]) else { return }
         stateLock.lock()
         defer { stateLock.unlock() }
@@ -335,7 +347,84 @@ public enum MailCrawler {
         }
     }
 
+    /// The 365-day horizon every full crawl covers.
+    public static let fullCrawlHorizonDays: Int = 365
+    /// The full plan's newest window (matching the historic schedule).
+    public static let fullCrawlLeadWindowDays: Int = 30
+    /// The full plan's backfill window width.
+    public static let fullCrawlBackfillWindowDays: Int = 10
+    /// How old the last completed crawl may be for a delta to be honored —
+    /// older than this and the mail older than the delta windows may have
+    /// drifted too (mail moves between mailboxes, server-side deletes), so
+    /// the delta replays a 30-day window to re-establish coverage.
+    public static let deltaCrawlMaxAgeDays: Int = 7
+    /// Overlap margin added in front of the since-last-run edge so mail
+    /// delivered while the previous crawl ran (or between its last window
+    /// walk and its terminal state write) is still re-read. Re-reads are
+    /// free: ingest upserts by (app, account, id), never duplicates.
+    public static let deltaCrawlOverlapDays: Int = 2
+
+    /// A window in the crawl plan, plus WHY it is there — the state-file
+    /// label distinguishes a delta refresh from a backfill window so
+    /// operators can tell incremental runs from full ones at a glance.
+    public struct PlannedWindow {
+        public let window: CrawlWindow
+        public let kind: String  // "delta" | "lead" | "backfill"
+        public init(window: CrawlWindow, kind: String) {
+            self.window = window
+            self.kind = kind
+        }
+    }
+
+    /// Build the crawl plan. A delta run replaces the whole 35-window
+    /// backfill schedule with ONE window reaching from the last completed
+    /// crawl's watermark (minus the overlap margin) to now — the difference
+    /// between minutes of Apple Events and a full-day crawl. Falls back to
+    /// the full plan whenever the watermark is missing, stale beyond
+    /// `deltaCrawlMaxAgeDays`, or `forceFull` is set; `windowDays` (the
+    /// legacy param, historically ignored by the worker) pins the lead
+    /// window width of a full plan when given.
+    public static func crawlPlan(nowMs: Int64, lastCompletedAtMs: Int64?, forceFull: Bool,
+                                 windowDays: Int) -> [PlannedWindow] {
+        let day: Int64 = 86_400_000
+        func clampToHorizon(_ from: Int64) -> Int64 { max(from, nowMs - Int64(fullCrawlHorizonDays) * day) }
+        func deltaPlan() -> [PlannedWindow] {
+            let from = clampToHorizon(lastCompletedAtMs! - Int64(deltaCrawlOverlapDays) * day)
+            return [PlannedWindow(window: CrawlWindow(fromMs: from, toMs: nowMs), kind: "delta")]
+        }
+        func fullPlan() -> [PlannedWindow] {
+            let lead = windowDays > 0 ? Int64(windowDays) : Int64(fullCrawlLeadWindowDays)
+            var out = [PlannedWindow(window: CrawlWindow(fromMs: nowMs - lead * day, toMs: nowMs), kind: "lead")]
+            var edge = nowMs - lead * day
+            let backfill = Int64(fullCrawlBackfillWindowDays)
+            while edge > nowMs - Int64(fullCrawlHorizonDays) * day {
+                out.append(PlannedWindow(
+                    window: CrawlWindow(fromMs: max(edge - backfill * day, nowMs - Int64(fullCrawlHorizonDays) * day),
+                                        toMs: edge),
+                    kind: "backfill"))
+                edge -= backfill * day
+            }
+            return out
+        }
+        guard !forceFull, let lastCompletedAtMs else { return fullPlan() }
+        let ageMs = nowMs - lastCompletedAtMs
+        guard ageMs >= 0, ageMs <= Int64(deltaCrawlMaxAgeDays) * day else { return fullPlan() }
+        return deltaPlan()
+    }
+
+    /// The `mail_completed_at` watermark carried in crawl-state.json
+    /// (additive contract — absent/null/malformed means "never completed",
+    /// same tolerance as the `failures` counter). Only a `done` crawl may
+    /// set it, and only the crawl process itself writes it.
+    public static func existingMailCompletedAtMs() -> Int64? {
+        guard let data = try? Data(contentsOf: statePath()),
+              let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+              let v = obj["mail_completed_at"] as? Int64 else { return nil }
+        return v >= 0 ? v : nil
+    }
+
     public static func runJob(jobID: String, windowDays: Int, storeBody: Bool, mailboxFilter: String?,
+                              forceFull: Bool,
                               seq: SeqCounter, progress: @escaping (String, Int, Int) -> Void) -> String {
         let state = CrawlState.shared
         guard MailAE.mailRunning() else {
@@ -346,12 +435,17 @@ public enum MailCrawler {
         }
 
         let now = Int64(Date().timeIntervalSince1970 * 1000)
-        let day: Int64 = 86_400_000
-        var windows: [CrawlWindow] = [CrawlWindow(fromMs: now - 30 * day, toMs: now)]
-        var edge = now - 30 * day
-        while edge > now - 365 * day {
-            windows.append(CrawlWindow(fromMs: max(edge - 10 * day, now - 365 * day), toMs: edge))
-            edge -= 10 * day
+        let plan = crawlPlan(nowMs: now, lastCompletedAtMs: existingMailCompletedAtMs(),
+                             forceFull: forceFull, windowDays: windowDays)
+        var windows: [CrawlWindow] = plan.map(\.window)
+        let planKind = plan.first?.kind ?? "lead"
+        let planLabel: String
+        if planKind == "delta" {
+            planLabel = "delta since \(plan[0].window.fromMs) (since last completed crawl)"
+        } else if plan.count > 1 {
+            planLabel = "full: \(plan.count) windows"
+        } else {
+            planLabel = planKind
         }
 
         // Mail's AE layer can stay saturated for many hours; keep retrying
@@ -407,7 +501,9 @@ public enum MailCrawler {
         // count attempts and go straight to blind pagination (memoized per
         // job — 2×360 s of failed counting per window adds up to hours).
         var blindMailboxes = Set<String>()
-        let windowLabel = { (w: CrawlWindow) -> String in "\(w.fromMs)-\(w.toMs)" }
+        let windowLabel = { (w: CrawlWindow) -> String in
+            planKind == "delta" ? planLabel : "\(w.fromMs)-\(w.toMs)"
+        }
 
         for window in windows {
             for t in targets {
@@ -1153,13 +1249,14 @@ public enum MailCrawler {
     /// numbering instead of colliding with mail batches. jobID comes from
     /// the caller — one source of truth for the state file and batch names.
     public static func runCrawlWorker(jobID: String, windowDays: Int, storeBody: Bool,
-                                      mailboxFilter: String?,
+                                      mailboxFilter: String?, forceFull: Bool,
                                       progress: @escaping (String, Int, Int) -> Void)
         -> (state: String, seq: SeqCounter) {
         let seq = SeqCounter(0)
         writeState(jobID: jobID, state: "running", processed: 0, found: 0, window: nil)
         let terminal = runJob(jobID: jobID, windowDays: windowDays, storeBody: storeBody,
-                              mailboxFilter: mailboxFilter, seq: seq, progress: progress)
+                              mailboxFilter: mailboxFilter, forceFull: forceFull,
+                              seq: seq, progress: progress)
         return (terminal, seq)
     }
 }

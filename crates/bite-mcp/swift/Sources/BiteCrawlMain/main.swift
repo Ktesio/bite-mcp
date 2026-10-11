@@ -3,6 +3,8 @@
 // Spawned by the Rust control plane (`bite index rebuild`, bulk tools).
 // Modes:
 //   --crawl-worker              30-day Mail window + 10-day backfill + mirrors
+//                               (delta window since the last completed crawl
+//                               when fresh; --full forces the full schedule)
 //   --bulk-worker --bulk-op …   one-shot bulk Mail operation
 //   --probe-mail                doctor diagnostic (one-shot Mail OSA probe)
 //
@@ -20,6 +22,7 @@ var windowDays = 30
 var mailboxFilter: String?
 var storeBody = true
 var mirrors = true
+var fullCrawl = false
 var bulkOp: String?
 var bulkMailbox = "INBOX"
 var bulkToMailbox: String?
@@ -80,6 +83,7 @@ while let arg = it.next() {
     case "--mailbox": mailboxFilter = it.next()
     case "--no-body": storeBody = false
     case "--no-mirrors": mirrors = false
+    case "--full": fullCrawl = true
     case "--bulk-op": bulkOp = it.next() ?? "mark"
     case "--bulk-mailbox": bulkMailbox = it.next() ?? "INBOX"
     case "--to-mailbox": bulkToMailbox = it.next()
@@ -157,7 +161,8 @@ case "crawl":
     // toward the ≥5 respawn gate
     let preJobFailures = MailCrawler.existingFailureCount()
     let crawl = MailCrawler.runCrawlWorker(jobID: jobID, windowDays: windowDays, storeBody: storeBody,
-                                           mailboxFilter: mailboxFilter, progress: progress)
+                                           mailboxFilter: mailboxFilter, forceFull: fullCrawl,
+                                           progress: progress)
     if crawl.state == "done" {
         var mirrorsOK = true
         if mirrors {
