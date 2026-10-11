@@ -104,7 +104,14 @@ pub fn with_index<T>(
     if !IN_INGEST_PENDING.load(Ordering::SeqCst) {
         ingest_pending_if_due(index);
     }
-    f(index)
+    let out = f(index);
+    // Post-settle FTS refresh LAST: batches that landed after the final
+    // mid-crawl ingest must be folded in only after they were ingested
+    // (fold-then-ingest would mark a crawl state whose newest rows stay
+    // unindexed until the next crawl). No-op within milliseconds when the
+    // marker already matches — unindexed rows stay searchable meanwhile.
+    refresh_fts_after_settled_crawl(index);
+    out
 }
 
 /// Opportunistic auto-ingest: cheap gate (30 s throttle FIRST — inside the
@@ -157,7 +164,104 @@ fn ingest_pending_if_due(index: &bite_index::EntityIndex) {
     let _ = bite_index::ingest_staged(index, &staging())
         .map_err(|e| eprintln!("bite auto-ingest error: {e}"));
     let _ = fs2::FileExt::unlock(&lock);
+    // writer lock still held here (guard `_writer` lives to fn end), so the
+    // optimize serializes against concurrent ingests
+    refresh_fts_if_crawl_settled(index);
     crate::jobs::set_pending_batches(pending_batches());
+}
+
+/// Raw `crawl-state.json` text — the signature for "which crawl state has
+/// been folded into the FTS index". None = no crawl ever recorded state.
+fn crawl_state_raw() -> Option<String> {
+    std::fs::read_to_string(bite_core::config::data_dir().join("crawl-state.json")).ok()
+}
+
+/// Parsed `state` field of raw crawl-state text ("unknown" when unparseable).
+fn crawl_state_of(raw: &str) -> String {
+    serde_json::from_str::<Value>(raw)
+        .ok()
+        .and_then(|v| v.get("state").and_then(|s| s.as_str()).map(String::from))
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+fn fts_refresh_marker_path() -> std::path::PathBuf {
+    bite_core::config::data_dir().join("fts-refresh.json")
+}
+
+/// Pure gate for the post-settle FTS refresh (see
+/// `refresh_fts_if_crawl_settled` for why it must not run mid-crawl).
+fn fts_refresh_settled(state: &str, crawler_alive: bool) -> bool {
+    if crawler_alive {
+        return false;
+    }
+    // never_run/unknown = no (readable) crawl ever recorded state — there
+    // is no crawl whose rows could be sitting unindexed
+    !matches!(state, "never_run" | "unknown")
+}
+
+/// Is there a settled crawl state whose rows have not been folded into the
+/// FTS index yet? Cheap: two small file reads, plus a pid check only when
+/// the crawl-state text actually differs from the marker.
+fn fts_refresh_pending() -> bool {
+    let Some(raw) = crawl_state_raw() else {
+        return false;
+    };
+    let marker = std::fs::read_to_string(fts_refresh_marker_path()).unwrap_or_default();
+    fts_refresh_due(&raw, &marker, crawl_running())
+}
+
+/// Pure form of `fts_refresh_pending` (raw crawl-state text vs marker text).
+fn fts_refresh_due(raw: &str, marker: &str, crawler_alive: bool) -> bool {
+    if raw == marker {
+        return false; // this exact crawl state is already folded in
+    }
+    fts_refresh_settled(&crawl_state_of(raw), crawler_alive)
+}
+
+/// Fold rows written since the last FTS refresh into the index — exactly
+/// once per settled crawl state. `EntityIndex::refresh_fts` runs LanceDB
+/// `optimize(All)`, which not only adds unindexed rows to the FTS index but
+/// also compacts fragments and prunes old dataset versions: running it
+/// mid-crawl (the 30 s auto-ingest ticks, the per-batch `job_progress`
+/// ingests) would re-compact a table the crawler is still appending to and
+/// churn dataset versions under readers — hence the not-while-running gate
+/// and the marker that makes it once per crawl state, not once per ingest.
+/// A failed optimize is logged and NOT marked: unindexed rows remain
+/// searchable (LanceDB FTS scans indexed and unindexed rows in parallel),
+/// only slower, so the refresh retries on a later index touch instead of
+/// failing the tool call that carried the ingest.
+/// Caller must hold the store's writer lock (both ingest paths do).
+fn refresh_fts_if_crawl_settled(index: &bite_index::EntityIndex) {
+    let Some(raw) = crawl_state_raw() else {
+        return;
+    };
+    let marker = std::fs::read_to_string(fts_refresh_marker_path()).unwrap_or_default();
+    if !fts_refresh_due(&raw, &marker, crawl_running()) {
+        return;
+    }
+    match index.refresh_fts() {
+        Ok(()) => {
+            // mark exactly the state we optimized for — if a new crawl
+            // started meanwhile, its state text differs and stays pending
+            std::fs::write(fts_refresh_marker_path(), raw).ok();
+        }
+        Err(e) => eprintln!("bite-index: post-crawl FTS refresh failed: {e}"),
+    }
+}
+
+/// Post-settle FTS refresh for callers NOT holding the writer lock (the
+/// `with_index` tool path): gate on the cheap checks first, then take the
+/// writer lock so the optimize serializes against concurrent ingests —
+/// Busy just means another bite process owns the table right now and will
+/// get its own chance.
+fn refresh_fts_after_settled_crawl(index: &bite_index::EntityIndex) {
+    if !fts_refresh_pending() {
+        return;
+    }
+    let Ok(_writer) = index.lock_writer() else {
+        return;
+    };
+    refresh_fts_if_crawl_settled(index);
 }
 
 /// Ingest any staged JSONL batches. Cheap when nothing is pending.
@@ -184,6 +288,9 @@ pub fn ingest_pending() -> Result<Value, BiteError> {
         }
         let (batches, rows, quarantined) = bite_index::ingest_staged(index, &staging)
             .map_err(|e| BridgeError::new("index_ingest_failed", e.to_string()))?;
+        if batches > 0 {
+            refresh_fts_if_crawl_settled(index);
+        }
         crate::jobs::set_pending_batches(pending_batches());
         Ok(json!({
             "batches_ingested": batches,
@@ -1021,6 +1128,47 @@ mod tests {
         ));
         // saturating math: a huge last-attempt must not panic/underflow
         assert!(!auto_ingest_due(u64::MAX, 0, 3, THROTTLE));
+    }
+
+    #[test]
+    fn fts_refresh_settled_gate() {
+        // live crawler: never due, whatever the state
+        assert!(!fts_refresh_settled("running", true));
+        assert!(!fts_refresh_settled("done", true));
+        // no crawl ever recorded state (missing file): nothing to fold in
+        assert!(!fts_refresh_settled("never_run", false));
+        assert!(!fts_refresh_settled("unknown", false));
+        // terminal states with no live crawler: due exactly once
+        assert!(fts_refresh_settled("done", false));
+        assert!(fts_refresh_settled("failed", false));
+        assert!(fts_refresh_settled("cancelled", false));
+        // running state with a DEAD crawler (crashed worker, stale pid):
+        // rows may sit unindexed — still due
+        assert!(fts_refresh_settled("running", false));
+    }
+
+    #[test]
+    fn fts_refresh_due_marker_matching() {
+        let done = r#"{"state":"done","processed":10}"#;
+        // marker equals raw state → already folded in, not due
+        assert!(!fts_refresh_due(done, done, false));
+        // any other marker (older crawl, or never written) → due
+        assert!(fts_refresh_due(done, "", false));
+        assert!(fts_refresh_due(done, r#"{"state":"running"}"#, false));
+        // unparseable crawl state text behaves as unknown → not due
+        assert!(!fts_refresh_due("garbage", "", false));
+        // and the alive gate still wins over a differing marker
+        assert!(!fts_refresh_due(done, "", true));
+    }
+
+    #[test]
+    fn crawl_state_of_parses_state_field() {
+        assert_eq!(
+            crawl_state_of(r#"{"state":"done","processed":3}"#),
+            "done".to_string()
+        );
+        assert_eq!(crawl_state_of("garbage"), "unknown".to_string());
+        assert_eq!(crawl_state_of(r#"{"no_state":1}"#), "unknown".to_string());
     }
 
     #[test]
