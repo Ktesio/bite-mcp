@@ -123,12 +123,11 @@ fn compile_into(scratch: &std::path::Path, stable: &PathBuf) -> Result<PathBuf, 
             src_dir.display()
         )));
     }
-    if !which("swift") && !xcrun_available() {
-        return Err(BridgeError::spawn(
-            "no Swift toolchain found — run `xcode-select --install`, then retry",
-        ));
-    }
-    let status = Command::new("swift")
+    // The build output is staged into the TCC-granted install dir, so the
+    // swift driver is resolved through secure-path rules — a binary planted
+    // in a writable PATH entry must never compile what bite installs.
+    let swift = crate::toolchain::resolve_swift().map_err(BridgeError::spawn)?;
+    let status = Command::new(&swift)
         .args([
             "build",
             "-c",
@@ -143,7 +142,7 @@ fn compile_into(scratch: &std::path::Path, stable: &PathBuf) -> Result<PathBuf, 
     if !status.success() {
         return Err(BridgeError::spawn("swift build failed — see output above"));
     }
-    let bin_dir = Command::new("swift")
+    let bin_dir = Command::new(&swift)
         .args([
             "build",
             "--show-bin-path",
@@ -260,29 +259,15 @@ fn set_exec(path: &PathBuf) {
 }
 
 fn adhoc_sign(path: &PathBuf) {
-    // ad-hoc signature keeps Gatekeeper happy for locally built helpers
-    let _ = Command::new("codesign")
-        .args(["--force", "--sign", "-"])
-        .arg(path)
-        .status();
-}
-
-fn which(bin: &str) -> bool {
-    std::env::var("PATH")
-        .ok()
-        .map(|path| {
-            std::env::split_paths(&path)
-                .map(|dir| dir.join(bin))
-                .any(|p| p.is_file())
-        })
-        .unwrap_or(false)
-}
-
-fn xcrun_available() -> bool {
-    Command::new("xcrun")
-        .args(["-f", "swiftc"])
-        .output()
-        .is_ok_and(|o| o.status.success())
+    // ad-hoc signature keeps Gatekeeper happy for locally built helpers;
+    // resolved securely so a planted `codesign` can't intercept the signing
+    // of the TCC-granted helper binary
+    if let Some(codesign) = crate::toolchain::resolve_codesign() {
+        let _ = Command::new(&codesign)
+            .args(["--force", "--sign", "-"])
+            .arg(path)
+            .status();
+    }
 }
 
 /// Process-wide bridge (spawned lazily, reused).

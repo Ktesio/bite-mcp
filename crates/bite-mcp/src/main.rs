@@ -9,6 +9,7 @@ mod index;
 mod jobs;
 mod mcp;
 mod setup;
+mod toolchain;
 
 fn main() {
     let parsed = clap::Parser::parse();

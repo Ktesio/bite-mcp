@@ -189,6 +189,7 @@ Performance section.
 |---|---|
 | `bite: command not found` after install | `$CARGO_HOME/bin` not on `PATH` |
 | helper install fails in setup | `xcode-select --install`, retry `bite setup` |
+| install refuses a `swift` on `PATH` | intentional: the PATH entry is writable or foreign — use the stock toolchain (`xcode-select`) |
 | agent doesn't list bite tools | restart the CLI; then `bite doctor` (client lines) |
 | setup exit 2 | read the stderr summary — fix the named config, re-run |
 | permission denied on a call | `bite doctor --fix`; details in [permissions.md](permissions.md) |
