@@ -650,10 +650,16 @@ public enum MailCrawler {
             var r = rec
             var seen = Set<String>()
             var parts: [String] = []
-            if let sender = r.participants, !sender.isEmpty { parts.append(sender); seen.insert(sender.lowercased()) }
+            let sender = r.participants.flatMap { $0.isEmpty ? nil : $0 }
+            if let sender { parts.append(sender) }
             for to in tos {
                 let key = to.lowercased()
-                guard !key.isEmpty, !seen.contains(key), parts.count < 20 else { continue }
+                guard !key.isEmpty, parts.count < 20 else { continue }
+                // the sender renders as "Name <addr>" — a to-address
+                // already contained in the sender string is the same
+                // participant (send-from-self), not a new one
+                if let sender, sender.lowercased().contains(key) { continue }
+                guard !seen.contains(key) else { continue }
                 seen.insert(key)
                 parts.append(to)
             }
