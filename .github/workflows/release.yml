@@ -32,6 +32,18 @@ jobs:
           cargo build --release --workspace
           cargo test --workspace --release
 
+      - name: Changelog entry guard
+        # A tag may only ship when CHANGELOG.md carries a matching
+        # `## [vX.Y.Z]` section (see the convention at the top of the file).
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME#v}"
+          if ! grep -Eq "^## \[?v?${tag//./\\.}\]?" CHANGELOG.md; then
+            echo "CHANGELOG.md has no '## [v${tag}]' section for tag ${GITHUB_REF_NAME}." >&2
+            echo "Add the section (and move [Unreleased] items under it) before pushing the tag." >&2
+            exit 1
+          fi
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
