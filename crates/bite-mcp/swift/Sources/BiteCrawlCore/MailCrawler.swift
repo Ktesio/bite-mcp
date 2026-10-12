@@ -637,6 +637,32 @@ public enum MailCrawler {
         public var aboveWindowTail: Int
     }
 
+    /// Fold to-recipient addresses into a scanned chunk's records:
+    /// `participants` becomes `"sender, to1, to2, …"` (sender first, `", "`
+    /// joined, matching the Mirrors.swift attendees convention). Pure and
+    /// total: a nil `participants` (no sender) keeps recipients only when
+    /// present; ids missing from the map are left untouched; the list is
+    /// capped at 20 addresses and de-duplicated case-insensitively
+    /// (send-from-self keeps the sender out of the recipient tail).
+    public static func applyRecipients(_ records: [CrawlRecord], recipients: [String: [String]]) -> [CrawlRecord] {
+        records.map { rec in
+            guard let tos = recipients[rec.id], !tos.isEmpty else { return rec }
+            var r = rec
+            var seen = Set<String>()
+            var parts: [String] = []
+            if let sender = r.participants, !sender.isEmpty { parts.append(sender); seen.insert(sender.lowercased()) }
+            for to in tos {
+                let key = to.lowercased()
+                guard !key.isEmpty, !seen.contains(key), parts.count < 20 else { continue }
+                seen.insert(key)
+                parts.append(to)
+            }
+            guard !parts.isEmpty else { return rec }
+            r.participants = parts.joined(separator: ", ")
+            return r
+        }
+    }
+
     /// Pure per-chunk core of the walk: maps one chunk's rows through the
     /// record mapping and the direction-aware window decision. `reverseRows`
     /// reverses within-chunk iteration (only counted oldest-first plans,
@@ -952,7 +978,8 @@ public enum MailCrawler {
         /// proves itself wrong mid-walk (long above-window tail after
         /// collected rows).
         @discardableResult
-        func process(_ rows: [NSAppleEventDescriptor?], reverseRows: Bool, edgeAscending: Bool) -> Bool {
+        func process(_ rows: [NSAppleEventDescriptor?], start: Int, end: Int,
+                     reverseRows: Bool, edgeAscending: Bool) -> Bool {
             let scan = MailCrawler.scanChunk(rows, window: window, reverseRows: reverseRows,
                                              edgeAscending: edgeAscending, account: account, mailbox: mailbox,
                                              includeContent: includeContent, hasCollected: indexed > 0,
@@ -965,7 +992,20 @@ public enum MailCrawler {
             if scan.orderMisDetected {
                 orderMisDetectedWalk = true
             }
-            for record in scan.records where !collect(record) {
+            // Best-effort recipient enrichment BEFORE staging: `to`
+            // searches need recipient addresses in the index. A nil fetch
+            // (script error / Mail wedged) degrades this chunk to
+            // sender-only — it must never fail the walk.
+            let enriched: [CrawlRecord]
+            if scan.records.isEmpty {
+                enriched = scan.records
+            } else if let tos = MailAE.readToRecipients(mailboxAt: mailboxAt, account: account,
+                                                        start: start, end: end) {
+                enriched = MailCrawler.applyRecipients(scan.records, recipients: tos)
+            } else {
+                enriched = scan.records
+            }
+            for record in enriched where !collect(record) {
                 writeFailed = true
             }
             return scan.edgeCrossed
@@ -1082,7 +1122,8 @@ public enum MailCrawler {
         let (reverseRows, edgeAscending) = MailCrawler.flagsForWalk(blind: blind,
                                                                     newestFirstResolved: newestFirstResolved)
         if processProbe {
-            edgeCrossed = process(probe, reverseRows: reverseRows, edgeAscending: edgeAscending)
+            edgeCrossed = process(probe, start: probeRange.lowerBound, end: probeRange.upperBound,
+                                  reverseRows: reverseRows, edgeAscending: edgeAscending)
             if orderMisDetectedWalk {
                 let flushed = flush()
                 CrawlState.shared.setFlushPending(nil)
@@ -1156,7 +1197,8 @@ public enum MailCrawler {
                 // gentle pacing: a pause between chunks keeps Mail's event
                 // queue responsive for the user's interactive Mail use
                 Thread.sleep(forTimeInterval: 1)
-                edgeCrossed = process(rows, reverseRows: reverseRows, edgeAscending: edgeAscending)
+                edgeCrossed = process(rows, start: range.lowerBound, end: range.upperBound,
+                                      reverseRows: reverseRows, edgeAscending: edgeAscending)
                 if orderMisDetectedWalk {
                     let flushed = flush()
                     CrawlState.shared.setFlushPending(nil)

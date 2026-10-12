@@ -68,6 +68,10 @@ let kwReadD = AEKeyword(0x69737264)           // 'isrd'  — read status
 let kwFlaggedD = AEKeyword(0x6973666c)        // 'isfl'  — flagged status
 let kwJunkD = AEKeyword(0x69736a6b)           // 'isjk'  — junk mail status
 let kwContentD = AEKeyword(0x63746e74)        // 'ctnt'  — content
+// 'pAdr' — recipient address property (record-shaped recipient items).
+// Only consulted when a recipient item is NOT a plain string (unresolved
+// specifiers land here).
+let kwAddressD = AEKeyword(0x70416472)        // 'pAdr'  — recipient address
 
 // Descriptor types we must tell apart when mapping replies.
 let typeListD = DescType(0x6c697374)          // 'list'
@@ -178,6 +182,11 @@ public enum MailAE {
 
     /// Properties fetched by the no-body bundle, in bundle order.
     static let bundleProps = "id, subject, sender, date sent, read status, flagged status, junk mail status"
+    // NOTE: to-recipient addresses are fetched by a SEPARATE per-chunk
+    // script (`readToRecipients`), not added here — recipient collections
+    // are elements, not properties, so they cannot ride a `get properties`
+    // record; and an 8th bundle column would break the walk's 7-wide
+    // bundle-ambiguity guards (`walkPlan(avoidWidth: 7)`).
 
     // ── script text builders (pure; unit-tested) ──
 
@@ -632,6 +641,87 @@ public enum MailAE {
             return nil
         }
         return rows
+    }
+
+    /// To-recipient addresses for one chunk of messages, keyed by Mail
+    /// message id: `get {id, address of every to recipient} of messages S
+    /// thru E of mb`. Runs as a SEPARATE best-effort script per chunk —
+    /// recipients are elements (not properties) so they cannot ride the
+    /// property bundle or a `get properties` record, and a recipient-read
+    /// failure must never fail the walk (records degrade to sender-only).
+    /// Returns nil on any script error; an empty map means "no usable
+    /// addresses" (either genuinely none or shapes we don't parse).
+    public static func readToRecipients(mailboxAt: Int, account: String, start: Int, end: Int,
+                                        timeoutSeconds: Int32 = 400) -> [String: [String]]? {
+        guard mailRunning() else { lastError = "Mail is not running"; lastErrorNumber = nil; return nil }
+        let src = """
+        \(tellPrefix(240))
+        set mb to \(mailboxRef(mailboxAt, account))
+        get {id, address of every to recipient} of messages \(start) thru \(end) of mb
+        \(tellSuffix)
+        """
+        guard let reply = run(src, timeoutSeconds: TimeInterval(timeoutSeconds)) else { return nil }
+        return recipientsFromReply(reply)
+    }
+
+    /// Map a `{id, address of every to recipient}` bundle reply to
+    /// id → [address]. The reply is property-major: two columns (id list,
+    /// per-message recipient-list list) when Mail cooperates, but the
+    /// parser stays shape-tolerant because raw-AE reads of element
+    /// collections have been observed to come back in more than one shape:
+    /// row-major (one {id, recipients} list per message) is also accepted.
+    /// Public for unit tests.
+    public static func recipientsFromReply(_ reply: NSAppleEventDescriptor?) -> [String: [String]] {
+        guard let reply else { return [:] }
+        var out: [String: [String]] = [:]
+        let parseRecipientCell: (NSAppleEventDescriptor?) -> [String] = { cell in
+            // one cell = every to recipient of ONE message: a list of
+            // recipient records whose `address` we read defensively — some
+            // transports return unresolved object specifiers or 'msr1'
+            // class records instead of plain strings
+            guard let cell, cell.descriptorType == typeListD else { return [] }
+            var addrs: [String] = []
+            for i in 1...max(1, cell.numberOfItems) {
+                guard let item = cell.atIndex(i) else { continue }
+                if let s = item.stringValue, !s.isEmpty {
+                    addrs.append(s)
+                    continue
+                }
+                // record-shaped recipient: address property by keyword
+                if let addr = item.forKeyword(kwAddressD)?.stringValue, !addr.isEmpty {
+                    addrs.append(addr)
+                }
+            }
+            return addrs
+        }
+        if reply.descriptorType == typeListD, reply.numberOfItems == 2,
+           let idsColumn = reply.atIndex(1), let cellsColumn = reply.atIndex(2) {
+            // property-major: idsColumn = flat id list, cellsColumn = one
+            // recipient-list per message (position-aligned). Disambiguate
+            // from row-major: ids must ALL be scalars and cells ALL lists
+            // (a 2-message row-major reply is also 2 items wide).
+            let n = idsColumn.numberOfItems
+            let idsAllScalars = n > 0 && (1...n).allSatisfy { idsColumn.atIndex($0)?.descriptorType != typeListD }
+            let cellsAllLists = cellsColumn.numberOfItems == n && n > 0
+                && (1...n).allSatisfy { cellsColumn.atIndex($0)?.descriptorType == typeListD }
+            if idsAllScalars && cellsAllLists {
+                for pos in 1...n {
+                    guard let idDesc = idsColumn.atIndex(pos), let id = intString(idDesc), !id.isEmpty else { continue }
+                    out[id] = parseRecipientCell(cellsColumn.atIndex(pos))
+                }
+                return out
+            }
+        }
+        if reply.descriptorType == typeListD {
+            // row-major fallback: one {id, recipients} list per message
+            for i in 1...max(1, reply.numberOfItems) {
+                guard let row = reply.atIndex(i), row.descriptorType == typeListD,
+                      row.numberOfItems == 2,
+                      let idDesc = row.atIndex(1), let id = intString(idDesc), !id.isEmpty else { continue }
+                out[id] = parseRecipientCell(row.atIndex(2))
+            }
+        }
+        return out
     }
 
     /// `name of mailbox «i» of account «A»` — used to re-validate
