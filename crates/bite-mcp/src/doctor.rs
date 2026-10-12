@@ -154,12 +154,13 @@ fn collect(fix: bool, probe: bool) -> Result<DoctorReport, bite_core::BiteError>
 
     // ── Swift toolchain (only needed for source-compile installs) ──
     fn probe_toolchain() -> Option<String> {
-        std::process::Command::new("xcrun")
-            .args(["-f", "swiftc"])
-            .output()
-            .ok()
-            .filter(|o| o.status.success())
-            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        // Secure resolution: a `swiftc` planted in a writable PATH entry is
+        // not evidence of a real toolchain. Falls back to xcrun (from its
+        // fixed /usr/bin location) with the reported path validated.
+        match crate::toolchain::secure_which("swiftc") {
+            crate::toolchain::Found::Trusted(path) => Some(path.display().to_string()),
+            _ => crate::toolchain::xcrun_find("swiftc").map(|p| p.display().to_string()),
+        }
     }
     let toolchain = probe_toolchain();
 

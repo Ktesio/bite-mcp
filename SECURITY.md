@@ -23,6 +23,13 @@ security-relevant surface is:
 - **Injection through agent input** — bite deliberately runs no shell, no
   AppleScript strings, and no dynamic code; report anything that changes that
   (e.g. a path where app-controlled strings reach an interpreter).
+- **The toolchain invocation path** — `bite install-helper` compiles the
+  Swift helper with `swift` resolved through secure-path rules (every
+  directory in the chain root- or user-owned and not group/world-writable,
+  the tool a real executable file, never a symlink) and stages the result
+  into the location macOS permissions are granted to. Report anything that
+  lets an untrusted `swift`/`codesign`/`xcrun` produce or sign the
+  installed helper.
 - **The config writers** (`bite setup`) — they edit other applications' MCP
   config files; report anything that could corrupt or clobber unrelated
   settings.
