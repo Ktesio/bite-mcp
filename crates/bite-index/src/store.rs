@@ -74,6 +74,7 @@ pub struct SearchQuery {
     pub text: Option<String>,
     pub app: Option<String>,
     pub container: Option<String>,
+    pub account: Option<String>,
     pub read: Option<bool>,
     pub flagged: Option<bool>,
     pub junk: Option<bool>,
@@ -81,12 +82,14 @@ pub struct SearchQuery {
     pub since_ms: Option<i64>,
     pub until_ms: Option<i64>,
     pub limit: usize,
-    /// SQL LIKE pattern against participants (e.g. "%sender@example.com%")
-    pub participant_like: Option<String>,
-    /// SQL LIKE pattern against title
-    pub title_like: Option<String>,
-    /// SQL LIKE pattern against content
-    pub content_like: Option<String>,
+    /// Case-insensitive substring match against participants (sender for
+    /// mail). Applied as `ILIKE '%…%'` with LIKE wildcards escaped, so the
+    /// needle is always a literal substring.
+    pub participant_contains: Option<String>,
+    /// Case-insensitive substring match against title
+    pub title_contains: Option<String>,
+    /// Case-insensitive substring match against content
+    pub content_contains: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -461,6 +464,9 @@ fn filter_sql(q: &SearchQuery) -> Option<String> {
     if let Some(c) = &q.container {
         parts.push(format!("container = {}", sql_str(c)));
     }
+    if let Some(a) = &q.account {
+        parts.push(format!("account = {}", sql_str(a)));
+    }
     if let Some(v) = q.read {
         parts.push(format!("read IS NOT NULL AND read = {v}"));
     }
@@ -479,11 +485,33 @@ fn filter_sql(q: &SearchQuery) -> Option<String> {
     if let Some(v) = q.until_ms {
         parts.push(format!("start_ms < {v}"));
     }
+    if let Some(needle) = &q.participant_contains {
+        parts.push(contains_clause("participants", needle));
+    }
+    if let Some(needle) = &q.title_contains {
+        parts.push(contains_clause("title", needle));
+    }
+    if let Some(needle) = &q.content_contains {
+        parts.push(contains_clause("content", needle));
+    }
     if parts.is_empty() {
         None
     } else {
         Some(parts.join(" AND "))
     }
+}
+
+/// Case-insensitive literal-substring predicate (ILIKE with LIKE wildcards
+/// escaped), matching the live path's `lowercased().contains(needle)`.
+/// NULL columns never match: a NULL title/participants/content row is
+/// excluded, which is the same answer the live Mail path gives.
+fn contains_clause(column: &str, needle: &str) -> String {
+    // escape LIKE wildcards so a user needle containing % or _ stays literal
+    let escaped = needle
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_");
+    format!("{column} ILIKE {}", sql_str(&format!("%{escaped}%")))
 }
 
 fn record_batch(records: &[Record]) -> Result<RecordBatch, IndexError> {
@@ -767,6 +795,119 @@ mod tests {
         // stats
         let stats = idx.stats().unwrap();
         assert_eq!(stats.total, 2);
+    }
+
+    #[test]
+    fn search_contains_filters_apply() {
+        // regression: *_contains used to be declared on SearchQuery but never
+        // reached filter_sql — subject/body/from/to filters were silently
+        // ignored by every index-backed search
+        let dir = temp_dir("contains");
+        let idx = EntityIndex::open(&dir).unwrap();
+        let mut rec = record(
+            "mail",
+            "m1",
+            "Invoice from Acme",
+            "please pay soon",
+            Some(false),
+        );
+        rec.participants = Some("billing@acme.example".into());
+        let mut rec2 = record("mail", "m2", "Hello", "greeting body", Some(true));
+        rec2.participants = Some("friend@elsewhere.example".into());
+        // m3: NULL participants/title-adjacent shape — must never match
+        let mut rec3 = record("mail", "m3", "No participants here", "some body", None);
+        rec3.participants = None;
+        idx.ingest(&[rec, rec2, rec3]).unwrap();
+
+        // case-insensitive title substring
+        let res = idx
+            .search(&SearchQuery {
+                title_contains: Some("INVOICE".into()),
+                limit: 10,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(res.total, Some(1));
+        assert_eq!(res.hits[0].id, "m1");
+
+        // participants substring (the `from` filter at the MCP boundary)
+        let res = idx
+            .search(&SearchQuery {
+                participant_contains: Some("acme.example".into()),
+                limit: 10,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(res.total, Some(1));
+        assert_eq!(res.hits[0].id, "m1");
+
+        // content substring (the `body` filter)
+        let res = idx
+            .search(&SearchQuery {
+                content_contains: Some("greeting".into()),
+                limit: 10,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(res.total, Some(1));
+        assert_eq!(res.hits[0].id, "m2");
+
+        // combining with a scalar filter still applies both
+        let res = idx
+            .search(&SearchQuery {
+                participant_contains: Some("example".into()),
+                read: Some(true),
+                limit: 10,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(res.total, Some(1));
+        assert_eq!(res.hits[0].id, "m2");
+
+        // no match → empty, not everything
+        let res = idx
+            .search(&SearchQuery {
+                title_contains: Some("nonexistent".into()),
+                limit: 10,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(res.total, Some(0));
+        assert!(res.hits.is_empty());
+    }
+
+    #[test]
+    fn search_contains_needles_with_like_wildcards_stay_literal() {
+        // a needle containing % or _ must not widen into a LIKE pattern
+        let dir = temp_dir("contains-wildcard");
+        let idx = EntityIndex::open(&dir).unwrap();
+        let mut rec = record("mail", "m1", "100% done_report", "body", Some(false));
+        rec.participants = Some("a_b@c.example".into());
+        let mut rec2 = record("mail", "m2", "plain title", "body", Some(false));
+        rec2.participants = Some("axb@c.example".into());
+        idx.ingest(&[rec, rec2]).unwrap();
+
+        // literal "_" must NOT match both a_b and axb
+        let res = idx
+            .search(&SearchQuery {
+                participant_contains: Some("a_b@".into()),
+                limit: 10,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(res.total, Some(1));
+        assert_eq!(res.hits[0].id, "m1");
+
+        // literal "%" must not act as a wildcard
+        let res = idx
+            .search(&SearchQuery {
+                title_contains: Some("100%".into()),
+                limit: 10,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(res.total, Some(1));
+        assert_eq!(res.hits[0].id, "m1");
     }
 
     #[test]

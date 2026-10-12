@@ -542,7 +542,13 @@ fn search_params_to_query(params: &Value) -> bite_index::SearchQuery {
         text: g("query"),
         app: g("app"),
         container: g("mailbox").or_else(|| g("container")),
-        read: params.get("unread").and_then(|v| v.as_bool()),
+        // the MCP param is `unread` (true → unread messages) while the index
+        // stores `read`; inverting here was returning READ mail for
+        // unread:true — opposite of the live path
+        read: params
+            .get("unread")
+            .and_then(|v| v.as_bool())
+            .map(|unread| !unread),
         flagged: params.get("flagged").and_then(|v| v.as_bool()),
         junk: params.get("junk").and_then(|v| v.as_bool()),
         completed: params.get("completed").and_then(|v| v.as_bool()),
@@ -555,9 +561,10 @@ fn search_params_to_query(params: &Value) -> bite_index::SearchQuery {
             .and_then(|v| v.as_str())
             .and_then(bite_core::dates::parse_to_epoch_ms),
         limit: search_limit(params),
-        participant_like: None,
-        title_like: g("subject").map(|s| format!("%{s}%")),
-        content_like: g("body").map(|s| format!("%{s}%")),
+        participant_contains: None,
+        title_contains: g("subject"),
+        content_contains: g("body"),
+        account: g("account"),
     }
 }
 
@@ -581,12 +588,15 @@ pub fn try_mail_search(params: &Value) -> Option<Result<Value, BiteError>> {
         .and_then(|v| v.as_str())
         .map(String::from)
         .or_else(|| q.text.clone());
-    // from/to → participants LIKE
-    if let Some(from) = params.get("from").and_then(|v| v.as_str()) {
-        q.participant_like = Some(format!("%{from}%"));
+    // The index stores the sender only in `participants`, so a `to` filter
+    // cannot be served faithfully from it — fall back to the live path
+    // (which checks toRecipients) instead of returning wrong results.
+    if params.get("to").and_then(|v| v.as_str()).is_some() {
+        return None;
     }
-    if let Some(to) = params.get("to").and_then(|v| v.as_str()) {
-        q.participant_like = Some(format!("%{to}%"));
+    // `from` filters on the sender, which IS what the index stores.
+    if let Some(from) = params.get("from").and_then(|v| v.as_str()) {
+        q.participant_contains = Some(from.to_string());
     }
     Some(with_index(|index| {
         let res = index
@@ -1061,6 +1071,38 @@ mod tests {
         assert_eq!(search_limit(&json!({ "limit": u64::MAX })), 200);
         // zero floors to 1 (store.query() already floors; keep that contract)
         assert_eq!(search_limit(&json!({ "limit": 0 })), 1);
+    }
+
+    #[test]
+    fn search_params_map_subject_body_account_to_contains_filters() {
+        // subject/body/account used to be dropped entirely — search_params_to_query
+        // read them into *_like fields that filter_sql never saw
+        let q = search_params_to_query(&json!({
+            "subject": "invoice",
+            "body": "payment",
+            "account": "iCloud",
+            "mailbox": "INBOX"
+        }));
+        assert_eq!(q.title_contains.as_deref(), Some("invoice"));
+        assert_eq!(q.content_contains.as_deref(), Some("payment"));
+        assert_eq!(q.account.as_deref(), Some("iCloud"));
+        assert_eq!(q.container.as_deref(), Some("INBOX"));
+        // needles stay literal substrings — no implicit % wrapping
+        let q = search_params_to_query(&json!({ "subject": "50%" }));
+        assert_eq!(q.title_contains.as_deref(), Some("50%"));
+    }
+
+    #[test]
+    fn unread_param_maps_to_read_inverted() {
+        // unread:true must ask for UNREAD messages (read = false), matching
+        // the live path; it used to map straight onto `read` and return
+        // read mail — the exact opposite
+        let q = search_params_to_query(&json!({ "unread": true }));
+        assert_eq!(q.read, Some(false));
+        let q = search_params_to_query(&json!({ "unread": false }));
+        assert_eq!(q.read, Some(true));
+        let q = search_params_to_query(&json!({}));
+        assert_eq!(q.read, None);
     }
 
     #[test]
