@@ -82,7 +82,7 @@ final class RecipientEnrichmentTests: XCTestCase {
         let reply = NSAppleEventDescriptor.list()
         for id in [7, 8] {
             let row = NSAppleEventDescriptor.list()
-            row.insert(NSAppleEventDescriptor(int32: id), at: 1)
+            row.insert(NSAppleEventDescriptor(int32: Int32(id)), at: 1)
             let cell = NSAppleEventDescriptor.list()
             cell.insert(NSAppleEventDescriptor(string: "x\(id)@example.com"), at: 1)
             row.insert(cell, at: 2)
