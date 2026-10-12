@@ -47,6 +47,10 @@ pub struct Record {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Participants: for mail `"sender, to1, to2, …"` (sender first, `", "`
+    /// joined, capped at 20 addresses; rows indexed before recipient
+    /// enrichment carry the sender only). Other apps use their natural
+    /// participant list (e.g. event attendees).
     pub participants: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub start_ms: Option<i64>,
@@ -82,8 +86,11 @@ pub struct SearchQuery {
     pub since_ms: Option<i64>,
     pub until_ms: Option<i64>,
     pub limit: usize,
-    /// Case-insensitive substring match against participants (sender for
-    /// mail). Applied as `ILIKE '%…%'` with LIKE wildcards escaped, so the
+    /// Case-insensitive substring match against participants. For mail the
+    /// crawl now stores `"sender, to1, to2, …"` (to-recipient addresses
+    /// appended since the recipient-enrichment change; rows indexed before
+    /// it carry the sender only until a full reindex backfills them).
+    /// Applied as `ILIKE '%…%'` with LIKE wildcards escaped, so the
     /// needle is always a literal substring.
     pub participant_contains: Option<String>,
     /// Case-insensitive substring match against title

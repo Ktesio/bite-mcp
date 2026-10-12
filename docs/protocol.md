@@ -160,7 +160,12 @@ normalized to `""` at ingest, see below; `content` omitted entirely
 when the store-body posture is off / `--no-body`), written 0600 via unique
 tmp + atomic rename. Mail batches hold at most 50 records; the
 Calendar/Reminders/Contacts mirrors stage up to 500. Stale `*.tmp` files are
-swept at job start (10 min age). Ingest deletes batches on success
+swept at job start (10 min age). Mail records carry `participants` as
+`"sender, to1, to2, …"` — the sender first, then to-recipient addresses
+fetched by a separate best-effort per-chunk read (a recipient-read failure
+degrades the chunk to sender-only, never fails the crawl; rows indexed
+before this enrichment carry the sender only until a full reindex).
+Ingest deletes batches on success
 (merge-insert makes re-ingest idempotent). Staged batches are ingested
 automatically: index touches that read the index (`index_status`,
 `search`, `index_wipe`) opportunistically ingest pending batches first —

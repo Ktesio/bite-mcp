@@ -588,9 +588,11 @@ pub fn try_mail_search(params: &Value) -> Option<Result<Value, BiteError>> {
         .and_then(|v| v.as_str())
         .map(String::from)
         .or_else(|| q.text.clone());
-    // The index stores the sender only in `participants`, so a `to` filter
-    // cannot be served faithfully from it — fall back to the live path
-    // (which checks toRecipients) instead of returning wrong results.
+    // The index's `participants` gains to-recipient addresses as rows are
+    // re-crawled, but rows indexed before that change still carry the
+    // sender only — serving `to` from the index would silently miss them.
+    // Fall back to the live path (which checks toRecipients) until a full
+    // reindex (`index_rebuild full: true`) has backfilled recipients.
     if params.get("to").and_then(|v| v.as_str()).is_some() {
         return None;
     }

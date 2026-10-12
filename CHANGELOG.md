@@ -12,6 +12,9 @@ a tag has a matching section here before it can ship.
 
 ### Added
 
+- Mail crawl indexes to-recipient addresses: `participants` is now
+  `"sender, to1, to2, …"` (best-effort per-chunk read, capped at 20,
+  de-duplicated) — the groundwork for serving `to` searches from the index.
 - Machine-readable diagnostics: `bite doctor --json` emits a structured report (#10).
 - Incremental mail crawl: subsequent crawls process only the delta window since
   the last completed run instead of a full reindex (#12).
