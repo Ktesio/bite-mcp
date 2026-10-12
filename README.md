@@ -175,6 +175,8 @@ current size — the number that tells you when `cargo clean` is worth it.
 - [PRIVACY.md](PRIVACY.md) — privacy statement and intended use
 - [NOTICE.md](NOTICE.md) — attribution and trademark notices
 - [SECURITY.md](SECURITY.md) — how to report security issues
+- [CHANGELOG.md](CHANGELOG.md) — notable changes per release; tags are gated
+  on a matching section
 - [docs/setup.md](docs/setup.md) — first-time setup, end to end
 - [docs/PLAN.md](docs/PLAN.md) — the full implementation plan
 - [docs/protocol.md](docs/protocol.md) — the Rust↔Swift helper protocol and
