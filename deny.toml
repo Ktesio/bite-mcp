@@ -1,0 +1,54 @@
+# cargo-deny configuration.
+#
+# Runs in the CI `audit` lane next to cargo-audit. cargo-audit owns RustSec
+# advisory scanning of the committed Cargo.lock; this file covers what it
+# cannot see:
+#
+#   licenses  every crate in the lockfile must carry a license from the
+#             allow-list below (workspace is MIT; dependencies stick to the
+#             usual permissive set — anything new fails the lane and forces
+#             a conscious allow-list decision)
+#   bans      wildcard version requirements are denied outright, duplicate
+#             crate versions surface as warnings — the Lance/DataFusion
+#             graph carries deliberate duplicate majors during stack
+#             transitions (see the arrow 58/60 lockstep pinned in
+#             crates/bite-index), so a hard fail would block those moves
+#             instead of flagging them for review
+#   sources   crates.io is the only allowed registry; any git or alternative
+#             registry dependency fails the lane
+
+[graph]
+all-features = true
+
+[advisories]
+# Advisories are owned by `cargo audit` in the same CI lane; this section
+# only exists so a bare `cargo deny check` stays on supported defaults.
+version = 2
+yanked = "deny"
+
+[licenses]
+version = 2
+allow = [
+  "MIT",
+  "MIT-0",
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "Unicode-3.0",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  "Zlib",
+  "CC0-1.0",
+  "MPL-2.0",
+  "BSL-1.0",
+]
+
+[bans]
+wildcards = "deny"
+multiple-versions = "warn"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

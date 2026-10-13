@@ -38,6 +38,9 @@ jobs:
   audit:
     # Supply-chain lane: scan the committed Cargo.lock for RustSec advisories
     # so a vulnerable transitive dependency is caught by CI before it ships.
+    # cargo-deny layers the deny.toml policies on top: license allow-list,
+    # wildcard-version bans (duplicate majors warn) and a crates.io-only
+    # source policy.
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -49,8 +52,14 @@ jobs:
       - name: Install cargo-audit
         run: cargo +stable install cargo-audit --locked
 
+      - name: Install cargo-deny
+        run: cargo +stable install cargo-deny --locked
+
       - name: Scan the lockfile (RustSec advisories)
         run: cargo +stable audit
+
+      - name: Check licenses, dependency bans and sources (cargo-deny)
+        run: cargo +stable deny --workspace check bans licenses sources
 
   msrv:
     runs-on: ubuntu-latest
