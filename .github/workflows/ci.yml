@@ -60,7 +60,7 @@ jobs:
       - name: Install protoc (required by the Lance stack)
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
 
-      - uses: dtolnay/rust-toolchain@ac438055942cdba6fe7a5c06ca1b9f6216258bc8 # 1.91.0
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # 1.91.0
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
