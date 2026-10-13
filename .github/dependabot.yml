@@ -1,0 +1,79 @@
+# Dependency updates for Ktesio/bite-mcp.
+#
+# Batches kept small and weekly so routine bumps arrive as a handful of
+# reviewable PRs instead of a daily flood. Cargo PRs run the full CI matrix
+# (fmt/clippy/tests on macOS runners); the committed Cargo.lock pins the
+# resolution so every PR diff is reproducible from the lockfile.
+#
+# Note on SHA-pinned actions: the workflows pin third-party actions to commit
+# SHAs with version comments (see ci.yml / release.yml). Dependabot's
+# github-actions updater understands that format and rewrites the SHA while
+# updating the comment, so pins stay both immutable and current.
+version: 2
+
+updates:
+  # Rust workspace dependencies (Cargo.lock).
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "07:00"
+      timezone: "Europe/Amsterdam"
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "chore(deps)"
+      prefix-development: "chore(deps)"
+    labels:
+      - "dependencies"
+    groups:
+      # Lockfile-only bumps (semver-compatible cargo updates) are batched:
+      # they are low-risk and noisy one-by-one.
+      cargo-lockfile-only:
+        applies-to: "version-updates"
+        update-types:
+          - "patch"
+          - "minor"
+      # Major bumps and security fixes each get dedicated PRs — the Lance /
+      # DataFusion stack has broken on majors before, so they deserve full
+      # review against the matrix + msrv lanes.
+      cargo-major-updates:
+        applies-to: "version-updates"
+        update-types:
+          - "major"
+      cargo-security-updates:
+        applies-to: "security-updates"
+        update-types:
+          - "patch"
+          - "minor"
+          - "major"
+
+  # GitHub Actions workflow dependencies (SHA pins in ci.yml / release.yml).
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "07:00"
+      timezone: "Europe/Amsterdam"
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "chore(ci)"
+    labels:
+      - "dependencies"
+    groups:
+      actions-patch-and-minor:
+        applies-to: "version-updates"
+        update-types:
+          - "patch"
+          - "minor"
+      actions-major-updates:
+        applies-to: "version-updates"
+        update-types:
+          - "major"
+      actions-security-updates:
+        applies-to: "security-updates"
+        update-types:
+          - "patch"
+          - "minor"
+          - "major"
