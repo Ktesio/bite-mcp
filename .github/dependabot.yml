@@ -27,20 +27,46 @@ updates:
     labels:
       - "dependencies"
     groups:
+      # The Lance / Arrow stack moves lockstep, in its own PR: lancedb pins
+      # the arrow major its lance build targets, and crates/bite-index also
+      # depends on arrow-array/arrow-schema directly. Bumping the direct
+      # arrow requirements ahead of lancedb once left two arrow majors in
+      # one dependency graph and broke bite-index with arrow-skew trait
+      # bound errors, so every update for this stack — patch, minor or
+      # major — is batched into a single dedicated PR that gets full review
+      # against the matrix + msrv lanes. A lone arrow major in that PR
+      # means the direct pins must be held back; see the lockstep comment
+      # in crates/bite-index/Cargo.toml.
+      lance-arrow-stack:
+        applies-to: "version-updates"
+        patterns:
+          - "lance*"
+          - "arrow*"
       # Lockfile-only bumps (semver-compatible cargo updates) are batched:
-      # they are low-risk and noisy one-by-one.
+      # they are low-risk and noisy one-by-one. The Lance / Arrow stack is
+      # excluded here — it owns the group above.
       cargo-lockfile-only:
         applies-to: "version-updates"
         update-types:
           - "patch"
           - "minor"
-      # Major bumps and security fixes each get dedicated PRs — the Lance /
-      # DataFusion stack has broken on majors before, so they deserve full
-      # review against the matrix + msrv lanes.
+        exclude-patterns:
+          - "lance*"
+          - "arrow*"
+      # Unrelated major bumps get their own dedicated PR — majors have
+      # broken CI before and deserve full review against the matrix + msrv
+      # lanes. The Lance / Arrow stack is excluded so unrelated majors can
+      # never drag the arrow pins ahead of lancedb again.
       cargo-major-updates:
         applies-to: "version-updates"
         update-types:
           - "major"
+        exclude-patterns:
+          - "lance*"
+          - "arrow*"
+      # Security fixes ride together in one PR so they can be reviewed and
+      # merged fast; an advisory against the arrow stack is coordinated
+      # upstream across crates, so urgency beats lockstep grouping here.
       cargo-security-updates:
         applies-to: "security-updates"
         update-types:
