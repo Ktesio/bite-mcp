@@ -418,6 +418,13 @@ impl EntityIndex {
                 .select(lancedb::query::Select::Columns(vec![
                     "updated_ms".to_string()
                 ]))
+                // Without an explicit ordering the limit-1 query returns an
+                // arbitrary row (scan order), so `newest_updated_ms` could
+                // report a stale timestamp. Nulls sink: rows without an
+                // updated_ms must never win.
+                .order_by(Some(vec![lancedb::query::ColumnOrdering::desc_nulls_last(
+                    "updated_ms".to_string(),
+                )]))
                 .limit(1)
                 .execute()
                 .await?;
@@ -802,6 +809,34 @@ mod tests {
         // stats
         let stats = idx.stats().unwrap();
         assert_eq!(stats.total, 2);
+    }
+
+    #[test]
+    fn stats_newest_updated_ms_is_max_not_scan_order() {
+        // regression: the limit-1 `updated_ms` query had no ORDER BY, so
+        // `newest_updated_ms` echoed whichever row the scan happened to
+        // return first (oldest here, by insertion order) instead of the max
+        let dir = temp_dir("stats-ordering");
+        let idx = EntityIndex::open(&dir).unwrap();
+
+        let mut oldest = record("mail", "m1", "first", "oldest body", Some(true));
+        oldest.updated_ms = Some(1_700_000_000_000);
+        let mut middle = record("mail", "m2", "second", "middle body", Some(true));
+        middle.updated_ms = Some(1_700_000_100_000);
+        let mut no_timestamp = record("notes", "n1", "null", "no updated_ms", None);
+        no_timestamp.updated_ms = None;
+        let mut newest = record("mail", "m3", "third", "newest body", Some(false));
+        newest.updated_ms = Some(1_700_000_200_000);
+        // ingest oldest-first so scan order ≠ max
+        idx.ingest(&[oldest, middle, no_timestamp, newest]).unwrap();
+
+        let stats = idx.stats().unwrap();
+        assert_eq!(stats.total, 4);
+        assert_eq!(
+            stats.newest_updated_ms,
+            Some(1_700_000_200_000),
+            "newest_updated_ms must be the max updated_ms, not an arbitrary row"
+        );
     }
 
     #[test]
