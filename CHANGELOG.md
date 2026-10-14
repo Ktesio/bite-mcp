@@ -12,6 +12,9 @@ a tag has a matching section here before it can ship.
 
 ### Added
 
+- cargo-deny supply-chain checks in CI: license allow-list, wildcard-version
+  bans with duplicate-major warnings, and a crates.io-only source policy
+  (`deny.toml`), layered onto the cargo-audit lane (#26).
 - Mail crawl indexes to-recipient addresses: `participants` is now
   `"sender, to1, to2, …"` (best-effort per-chunk read, capped at 20,
   de-duplicated) — the groundwork for serving `to` searches from the index.
