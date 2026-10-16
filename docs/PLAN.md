@@ -43,7 +43,7 @@ Deviations from the original plan, with reasons:
 - **Helper runs on one serial queue.** All Apple work is thread-confined.
   (A main-queue hop was tried and deadlocks — see main.swift comment.)
 - **One core layer, two faces:** `bite-core` registry is the single table of
-  38 tools (name, bridge method, params, JSON schema). MCP and CLI both
+  45 tools (name, bridge method, params, JSON schema). MCP and CLI both
   funnel through `ops::run`. A CI test asserts every registry method exists in
   the Swift dispatcher and no stray handlers exist.
 - **Agent-friendly errors:** every failure carries `{code, message, app, fix}`
@@ -55,9 +55,15 @@ Deviations from the original plan, with reasons:
 
 - `bite-bridge` — protocol types, spawn/lifecycle (handshake, correlation,
   timeouts, crash handling), scripted `bite-fake-helper` for golden tests.
-- `bite-core` — registry (38 tools), config (TOML in app-data dir), dates
+- `bite-core` — registry (45 tools), config (TOML in app-data dir), dates
   (strict ISO for MCP + relaxed parser for CLI: "tomorrow 3pm", "in 2h"),
   error rendering.
+- `bite-index` — local entity index (LanceDB, 0700 data dir): store schema
+  (`app, account, id` merge-insert key), staged-batch ingest, FTS + filtered
+  search, `stats`. Mail Apple Events for indexing and bulk ops belong to the
+  detached `bite-crawl` worker — the second Swift binary the embedded package
+  builds next to `bite-helper` — which stages NDJSON batch files the control
+  plane ingests (see protocol.md's staged-batch handoff).
 - `bite-mcp` (bin `bite`) — clap CLI mirroring every tool; `mcp serve`
   (initialize/tools/resources/prompts/ping); `setup`; `doctor [--fix|--probe]`;
   `install-helper`; `helper ping|version|raw`; config writers for 7 agent
@@ -69,13 +75,14 @@ Deviations from the original plan, with reasons:
   (content-hash gated), exposes `BITE_HELPER_BUILT`; the binary also
   compiles-on-demand from the packaged sources when the artifact is absent.
 
-## 4. MCP tool surface (38 tools)
+## 4. MCP tool surface (45 tools)
 
 calendar: list_calendars, events_search, event_get, event_create, event_update, event_delete*, event_availability ·
 reminders: list_lists, search, create, update, delete* ·
-mail: accounts, mailboxes_list, messages_search, message_get, send, reply, forward, move*, mark, delete*, attachment_save ·
+mail: accounts, mailboxes_list, messages_search, message_get, send, reply, forward, move*, mark, delete*, bulk_mark*, bulk_move*, bulk_delete*, attachment_save ·
 notes: folders, search, get, create, update, delete* ·
 contacts: search, get, create, update, delete*, groups ·
+index: index_rebuild, index_status, index_crawl_cancel, search (local LanceDB full-text; index_wipe is callable via tools/call/CLI but not advertised in tools/list) ·
 messages: send, chats_recent, history
 (* = confirm-first)
 

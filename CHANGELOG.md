@@ -35,6 +35,9 @@ a tag has a matching section here before it can ship.
 
 ### Fixed
 
+- `bite index stats` reports the true newest `updated_ms` — the limit-1
+  lookup is now ordered (`updated_ms DESC NULLS LAST`) instead of returning
+  an arbitrary row in scan order (#28).
 - Index-backed search applies the `subject`, `body`, `from` and `account`
   filters it previously ignored; `unread` results are no longer inverted and
   a `to` filter no longer clobbers `from` — `to` now falls back to the live

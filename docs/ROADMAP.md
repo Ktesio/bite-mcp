@@ -3,8 +3,10 @@
 ## Phase 1 — shipped (Core PIM)
 
 Calendar, Reminders (EventKit) · Contacts (Contacts.framework) · Mail, Notes,
-Messages (ScriptingBridge) · 38 MCP tools · CLI twins · setup/doctor ·
-marketplace plugin · config writers for 7 agent CLIs.
+Messages (ScriptingBridge) · 45 MCP tools · CLI twins · local entity index
+(LanceDB + detached `bite-crawl` worker: incremental Mail crawl, full-text
+search, bulk ops) · setup/doctor · marketplace plugin · config writers for
+7 agent CLIs.
 
 ## Phase 2 — planned
 
