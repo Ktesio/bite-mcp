@@ -25,6 +25,9 @@ a tag has a matching section here before it can ship.
 
 ### Changed
 
+- `bite index stats` computes the total, per-app counts and the newest
+  `updated_ms` in one projected scan instead of eight sequential index
+  queries (#33).
 - Index-backed search folds newly crawled rows into the full-text index as soon
   as a crawl settles, so fresh mail is searchable without an explicit rebuild (#14).
 - Mail crawl transport ported to OSA/NSAppleScript — the raw AppleEvents path is
