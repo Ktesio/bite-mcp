@@ -34,6 +34,9 @@ a tag has a matching section here before it can ship.
 
 ### Fixed
 
+- `bite index stats` reports the true newest `updated_ms` — the limit-1
+  lookup is now ordered (`updated_ms DESC NULLS LAST`) instead of returning
+  an arbitrary row in scan order.
 - Count timeouts during a crawl fall back to blind pagination — one slow mailbox
   no longer fails the whole job (#4).
 - Staged crawl batches are auto-ingested on any index touch, with actionable
