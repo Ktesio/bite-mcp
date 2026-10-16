@@ -99,8 +99,12 @@ jobs:
       - name: Install MCP Inspector and smoke-run the server
         run: |
           set -e
-          npm install -g @modelcontextprotocol/inspector
-          npx @modelcontextprotocol/inspector --cli ./target/debug/bite mcp --method tools/list | tee tools.json
+          # Pin an exact version: an unpinned install (and the npx registry
+          # fallback it used to rely on) resolves whatever is `latest` at run
+          # time, so a compromised or breaking release enters CI unreviewed.
+          # Bump deliberately; the installed binary `mcp-inspector` is on PATH.
+          npm install -g @modelcontextprotocol/inspector@2.11.0
+          mcp-inspector --cli ./target/debug/bite mcp --method tools/list | tee tools.json
           python3 - <<'EOF'
           import json, sys
           data = json.load(open('tools.json'))
