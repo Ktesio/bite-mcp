@@ -86,6 +86,9 @@ fn install_from(src: &PathBuf, stable: &PathBuf) -> Result<PathBuf, BridgeError>
     std::fs::copy(src, stable).map_err(|e| BridgeError::spawn(format!("copy helper: {e}")))?;
     set_exec(stable);
     adhoc_sign(stable);
+    // sign is the LAST metadata/bytes mutation — remember the final pair so
+    // the next compare can short-circuit on the marker
+    write_install_marker(src, stable);
     // the crawler binary ships alongside the helper
     if let Some(crawl_src) = src.parent().map(|d| d.join("bite-crawl")) {
         if crawl_src.exists() {
@@ -94,6 +97,7 @@ fn install_from(src: &PathBuf, stable: &PathBuf) -> Result<PathBuf, BridgeError>
                 .map_err(|e| BridgeError::spawn(format!("copy crawl binary: {e}")))?;
             set_exec(&crawl_dst);
             adhoc_sign(&crawl_dst);
+            write_install_marker(&crawl_src, &crawl_dst);
         }
     }
     Ok(stable.clone())
@@ -242,11 +246,99 @@ fn sweep_stale_scratch() {
     sweep_stale_scratch_in(&bite_core::config::data_dir(), std::time::SystemTime::now());
 }
 
+/// Metadata fingerprint of one side of the install compare.
+#[derive(serde::Serialize, serde::Deserialize, PartialEq, Eq, Debug, Clone)]
+struct SideMeta {
+    len: u64,
+    /// (secs since UNIX_EPOCH, nanos); None = pre-epoch or unreadable mtime
+    mtime: Option<(i64, u32)>,
+}
+
+/// Remembered (src, dst) metadata of the last CONFIRMED-identical install,
+/// written to `<dst>.install-meta` in the same 0700 dir. Plain metadata
+/// equality can never hold on the real install path — `install_from` runs
+/// codesign AFTER `fs::copy`, rewriting the installed binary's bytes, size
+/// AND mtime — so the fast path must compare against this snapshot, not
+/// against live metadata.
+#[derive(serde::Serialize, serde::Deserialize, PartialEq, Eq, Debug, Clone)]
+struct InstallMarker {
+    src: SideMeta,
+    dst: SideMeta,
+}
+
+fn install_meta_path(dst: &std::path::Path) -> std::path::PathBuf {
+    let name = dst
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    dst.with_file_name(format!("{name}.install-meta"))
+}
+
+fn side_meta(path: &std::path::Path) -> Option<SideMeta> {
+    let m = std::fs::metadata(path).ok()?;
+    Some(SideMeta {
+        len: m.len(),
+        mtime: m
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| (d.as_secs() as i64, d.subsec_nanos())),
+    })
+}
+
+/// Best-effort marker write (ignore errors: the fast path just misses and
+/// falls back to the byte compare).
+fn write_install_marker(src: &std::path::Path, dst: &std::path::Path) {
+    let Some(src_meta) = side_meta(src) else {
+        return;
+    };
+    let Some(dst_meta) = side_meta(dst) else {
+        return;
+    };
+    let marker = InstallMarker {
+        src: src_meta,
+        dst: dst_meta,
+    };
+    let Ok(text) = serde_json::to_string(&marker) else {
+        return;
+    };
+    let _ = bite_core::fsops::write_private(&install_meta_path(dst), text.as_bytes());
+}
+
+fn read_install_marker(dst: &std::path::Path) -> Option<InstallMarker> {
+    let text = std::fs::read_to_string(install_meta_path(dst)).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+/// Preserve the installed binary (and its TCC identity) when content is
+/// unchanged. Fast path: both sides' (size, mtime) still match the marker
+/// written at the last confirmed-identical install (after copy+sign, when
+/// the signed binary's metadata is final) — no multi-MB byte read. The
+/// accepted trade-off remains, but narrower than plain metadata equality:
+/// a pair matching the REMEMBERED metadata is trusted without re-reading
+/// the bytes — the trust is in our own post-sign snapshot (which survives
+/// codesign, where live-metadata equality never could), and a stale
+/// snapshot is simply a miss, never a false negative. A marker miss falls
+/// back to the authoritative byte compare; when the bytes say "same", the
+/// marker is refreshed so later checks short-circuit.
 fn path_exists_with_same_content(src: &PathBuf, dst: &PathBuf) -> bool {
-    dst.exists()
-        && std::fs::read(src)
-            .map(|a| a == std::fs::read(dst).unwrap_or_default())
-            .unwrap_or(false)
+    if !dst.exists() {
+        return false;
+    }
+    let marker = read_install_marker(dst);
+    if let (Some(marker), Some(src_meta), Some(dst_meta)) = (marker, side_meta(src), side_meta(dst))
+    {
+        if marker.src == src_meta && marker.dst == dst_meta {
+            return true;
+        }
+    }
+    let same = std::fs::read(src)
+        .map(|a| a == std::fs::read(dst).unwrap_or_default())
+        .unwrap_or(false);
+    if same {
+        write_install_marker(src, dst);
+    }
+    same
 }
 
 fn set_exec(path: &PathBuf) {
@@ -405,5 +497,72 @@ mod tests {
             .map(|s| s.success())
             .unwrap_or(false);
         assert!(ok, "touch -t failed for {}", path.display());
+    }
+
+    #[test]
+    fn install_marker_fast_path_fallback_and_refresh() {
+        let dir = tempfile::Builder::new()
+            .prefix("bite-helper-compare-")
+            .tempdir()
+            .unwrap();
+        let (src, dst) = (dir.path().join("src"), dir.path().join("dst"));
+
+        // dst missing → must copy
+        std::fs::write(&src, b"identical").unwrap();
+        assert!(!path_exists_with_same_content(&src, &dst));
+
+        // first compare (no marker yet): the byte compare says "same" →
+        // true, AND the confirmed pair is remembered in the sidecar marker
+        std::fs::write(&dst, b"identical").unwrap();
+        assert!(path_exists_with_same_content(&src, &dst));
+        assert!(
+            install_meta_path(&dst).exists(),
+            "a confirmed pair must be remembered"
+        );
+        let recorded_src = side_meta(&src).unwrap();
+        let restore_mtime = |path: &std::path::Path, meta: &SideMeta| {
+            let t = meta
+                .mtime
+                .map(|(s, n)| {
+                    std::time::SystemTime::UNIX_EPOCH + std::time::Duration::new(s as u64, n)
+                })
+                .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+            let f = std::fs::File::open(path).unwrap();
+            f.set_times(std::fs::FileTimes::new().set_modified(t))
+                .unwrap();
+        };
+
+        // marker HIT short-circuits: bytes now DIFFER but (size, mtime)
+        // still match the remembered pair — a byte compare would say
+        // "different", so a true answer can only come from the marker
+        std::fs::write(&src, b"identicaL").unwrap(); // same 9 bytes length
+        restore_mtime(&src, &recorded_src);
+        assert!(
+            path_exists_with_same_content(&src, &dst),
+            "marker hit must win over the byte compare"
+        );
+
+        // src changed (size no longer matches the marker) → byte-compare
+        // fallback reports "different"
+        std::fs::write(&src, b"now-longer").unwrap();
+        assert!(!path_exists_with_same_content(&src, &dst));
+
+        // dst changed (mtime no longer matches the marker) while bytes are
+        // identical → fallback says "same" AND the marker is REFRESHED to
+        // the new metadata, so a later check short-circuits again
+        let fresh = std::time::SystemTime::now();
+        let f = std::fs::File::open(&dst).unwrap();
+        f.set_times(std::fs::FileTimes::new().set_modified(fresh))
+            .unwrap();
+        drop(f);
+        std::fs::write(&src, b"identical").unwrap(); // bytes match dst again
+        assert!(path_exists_with_same_content(&src, &dst));
+        let marker = read_install_marker(&dst).expect("marker present after refresh");
+        assert_eq!(
+            marker.dst,
+            side_meta(&dst).unwrap(),
+            "marker refreshed to the NEW dst metadata"
+        );
+        assert_eq!(marker.src, side_meta(&src).unwrap());
     }
 }

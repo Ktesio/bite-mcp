@@ -45,13 +45,17 @@ One command, four stages, in order:
    `bite-helper` at a stable path under the data dir. The stable path is
    deliberate: macOS ties permission grants to the binary's path, so a
    helper that moves would re-prompt for everything. If this stage fails,
-   the usual fix is `xcode-select --install` and retry.
+   the rendered error names its real fix (most often installing the Xcode
+   Command Line Tools via `xcode-select --install`, then re-running).
 3. **`bite doctor`** — a prompt-free environment check: macOS version,
    helper presence and capabilities, per-app permission status. This is
    read-only; it never triggers prompts (that's what `--probe` is for —
+   it live-tests Apple Events and can raise prompts, so it warns first;
    see [permissions.md](permissions.md)). Add `--json` for the same report
    as one compact machine-readable object (exit codes unchanged:
-   0 clean, 2 problems).
+   0 clean, 2 problems). A denied crawler Mail probe counts as a problem
+   (exit 2); the missing Swift toolchain shows as a warning (○) and never
+   does.
 4. **Agent clients** — for every agent CLI it detects (by config file or
    binary on `PATH`), bite asks once:
 
@@ -66,7 +70,9 @@ One command, four stages, in order:
 
 Flags: `--all-clients` (or `--yes`) registers every detected client without
 asking — for headless use. The only prompt in the whole run is the per-client
-registration question; pressing Enter accepts.
+registration question; pressing Enter accepts. Closed stdin (EOF) counts as
+`n` for every prompt — a scripted run that wants registrations passes
+`--yes` (piped answers like `printf 'y\n'` still work).
 
 The run ends with the marketplace commands for Claude Code / ZCode and
 the next-steps list. Exit code 0 = all good; 2 = some client configs
@@ -87,7 +93,11 @@ format — nothing else in the file is touched:
 | VS Code | `~/Library/Application Support/Code/User/mcp.json` | `"servers"` with `"type": "stdio"` |
 | Gemini CLI | `~/.gemini/settings.json` | `"mcpServers"` |
 
-All entries are the same server: `bite mcp` over stdio.
+All entries are the same server: `bite mcp` over stdio. The registered
+command is the resolved absolute `bite` path (installed copies), so
+GUI-launched clients can start it without `~/.cargo/bin` on their PATH;
+builds straight from a dev checkout register the bare `bite` instead —
+build-tree binaries vanish on the next `cargo clean`.
 
 The writing itself is defensive by design:
 
@@ -188,9 +198,9 @@ Performance section.
 | Symptom | First move |
 |---|---|
 | `bite: command not found` after install | `$CARGO_HOME/bin` not on `PATH` |
-| helper install fails in setup | `xcode-select --install`, retry `bite setup` |
+| helper install fails in setup | read the rendered error's fix (usually `xcode-select --install`), retry `bite setup` |
 | install refuses a `swift` on `PATH` | intentional: the PATH entry is writable or foreign — use the stock toolchain (`xcode-select`) |
 | agent doesn't list bite tools | restart the CLI; then `bite doctor` (client lines) |
 | setup exit 2 | read the stderr summary — fix the named config, re-run |
 | permission denied on a call | `bite doctor --fix`; details in [permissions.md](permissions.md) |
-| Mail tools work but indexing fails | crawler TCC identity — see the macOS 27+ section of [permissions.md](permissions.md) |
+| Mail tools work but indexing fails (`bite doctor` exits 2 on the crawler line) | crawler TCC identity — approve the Mail automation prompt once from your terminal; see the macOS 27+ section of [permissions.md](permissions.md) |
