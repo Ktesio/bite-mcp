@@ -25,6 +25,10 @@ a tag has a matching section here before it can ship.
 
 ### Changed
 
+- Index-backed `search` returns newest-first for filter-only queries
+  (`updated_ms DESC NULLS LAST`) instead of an arbitrary scan-order page,
+  matching the live `messages_search` walk; full-text queries keep BM25
+  relevance ranking (#34).
 - `bite index stats` computes the total, per-app counts and the newest
   `updated_ms` in one projected scan instead of eight sequential index
   queries (#33).

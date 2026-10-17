@@ -384,6 +384,18 @@ impl EntityIndex {
                         .with_columns(&["search_text".to_string()])
                         .map_err(|e| IndexError::Other(e.to_string()))?,
                 );
+            } else {
+                // Filter-only queries have no relevance ranking, so without
+                // an explicit ordering the limit-N page was an arbitrary
+                // scan-order subset — while both the CLI help and the
+                // Apple-side `messages_search` document newest-first. Nulls
+                // sink: rows without an updated_ms must never win a slot.
+                // FTS queries deliberately stay unordered so BM25 relevance
+                // outranks recency there.
+                builder =
+                    builder.order_by(Some(vec![lancedb::query::ColumnOrdering::desc_nulls_last(
+                        "updated_ms".to_string(),
+                    )]));
             }
             builder = builder.limit(q.limit.max(1));
             let stream = builder.execute().await?;
@@ -994,6 +1006,76 @@ mod tests {
             .unwrap();
         assert_eq!(res.total, Some(1));
         assert_eq!(res.hits[0].id, "m1");
+    }
+
+    #[test]
+    fn search_filter_only_returns_newest_first() {
+        // regression: filter-only queries had no ORDER BY, so a limit-N page
+        // was an arbitrary scan-order subset — the CLI help and the
+        // Apple-side `messages_search` both document newest-first
+        let dir = temp_dir("filter-order");
+        let idx = EntityIndex::open(&dir).unwrap();
+        // ingest in shuffled order so physical/scan order ≠ recency order
+        let stamps: [(&str, Option<i64>); 5] = [
+            ("m3", Some(3_000)),
+            ("m1", Some(1_000)),
+            ("m4", None), // no updated_ms — must sink below every stamped row
+            ("m5", Some(5_000)),
+            ("m2", Some(2_000)),
+        ];
+        let recs: Vec<Record> = stamps
+            .iter()
+            .map(|(id, updated)| {
+                let mut r = record("mail", id, "title", "content", Some(false));
+                r.updated_ms = *updated;
+                r
+            })
+            .collect();
+        idx.ingest(&recs).unwrap();
+
+        // limit below the row count: exactly the newest 3, descending
+        let res = idx
+            .search(&SearchQuery {
+                limit: 3,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(res.total, Some(5));
+        let ids: Vec<&str> = res.hits.iter().map(|h| h.id.as_str()).collect();
+        assert_eq!(ids, vec!["m5", "m3", "m2"]);
+        // the unstamped row never wins a slot while stamped rows exist
+        assert!(!ids.contains(&"m4"));
+    }
+
+    #[test]
+    fn search_fts_stays_relevance_ordered_not_newest_first() {
+        // the ordering above must not leak into the FTS path: BM25 relevance
+        // outranks recency there. m_old repeats the needle far more densely
+        // (clearly higher score) but is the OLDEST row — if the order_by had
+        // leaked into FTS, m_new would come first.
+        let dir = temp_dir("fts-order");
+        let idx = EntityIndex::open(&dir).unwrap();
+        let mut old = record(
+            "mail",
+            "m_old",
+            "alpha alpha alpha",
+            "alpha alpha alpha",
+            Some(false),
+        );
+        old.updated_ms = Some(1_000);
+        let mut new = record("mail", "m_new", "beta gamma", "alpha", Some(false));
+        new.updated_ms = Some(9_000);
+        idx.ingest(&[old, new]).unwrap();
+
+        let res = idx
+            .search(&SearchQuery {
+                text: Some("alpha".into()),
+                limit: 10,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(res.hits.len(), 2);
+        assert_eq!(res.hits[0].id, "m_old");
     }
 
     #[test]
