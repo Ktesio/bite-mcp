@@ -29,6 +29,9 @@ a tag has a matching section here before it can ship.
   (`updated_ms DESC NULLS LAST`) instead of an arbitrary scan-order page,
   matching the live `messages_search` walk; full-text queries keep BM25
   relevance ranking (#34).
+- `bite index stats` computes the total, per-app counts and the newest
+  `updated_ms` in one projected scan instead of eight sequential index
+  queries (#33).
 - Dependency floors raised to `dirs` 7, `toml` 1.1 and `toml_edit` 0.25 (#27).
 - Index-backed search folds newly crawled rows into the full-text index as soon
   as a crawl settles, so fresh mail is searchable without an explicit rebuild (#14).

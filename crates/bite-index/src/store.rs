@@ -407,9 +407,52 @@ impl EntityIndex {
     pub fn stats(&self) -> Result<IndexStats, IndexError> {
         self.rt.block_on(async {
             let table = self.table().await?;
-            let total = table.count_rows(None).await?;
+            // One projected scan computes total, per-app counts and the
+            // newest `updated_ms` together. The previous shape issued one
+            // full-table `count_rows` per app plus an unfiltered total
+            // (7 scans) and an ordered limit-1 lookup on top (8 queries).
+            let stream = table
+                .query()
+                .select(lancedb::query::Select::Columns(vec![
+                    "app".to_string(),
+                    "updated_ms".to_string(),
+                ]))
+                .execute()
+                .await?;
+            use futures::StreamExt;
+            let mut stream = stream;
+            let mut counts: std::collections::HashMap<String, usize> =
+                std::collections::HashMap::new();
+            let mut newest: Option<i64> = None;
+            while let Some(batch) = stream.next().await {
+                let batch = batch.map_err(IndexError::from)?;
+                // `app` is non-nullable Utf8 and `updated_ms` nullable Int64
+                // in the schema; a column that is missing or mistyped means
+                // the store is corrupt, not empty.
+                let (Some(apps), Some(timestamps)) = (
+                    batch
+                        .column_by_name("app")
+                        .and_then(|a| a.as_any().downcast_ref::<StringArray>()),
+                    batch
+                        .column_by_name("updated_ms")
+                        .and_then(|a| a.as_any().downcast_ref::<Int64Array>()),
+                ) else {
+                    return Err(IndexError::Other(
+                        "stats: app/updated_ms columns missing from scan".into(),
+                    ));
+                };
+                for i in 0..batch.num_rows() {
+                    *counts.entry(apps.value(i).to_string()).or_insert(0) += 1;
+                    if !timestamps.is_null(i) {
+                        // Nulls sink: rows without an updated_ms must never win.
+                        newest = newest.max(Some(timestamps.value(i)));
+                    }
+                }
+            }
+            // Unknown app values still count toward `total`; per_app keeps
+            // the fixed app order and omits zero-count apps.
+            let total = counts.values().sum();
             let mut per_app = Vec::new();
-            let mut newest = None;
             for app in [
                 "mail",
                 "calendar",
@@ -418,37 +461,8 @@ impl EntityIndex {
                 "notes",
                 "messages",
             ] {
-                let n = table
-                    .count_rows(Some(format!("app = {}", sql_str(app))))
-                    .await?;
-                if n > 0 {
-                    per_app.push((app.to_string(), n));
-                }
-            }
-            let stream = table
-                .query()
-                .select(lancedb::query::Select::Columns(vec![
-                    "updated_ms".to_string()
-                ]))
-                // Without an explicit ordering the limit-1 query returns an
-                // arbitrary row (scan order), so `newest_updated_ms` could
-                // report a stale timestamp. Nulls sink: rows without an
-                // updated_ms must never win.
-                .order_by(Some(vec![lancedb::query::ColumnOrdering::desc_nulls_last(
-                    "updated_ms".to_string(),
-                )]))
-                .limit(1)
-                .execute()
-                .await?;
-            use futures::StreamExt;
-            let mut stream = stream;
-            while let Some(batch) = stream.next().await {
-                let batch = batch.map_err(IndexError::from)?;
-                let col = batch.column(0);
-                if let Some(arr) = col.as_any().downcast_ref::<Int64Array>() {
-                    if !arr.is_empty() && !arr.is_null(0) {
-                        newest = Some(arr.value(0));
-                    }
+                if let Some(n) = counts.get(app) {
+                    per_app.push((app.to_string(), *n));
                 }
             }
             let fts_indexed = self.has_fts().await?;
@@ -849,6 +863,36 @@ mod tests {
             Some(1_700_000_200_000),
             "newest_updated_ms must be the max updated_ms, not an arbitrary row"
         );
+    }
+
+    #[test]
+    fn stats_single_scan_contract_total_per_app_newest() {
+        // stats() computes everything in one projected scan now; pin the
+        // observable contract: total counts every row (unknown app values
+        // included), per_app keeps the fixed app order and omits zero-count
+        // apps, and newest skips rows without an updated_ms.
+        let dir = temp_dir("stats-single-scan");
+        let idx = EntityIndex::open(&dir).unwrap();
+
+        let mut older = record("mail", "m1", "one", "body one", Some(true));
+        older.updated_ms = Some(1_700_000_050_000);
+        let mut no_timestamp = record("mail", "m2", "two", "body two", None);
+        no_timestamp.updated_ms = None;
+        let mut newest = record("notes", "n1", "note", "note body", None);
+        newest.updated_ms = Some(1_700_000_150_000);
+        let mut unknown_app = record("future-app", "x1", "mystery", "??", None);
+        unknown_app.updated_ms = Some(9);
+        idx.ingest(&[older, no_timestamp, newest, unknown_app])
+            .unwrap();
+
+        let stats = idx.stats().unwrap();
+        assert_eq!(stats.total, 4, "unknown app values count toward total");
+        assert_eq!(
+            stats.per_app,
+            vec![("mail".to_string(), 2), ("notes".to_string(), 1)],
+            "per_app keeps fixed order, skips zero-count and unknown apps"
+        );
+        assert_eq!(stats.newest_updated_ms, Some(1_700_000_150_000));
     }
 
     #[test]
