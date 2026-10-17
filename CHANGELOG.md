@@ -17,7 +17,7 @@ a tag has a matching section here before it can ship.
   (`deny.toml`), layered onto the cargo-audit lane (#26).
 - Mail crawl indexes to-recipient addresses: `participants` is now
   `"sender, to1, to2, …"` (best-effort per-chunk read, capped at 20,
-  de-duplicated) — the groundwork for serving `to` searches from the index.
+  de-duplicated) — the groundwork for serving `to` searches from the index (#18).
 - Machine-readable diagnostics: `bite doctor --json` emits a structured report (#10).
 - Incremental mail crawl: subsequent crawls process only the delta window since
   the last completed run instead of a full reindex (#12).
@@ -28,6 +28,7 @@ a tag has a matching section here before it can ship.
 - `bite index stats` computes the total, per-app counts and the newest
   `updated_ms` in one projected scan instead of eight sequential index
   queries (#33).
+- Dependency floors raised to `dirs` 7, `toml` 1.1 and `toml_edit` 0.25 (#27).
 - Index-backed search folds newly crawled rows into the full-text index as soon
   as a crawl settles, so fresh mail is searchable without an explicit rebuild (#14).
 - Mail crawl transport ported to OSA/NSAppleScript — the raw AppleEvents path is
@@ -39,7 +40,11 @@ a tag has a matching section here before it can ship.
 
 - `bite index stats` reports the true newest `updated_ms` — the limit-1
   lookup is now ordered (`updated_ms DESC NULLS LAST`) instead of returning
-  an arbitrary row in scan order.
+  an arbitrary row in scan order (#28).
+- Index-backed search applies the `subject`, `body`, `from` and `account`
+  filters it previously ignored; `unread` results are no longer inverted and
+  a `to` filter no longer clobbers `from` — `to` now falls back to the live
+  helper (#16).
 - Count timeouts during a crawl fall back to blind pagination — one slow mailbox
   no longer fails the whole job (#4).
 - Staged crawl batches are auto-ingested on any index touch, with actionable
@@ -52,6 +57,15 @@ a tag has a matching section here before it can ship.
 
 ### Security
 
+- Toolchain resolution hardened: `swift` and `codesign` are only accepted from
+  securely-owned directories (or their stock system locations) and `xcrun` only
+  from its fixed `/usr/bin` path, so a binary planted on a writable `PATH`
+  entry can no longer build or sign the installed helper (#15).
+- Transitive `rustls` lockfile bump to 0.23.46, clearing four advisories
+  published 2026-10-14 (RUSTSEC-2026-0346 … -0349, incl. the medium-severity
+  `Debug` exposure of TLS session secrets) (#27).
+- CI workflows pin every third-party action to an immutable commit SHA instead
+  of a movable tag (#19).
 - Client-supplied search limits are capped at 200 at the MCP boundary (#13).
 
 ### Documentation
