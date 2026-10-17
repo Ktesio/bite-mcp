@@ -116,13 +116,21 @@ pub struct DevTarget {
 }
 
 pub fn run(fix: bool, probe: bool, json_out: bool) -> Result<i32, bite_core::BiteError> {
+    if probe {
+        // stderr on purpose: stdout may carry the --json report. The probe
+        // live-tests Apple Events, which can raise TCC prompts — say so
+        // BEFORE it happens, not just in docs.
+        eprintln!(
+            "note: --probe live-tests Mail/Notes/Messages Apple Events — macOS permission prompts may appear"
+        );
+    }
     let report = collect(fix, probe)?;
 
     if json_out {
         // One compact JSON object on stdout; trailing newline via println.
         println!("{}", serde_json::to_string(&report).unwrap_or_default());
     } else {
-        print!("{}", render_human(&report, fix));
+        print!("{}", render_human(&report));
     }
     if report.problems == 0 {
         Ok(0)
@@ -213,20 +221,6 @@ fn collect(fix: bool, probe: bool) -> Result<DoctorReport, bite_core::BiteError>
                     if !ok {
                         problems += 1;
                     }
-                    if fix && !ok {
-                        let pane = match app {
-                            "calendar" => "Privacy_Calendars",
-                            "reminders" => "Privacy_Reminders",
-                            "contacts" => "Privacy_Contacts",
-                            _ => "Privacy_Automation",
-                        };
-                        let url = format!(
-                            "x-apple.systempreferences:com.apple.preference.security?{pane}"
-                        );
-                        // stderr on purpose: stdout may carry the JSON report
-                        eprintln!("        {DIM}→ opening System Settings…{RESET}");
-                        let _ = std::process::Command::new("open").arg(url).status();
-                    }
                     apps.push(AppStatus {
                         app: app.to_string(),
                         state,
@@ -243,6 +237,17 @@ fn collect(fix: bool, probe: bool) -> Result<DoctorReport, bite_core::BiteError>
                         note: Some(bite_core::BiteError(e).render()),
                     });
                 }
+            }
+        }
+        if fix {
+            // panes are deduped and settings-blind states skipped (see
+            // fix_panes) — opening happens after all probes so the loop
+            // above stays pure
+            for pane in fix_panes(&apps) {
+                let url = format!("x-apple.systempreferences:com.apple.preference.security?{pane}");
+                // stderr on purpose: stdout may carry the JSON report
+                eprintln!("        {DIM}→ opening System Settings…{RESET}");
+                let _ = std::process::Command::new("open").arg(url).status();
             }
         }
     }
@@ -284,6 +289,11 @@ fn collect(fix: bool, probe: bool) -> Result<DoctorReport, bite_core::BiteError>
             },
         });
     }
+    // A denied crawler is a REAL problem (silent empty Mail results once
+    // indexing starts) and must match the rendered ✗: exit 2. It used to
+    // render as a failure without ever being counted. Pure and extracted so
+    // production can't silently stop counting while the suite stays green.
+    problems = problems_with_crawler(problems, &crawler_mail);
 
     // ── Storage ──
     let storage = collect_storage();
@@ -328,6 +338,47 @@ fn app_state_note(state: &str) -> (bool, Option<String>) {
         "app_missing" => (false, Some("app not installed".to_string())),
         _ => (true, Some(state.to_string())),
     }
+}
+
+/// Does this crawler Mail-probe state count toward the exit-code contract?
+/// Only an explicit `denied` is a problem: `no_accounts` is a healthy
+/// system, and a probe that failed to RUN is not evidence of denial.
+fn crawler_state_is_problem(state: &str) -> bool {
+    state == "denied"
+}
+
+/// Problems counted from the crawler Mail probe: only an explicit `denied`
+/// adds one; healthy, account-less and failed-to-run probes — and no probe
+/// at all (bite-crawl not installed, `None`) — add nothing.
+fn problems_with_crawler(base: usize, crawler: &Option<CrawlerMailStatus>) -> usize {
+    let denied = crawler
+        .as_ref()
+        .is_some_and(|c| crawler_state_is_problem(&c.state));
+    base + usize::from(denied)
+}
+
+/// System Settings panes `--fix` should open for the collected app states.
+/// One pane per DISTINCT Settings surface (mail/notes/messages all share
+/// the single `Privacy_Automation` pane — opening it once per denied app
+/// used to stack three identical windows) and none for states a Settings
+/// pane cannot fix (an app that isn't installed has no checkbox to grant).
+fn fix_panes(apps: &[AppStatus]) -> Vec<&'static str> {
+    let mut panes: Vec<&'static str> = Vec::new();
+    for a in apps {
+        if a.ok || a.state == "app_missing" {
+            continue;
+        }
+        let pane = match a.app.as_str() {
+            "calendar" => "Privacy_Calendars",
+            "reminders" => "Privacy_Reminders",
+            "contacts" => "Privacy_Contacts",
+            _ => "Privacy_Automation",
+        };
+        if !panes.contains(&pane) {
+            panes.push(pane);
+        }
+    }
+    panes
 }
 
 /// Storage overview: data-dir size breakdown, batch backlog, and temp-dir
@@ -438,8 +489,9 @@ fn detect_dev_target_at(exe: &std::path::Path) -> Option<DevTarget> {
     })
 }
 
-/// The classic human report, byte-for-byte the pre-JSON output.
-fn render_human(report: &DoctorReport, fix: bool) -> String {
+/// The classic human report, byte-for-byte the pre-JSON output (plus the
+/// honest-warning upgrade: a missing toolchain shows ○, not ✗).
+fn render_human(report: &DoctorReport) -> String {
     let mut out = String::new();
     macro_rules! line {
         ($($arg:tt)*) => {{
@@ -464,7 +516,14 @@ fn render_human(report: &DoctorReport, fix: bool) -> String {
             line!("{}", status_line(true, "Xcode Command Line Tools"));
             line!("        {DIM}{detail}{RESET}");
         }
-        None => line!("{}", status_line(false, "Xcode Command Line Tools")),
+        None => line!(
+            "{}",
+            warning_line(
+                "Xcode Command Line Tools",
+                "not found — needed only to compile the helper from source; \
+                 installs from prebuilt binaries don't need it"
+            )
+        ),
     }
 
     // ── Helper ──
@@ -481,9 +540,10 @@ fn render_human(report: &DoctorReport, fix: bool) -> String {
             "        {RED}{}{RESET}",
             report.helper.error.as_deref().unwrap_or_default()
         );
-        if fix {
-            line!("        {DIM}→ run: bite install-helper --force{RESET}");
-        }
+        // the fix is always printed: a broken helper blocks everything, and
+        // the hint costs one line — gating it behind --fix used to leave
+        // plain `bite doctor` runs with a red ✗ and no next step
+        line!("        {DIM}→ run: bite install-helper --force{RESET}");
     }
 
     // ── Per-app permission probes ──
@@ -742,6 +802,15 @@ fn scratch_action(present: bool, helper_installed: bool, stale: bool) -> Scratch
 fn status_line(ok: bool, label: &str) -> String {
     let (icon, color) = if ok { ("✓", GREEN) } else { ("✗", RED) };
     format!("  {color}{icon}{RESET} {label}")
+}
+
+/// Warning variant of the `status_line` family: yellow ○ + a DIM note on
+/// the next line. Warnings are honest-but-not-failing — they never count
+/// toward `problems`/exit 2, so the icon must not read as an error (a red
+/// ✗ for something doctor deliberately does not count lied about the exit
+/// code).
+fn warning_line(label: &str, note: &str) -> String {
+    format!("  {YELLOW}○{RESET} {label}\n        {DIM}{note}{RESET}")
 }
 
 #[cfg(test)]
@@ -1039,7 +1108,7 @@ mod tests {
         let v = serde_json::to_value(&r).unwrap();
         assert!(v.get("dev_target").is_some(), "key must exist");
         assert_eq!(v["dev_target"], serde_json::Value::Null);
-        let text = render_human(&r, false);
+        let text = render_human(&r);
         assert!(!text.contains("cargo target"), "got: {text}");
     }
 
@@ -1066,7 +1135,7 @@ mod tests {
 
     #[test]
     fn human_render_keeps_the_classic_shape() {
-        let text = render_human(&sample_report(), false);
+        let text = render_human(&sample_report());
         let lines: Vec<&str> = text.split('\n').collect();
         assert_eq!(lines[0], "bite doctor");
         // verdict line is the last content line (before the trailing "")
@@ -1084,23 +1153,122 @@ mod tests {
     }
 
     #[test]
-    fn human_render_fix_hint_only_when_asked() {
+    fn human_render_helper_fix_hint_always_prints() {
+        // the old behavior printed the fix only with --fix, leaving a plain
+        // `bite doctor` with a red ✗ and no next step — the hint is now
+        // unconditional (the helper being down blocks everything)
         let mut r = sample_report();
         r.helper.ok = false;
         r.helper.path = None;
         r.helper.capabilities = Vec::new();
         r.helper.error = Some("boom".to_string());
-        let with_fix = render_human(&r, true);
-        assert!(with_fix.contains("→ run: bite install-helper --force"));
-        let without_fix = render_human(&r, false);
-        assert!(!without_fix.contains("→ run: bite install-helper --force"));
+        let text = render_human(&r);
+        assert!(text.contains("→ run: bite install-helper --force"));
+    }
+
+    #[test]
+    fn toolchain_missing_renders_warning_not_failure() {
+        // the toolchain is informational by design (never counted) — the
+        // icon must match that contract: yellow ○ + note, not a red ✗
+        let mut r = sample_report();
+        r.toolchain = None;
+        r.problems = 0;
+        let text = render_human(&r);
+        let line = text
+            .lines()
+            .find(|l| l.contains("Xcode Command Line Tools"))
+            .expect("toolchain line present");
+        assert!(line.contains(YELLOW) && line.contains('○'), "got: {line}");
+        assert!(!line.contains(RED) && !line.contains('✗'), "got: {line}");
+        assert!(text.contains("compile the helper from source"));
+        assert!(text.contains("all checks passed"), "warnings never count");
+    }
+
+    #[test]
+    fn crawler_denied_is_a_problem_other_states_are_not() {
+        // denied = the one state that needs fixing (exit 2, matching the ✗)
+        assert!(crawler_state_is_problem("denied"));
+        // healthy system / nothing to index / probe couldn't run: no count
+        assert!(!crawler_state_is_problem("authorized"));
+        assert!(!crawler_state_is_problem("no_accounts"));
+        assert!(!crawler_state_is_problem("failed"));
+    }
+
+    #[test]
+    fn crawler_denied_adds_one_problem_everything_else_adds_none() {
+        // the COUNTING is pinned separately from the predicate, so a
+        // production call site that stops consulting it fails here
+        let status = |state: &str| {
+            Some(CrawlerMailStatus {
+                state: state.to_string(),
+                detail: None,
+            })
+        };
+        assert_eq!(problems_with_crawler(3, &status("denied")), 4);
+        assert_eq!(problems_with_crawler(3, &status("authorized")), 3);
+        assert_eq!(problems_with_crawler(3, &status("no_accounts")), 3);
+        assert_eq!(problems_with_crawler(3, &status("failed")), 3);
+        // no probe at all (bite-crawl not installed) → no count either
+        assert_eq!(problems_with_crawler(3, &None), 3);
+    }
+
+    #[test]
+    fn fix_panes_dedupe_automation_and_skip_app_missing() {
+        let app = |name: &str, state: &str, ok: bool| AppStatus {
+            app: name.to_string(),
+            state: state.to_string(),
+            ok,
+            note: None,
+        };
+        // nothing denied → nothing opens
+        assert!(fix_panes(&[app("calendar", "authorized", true)]).is_empty());
+        // three automation-gated apps denied → ONE Privacy_Automation open,
+        // not three identical windows
+        assert_eq!(
+            fix_panes(&[
+                app("mail", "denied", false),
+                app("notes", "denied", false),
+                app("messages", "denied", false),
+            ]),
+            vec!["Privacy_Automation"]
+        );
+        // distinct surfaces stay in first-seen order
+        assert_eq!(
+            fix_panes(&[
+                app("reminders", "denied", false),
+                app("mail", "denied", false),
+                app("contacts", "denied", false),
+                app("calendar", "denied", false),
+            ]),
+            vec![
+                "Privacy_Reminders",
+                "Privacy_Automation",
+                "Privacy_Contacts",
+                "Privacy_Calendars"
+            ]
+        );
+        // a missing app has no Settings checkbox to grant — no pane opens
+        assert!(fix_panes(&[app("calendar", "app_missing", false)]).is_empty());
+        // …but it doesn't suppress the panes of genuinely denied siblings
+        assert_eq!(
+            fix_panes(&[
+                app("calendar", "app_missing", false),
+                app("contacts", "denied", false),
+            ]),
+            vec!["Privacy_Contacts"]
+        );
+        // probe errors (state "error") still get the generic automation pane
+        assert_eq!(
+            fix_panes(&[app("messages", "error", false)]),
+            vec!["Privacy_Automation"]
+        );
     }
 
     #[test]
     fn human_render_clean_report_passes() {
         let mut r = sample_report();
         r.problems = 0;
-        let text = render_human(&r, false);
+        let text = render_human(&r);
         assert!(text.contains("all checks passed"));
         assert!(!text.contains("issue(s) found"));
     }

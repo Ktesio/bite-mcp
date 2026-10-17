@@ -94,23 +94,74 @@ fn codex_config_dir() -> PathBuf {
     }
 }
 
-/// `{"command": "bite", "args": ["mcp"]}` — Claude Code / ZCode / Cursor /
+/// The command a registered MCP entry should launch. Installed copies
+/// register the resolved ABSOLUTE path of this bite binary: GUI-launched
+/// clients don't inherit the user's shell PATH, so a bare `bite` fails to
+/// start whenever `~/.cargo/bin` isn't on the GUI process's PATH. Two
+/// fallbacks keep the bare `bite`:
+/// - the exe runs from a cargo dev checkout (`<workspace>/target/…`) —
+///   those binaries vanish on the next `cargo clean`/rebuild, so an
+///   absolute path there would leave the client config pointing at a ghost;
+/// - the exe path cannot be resolved at all.
+fn bite_command() -> String {
+    match std::env::current_exe() {
+        Ok(exe) => bite_command_from(&exe),
+        Err(_) => SERVER_FALLBACK_COMMAND.to_string(),
+    }
+}
+
+/// Pure command decision for one exe path (unit-testable — test exes always
+/// live in `target/debug/deps`, so the absolute-path branch needs synthetic
+/// paths to be reachable).
+fn bite_command_from(exe: &Path) -> String {
+    if is_dev_checkout_exe(exe) {
+        return SERVER_FALLBACK_COMMAND.to_string();
+    }
+    exe.canonicalize()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| SERVER_FALLBACK_COMMAND.to_string())
+}
+
+/// The bare command fallback (`bite` on the client's PATH).
+const SERVER_FALLBACK_COMMAND: &str = "bite";
+
+/// Does this exe live inside a cargo build tree? Same rule as doctor's
+/// dev-target detection: some ancestor directory must be a workspace
+/// `target/` (the exe may sit directly in `target/{debug,release}` or
+/// deeper, e.g. `target/debug/deps` for test binaries) AND the directory
+/// above `target/` must carry the workspace `Cargo.toml`. Installed copies
+/// (cargo home, homebrew, `~/.local/bin`) have no `target` ancestor and
+/// never match.
+fn is_dev_checkout_exe(exe: &Path) -> bool {
+    let mut cur = exe;
+    while let Some(parent) = cur.parent() {
+        if parent.file_name().and_then(|n| n.to_str()) == Some("target") {
+            return parent
+                .parent()
+                .is_some_and(|root| root.join("Cargo.toml").is_file());
+        }
+        cur = parent;
+    }
+    false
+}
+
+/// `{"command": <bite>, "args": ["mcp"]}` — Claude Code / ZCode / Cursor /
 /// Gemini CLI shape, all of which use top-level `mcpServers`.
 fn bite_entry() -> Value {
-    json!({ "command": "bite", "args": ["mcp"] })
+    json!({ "command": bite_command(), "args": ["mcp"] })
 }
 
 /// VS Code user-profile `mcp.json` shape: top-level `servers` with
 /// `"type": "stdio"` + `command` + `args`
 /// (code.visualstudio.com/docs/agent-customization/mcp-servers).
 fn vscode_entry() -> Value {
-    json!({ "type": "stdio", "command": "bite", "args": ["mcp"] })
+    json!({ "type": "stdio", "command": bite_command(), "args": ["mcp"] })
 }
 
 /// OpenCode shape: top-level `mcp` with `"type": "local"` and the command
 /// plus args as one array (opencode.ai/docs/config).
 fn opencode_entry() -> Value {
-    json!({ "type": "local", "command": ["bite", "mcp"] })
+    json!({ "type": "local", "command": [bite_command(), "mcp"] })
 }
 
 /// Same entry as a CST replacement value (jsonc-parser's `json!` macro
@@ -122,7 +173,7 @@ fn opencode_cst_entry() -> jsonc_parser::cst::CstInputValue {
         ("type".into(), CstInputValue::from("local")),
         (
             "command".into(),
-            CstInputValue::Array(vec!["bite".into(), "mcp".into()]),
+            CstInputValue::Array(vec![bite_command().into(), "mcp".into()]),
         ),
     ])
 }
@@ -375,7 +426,7 @@ impl ClientSpec {
         // refreshable/removable
         migrate_inline_mcp_servers(&mut doc);
         let mut bite = toml_edit::Table::new();
-        bite.insert("command", toml_edit::value("bite"));
+        bite.insert("command", toml_edit::value(bite_command()));
         let mut args = toml_edit::Array::new();
         args.push("mcp");
         bite.insert("args", toml_edit::value(args));
@@ -1281,6 +1332,87 @@ mod tests {
         assert_eq!(v["servers"][SERVER_KEY]["type"], "stdio");
         assert_eq!(v["servers"][SERVER_KEY]["command"], "bite");
         assert_eq!(v["servers"][SERVER_KEY]["args"], json!(["mcp"]));
+    }
+
+    // ── registered command: absolute path with dev-checkout fallback ─────
+
+    #[test]
+    fn dev_checkout_exes_are_detected_by_the_target_ancestor() {
+        let mk = |root: &Path| {
+            std::fs::create_dir_all(root).unwrap();
+            std::fs::write(root.join("Cargo.toml"), "[workspace]\n").unwrap();
+        };
+        // a real checkout: exe directly in target/{debug,release}, and test
+        // binaries one level deeper in target/debug/deps — both count
+        let ws = tempfile::tempdir().unwrap();
+        mk(ws.path());
+        for rel in [
+            "target/debug/bite",
+            "target/release/bite",
+            "target/debug/deps/tb",
+        ] {
+            let p = ws.path().join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, b"bin").unwrap();
+            assert!(is_dev_checkout_exe(&p), "{rel} must read as a dev checkout");
+        }
+        // no workspace manifest above target/ → not a REAL checkout
+        let bare = tempfile::tempdir().unwrap();
+        let p = bare.path().join("target/release/bite");
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(&p, b"bin").unwrap();
+        assert!(!is_dev_checkout_exe(&p), "no Cargo.toml → not a checkout");
+        // installed copies (cargo home, /usr/local/bin) have no target ancestor
+        let bin = tempfile::tempdir().unwrap();
+        let p = bin.path().join("bin").join("bite");
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(&p, b"bin").unwrap();
+        assert!(!is_dev_checkout_exe(&p), "installed copy must not match");
+        // a Cargo.toml at the BIN's ancestor is irrelevant without `target/`
+        mk(bin.path());
+        assert!(!is_dev_checkout_exe(&p));
+    }
+
+    #[test]
+    fn registered_command_is_bare_bite_from_a_dev_build() {
+        // cargo test binaries live under <workspace>/target/debug/deps, so
+        // in tests the dev fallback MUST hold — this is what keeps every
+        // existing `command == "bite"` assertion green: registering the
+        // ephemeral test binary's absolute path would be the ghost config
+        // the fallback exists to prevent.
+        let exe = std::env::current_exe().unwrap();
+        assert!(
+            is_dev_checkout_exe(&exe),
+            "test exe {} should read as a dev checkout",
+            exe.display()
+        );
+        assert_eq!(bite_command(), "bite");
+        assert_eq!(bite_entry()["command"], "bite");
+        assert_eq!(vscode_entry()["command"], "bite");
+        assert_eq!(opencode_entry()["command"][0], "bite");
+    }
+
+    #[test]
+    fn bite_command_from_synthetic_paths() {
+        let dir = tempdir("cmdfrom");
+        // non-dev existing exe → canonicalized absolute path string (what
+        // GUI-launched clients need: no PATH lookup, no symlink guessing)
+        let exe = dir.join("bin").join("bite");
+        std::fs::create_dir_all(exe.parent().unwrap()).unwrap();
+        std::fs::write(&exe, b"bin").unwrap();
+        let cmd = bite_command_from(&exe);
+        assert!(Path::new(&cmd).is_absolute(), "got: {cmd}");
+        assert_eq!(Path::new(&cmd), exe.canonicalize().unwrap());
+        // dev-checkout exe → bare bite (build-tree binaries are ghosts
+        // after the next cargo clean)
+        let ws = dir.join("ws");
+        std::fs::create_dir_all(ws.join("target").join("release")).unwrap();
+        std::fs::write(ws.join("Cargo.toml"), "[workspace]\n").unwrap();
+        let dev = ws.join("target").join("release").join("bite");
+        std::fs::write(&dev, b"bin").unwrap();
+        assert_eq!(bite_command_from(&dev), "bite");
+        // unresolvable exe → bare bite
+        assert_eq!(bite_command_from(&dir.join("nope").join("bite")), "bite");
     }
 
     #[test]

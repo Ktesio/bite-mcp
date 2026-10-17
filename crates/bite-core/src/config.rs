@@ -1,6 +1,7 @@
 //! User config: `~/Library/Application Support/bite/config.toml` on macOS.
 
 use std::path::PathBuf;
+use std::sync::OnceLock;
 
 use serde::{Deserialize, Serialize};
 
@@ -23,6 +24,19 @@ pub struct Config {
     pub auto_refresh_hours: Option<u64>,
 }
 
+/// Process-lifetime config cache backing [`Config::cached`]. Every MCP tool
+/// call used to re-read config.toml from disk; within one long-lived `bite
+/// mcp` server the file cannot change meaningfully: the only writer is the
+/// `bite config set` CLI verb, which runs in its own short-lived process.
+static CACHED_CONFIG: OnceLock<Config> = OnceLock::new();
+
+/// Testable core of [`Config::cached`]: fill `cell` from `load` at most
+/// once, then serve the cached copy. Separated so tests can drive it with
+/// their own cell and a counting loader instead of the real config file.
+fn cached_in(cell: &OnceLock<Config>, load: fn() -> Config) -> Config {
+    cell.get_or_init(load).clone()
+}
+
 pub fn data_dir() -> PathBuf {
     let base = dirs::data_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
     base.join("bite")
@@ -37,6 +51,19 @@ pub fn helper_install_path() -> PathBuf {
 }
 
 impl Config {
+    /// Load from disk once per process, then serve the cached copy.
+    ///
+    /// The hot path (every MCP tool call, every CLI verb) used to re-read
+    /// `config.toml` from disk; within a long-lived `bite mcp` process the
+    /// file cannot change meaningfully — the only writer is the `bite
+    /// config set` CLI verb, which is CLI-only and always runs in its own
+    /// process that re-exits right after saving. Callers that need the
+    /// freshest possible view (or that write the file) keep using
+    /// [`Config::load`]; call sites that run per tool call use this.
+    pub fn cached() -> Self {
+        cached_in(&CACHED_CONFIG, Config::load)
+    }
+
     pub fn load() -> Self {
         std::fs::read_to_string(config_path())
             .ok()
@@ -72,5 +99,30 @@ mod tests {
         let s = toml::to_string_pretty(&c).unwrap();
         let back: Config = toml::from_str(&s).unwrap();
         assert_eq!(back.default_calendar.as_deref(), Some("Home"));
+    }
+
+    #[test]
+    fn cached_initializes_exactly_once() {
+        // own cell + counting loader: proves the cache semantics without
+        // touching the developer's real config file. A regression of
+        // `cached()` to a plain per-call load would run the loader twice.
+        static CELL: OnceLock<Config> = OnceLock::new();
+        static LOADS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        fn counting_load() -> Config {
+            LOADS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Config {
+                timeout_secs: Some(42),
+                ..Default::default()
+            }
+        }
+        let a = cached_in(&CELL, counting_load);
+        let b = cached_in(&CELL, counting_load);
+        assert_eq!(a.timeout_secs, Some(42));
+        assert_eq!(b.timeout_secs, Some(42), "later calls get the cached value");
+        assert_eq!(
+            LOADS.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the loader must run exactly once"
+        );
     }
 }

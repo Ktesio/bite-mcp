@@ -237,9 +237,12 @@ reads `batches/`' top level only — `quarantine/` is never ingested), and
 quarantined batches are flagged for inspection
 (`… quarantined batches need inspection (batches/quarantine/)`). It also
 reports `crawl.state` (the crawl-state.json state) and `crawl.alive` (a
-live bite-crawl process owns the pidfile). `waiting_mail` or `running`
-with `alive: false` means the worker is gone — run `bite index rebuild` to
-respawn immediately.
+live bite-crawl process owns the pidfile). `crawl.alive` may serve a
+cached verdict on read-only status surfaces (`index_status`, the
+deferred-mail hints): up to ~5 s after a worker exits it can still report
+alive; crawl spawn and cancel always probe fresh. `waiting_mail` or
+`running` with `alive: false` means the worker is gone — run
+`bite index rebuild` to respawn immediately.
 
 Skipped mailboxes are not persisted per-mailbox: the reason lives transiently
 in `window` and `skipped` is a cumulative count, so zero-yield mailboxes are

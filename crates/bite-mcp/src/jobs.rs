@@ -1,7 +1,7 @@
 //! Global job registry — Swift-side jobs (crawler, bulk ops) report progress
-//! via bridge notifications; this registry mirrors the latest state so
-//! `job_status` / `index_status` tools can answer without round-tripping to
-//! the helper, and records batch-ingest accounting.
+//! via bridge notifications; this registry mirrors the latest state so the
+//! `index_status` tool can answer without round-tripping to the helper, and
+//! records batch-ingest accounting.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
