@@ -99,6 +99,25 @@ pub struct SearchQuery {
     pub content_contains: Option<String>,
 }
 
+/// Columns `hits_from_stream` reads — the exact projection `search()`
+/// requests. Keep in sync with the Hit reader: a column read there but
+/// missing from this list silently degrades to a None/default Hit field.
+const HIT_COLUMNS: &[&str] = &[
+    "app",
+    "id",
+    "account",
+    "container",
+    "title",
+    "content",
+    "participants",
+    "start_ms",
+    "updated_ms",
+    "read",
+    "flagged",
+    "junk",
+    "completed",
+];
+
 #[derive(Debug, Clone, Serialize)]
 pub struct Hit {
     pub app: String,
@@ -375,6 +394,13 @@ impl EntityIndex {
             }
 
             let mut builder = table.query();
+            // Project only the Hit-consumed columns: `search_text`
+            // duplicates title+content for the FTS index and `props` can
+            // carry a large JSON blob — neither is read on this path, so
+            // hauling them per hit wastes scan and IO.
+            builder = builder.select(lancedb::query::Select::Columns(
+                HIT_COLUMNS.iter().map(|c| c.to_string()).collect(),
+            ));
             if let Some(f) = &filter {
                 builder = builder.only_if(f.clone());
             }
@@ -1017,5 +1043,70 @@ mod tests {
         let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o700);
         drop(idx);
+    }
+
+    #[test]
+    fn search_projection_populates_all_hit_fields() {
+        // The search() projection must carry every column hits_from_stream
+        // reads: a column dropped from HIT_COLUMNS silently degrades to a
+        // None/default Hit field (the reader resolves columns via
+        // index_of().ok()). Pin both the filter-only and the FTS path —
+        // FTS matches on the indexed search_text but must still return the
+        // Hit-consumed columns under a Columns projection.
+        let dir = temp_dir("projection");
+        let idx = EntityIndex::open(&dir).unwrap();
+        // 300 chars: exercises the >200-char snippet truncation, which
+        // needs `content` present in the projection.
+        let long = "needle word ".repeat(25);
+        let mut r = record("mail", "m1", "a title", &long, Some(true));
+        r.account = Some("acct".into());
+        r.container = Some("INBOX/Sub".into());
+        r.participants = Some("x@y.z".into());
+        r.start_ms = Some(11);
+        r.updated_ms = Some(22);
+        r.flagged = Some(true);
+        r.junk = Some(false);
+        r.completed = Some(false);
+        idx.ingest(&[r]).unwrap();
+
+        let check = |h: &Hit| {
+            assert_eq!(h.app, "mail");
+            assert_eq!(h.id, "m1");
+            assert_eq!(h.account.as_deref(), Some("acct"));
+            assert_eq!(h.container.as_deref(), Some("INBOX/Sub"));
+            assert_eq!(h.title.as_deref(), Some("a title"));
+            assert_eq!(h.participants.as_deref(), Some("x@y.z"));
+            assert_eq!(h.start_ms, Some(11));
+            assert_eq!(h.updated_ms, Some(22));
+            assert_eq!(h.read, Some(true));
+            assert_eq!(h.flagged, Some(true));
+            assert_eq!(h.junk, Some(false));
+            assert_eq!(h.completed, Some(false));
+            let s = h.snippet.as_deref().expect("snippet needs content column");
+            assert_eq!(s.chars().count(), 201, "200 chars + ellipsis");
+            assert!(s.ends_with('…'));
+            assert!(s.starts_with("needle"));
+        };
+
+        // filter-only path
+        let res = idx
+            .search(&SearchQuery {
+                limit: 5,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(res.hits.len(), 1);
+        check(&res.hits[0]);
+
+        // FTS path: match on the indexed search_text (title + content)
+        let res = idx
+            .search(&SearchQuery {
+                text: Some("needle".into()),
+                limit: 5,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(res.hits.len(), 1, "fts must match under projection");
+        check(&res.hits[0]);
     }
 }

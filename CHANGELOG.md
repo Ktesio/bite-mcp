@@ -25,6 +25,9 @@ a tag has a matching section here before it can ship.
 
 ### Changed
 
+- Index search projects only the columns each hit consumes: `search_text`
+  (the full text-search concat, which duplicates title + content) and
+  `props` are no longer scanned and shipped per result row.
 - Dependency floors raised to `dirs` 7, `toml` 1.1 and `toml_edit` 0.25 (#27).
 - Index-backed search folds newly crawled rows into the full-text index as soon
   as a crawl settles, so fresh mail is searchable without an explicit rebuild (#14).
