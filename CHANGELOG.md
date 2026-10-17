@@ -25,6 +25,10 @@ a tag has a matching section here before it can ship.
 
 ### Changed
 
+- Index-backed `search` returns newest-first for filter-only queries
+  (`updated_ms DESC NULLS LAST`) instead of an arbitrary scan-order page,
+  matching the live `messages_search` walk; full-text queries keep BM25
+  relevance ranking (#34).
 - Index search projects only the columns each hit consumes: `search_text`
   (the full text-search concat, which duplicates title + content) and
   `props` are no longer scanned and shipped per result row.
