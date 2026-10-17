@@ -715,6 +715,13 @@ fn search_params_to_query(params: &Value) -> bite_index::SearchQuery {
         title_contains: g("subject"),
         content_contains: g("body"),
         account: g("account"),
+        // `skip_count` opts a filter-only search out of the exact-total
+        // COUNT scan (a second full filtered pass) — `count`/`total` comes
+        // back null, mirroring what full-text queries already return.
+        skip_exact_count: params
+            .get("skip_count")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
     }
 }
 
@@ -760,9 +767,22 @@ pub fn try_mail_search(params: &Value) -> Option<Result<Value, BiteError>> {
             "count": res.total,
             "truncated": res.total.map(|t| t > res.hits.len()).unwrap_or(false),
             "scanned": res.hits.len(),
-            "note": "served from the entity index — exact count, no Apple Events",
+            "note": index_search_note(res.total, q.skip_exact_count),
         }))
     }))
+}
+
+/// The note must not promise an exact count that isn't there: `total` is
+/// `None` both for skipped count scans (`skip_count`) and for full-text
+/// queries (page-only — an exact total would need a second full pass).
+fn index_search_note(total: Option<usize>, skip_exact_count: bool) -> &'static str {
+    match (total, skip_exact_count) {
+        (Some(_), _) => "served from the entity index — exact count, no Apple Events",
+        (None, true) => {
+            "served from the entity index — count skipped (skip_count), no Apple Events"
+        }
+        (None, false) => "served from the entity index — page only (full-text), no Apple Events",
+    }
 }
 
 /// Instant, non-blocking response for agents querying Mail while the index
@@ -1265,6 +1285,41 @@ mod tests {
         assert_eq!(q.read, Some(true));
         let q = search_params_to_query(&json!({}));
         assert_eq!(q.read, None);
+    }
+
+    #[test]
+    fn skip_count_param_maps_to_skip_exact_count() {
+        // default keeps the exact-total COUNT scan (current behavior);
+        // skip_count:true opts out of it — total/count comes back null
+        let q = search_params_to_query(&json!({}));
+        assert!(!q.skip_exact_count);
+        let q = search_params_to_query(&json!({ "unread": true }));
+        assert!(!q.skip_exact_count);
+        let q = search_params_to_query(&json!({ "skip_count": true }));
+        assert!(q.skip_exact_count);
+        let q = search_params_to_query(&json!({ "skip_count": false }));
+        assert!(!q.skip_exact_count);
+    }
+
+    #[test]
+    fn index_search_note_never_claims_an_exact_count_that_is_absent() {
+        // exact total → exact-count note (skip_count irrelevant: a text
+        // query never has one)
+        assert_eq!(
+            index_search_note(Some(42), false),
+            "served from the entity index — exact count, no Apple Events"
+        );
+        // count skipped by request → says so
+        assert_eq!(
+            index_search_note(None, true),
+            "served from the entity index — count skipped (skip_count), no Apple Events"
+        );
+        // None WITHOUT skip_count = full-text page — must not blame
+        // skip_count (it was never passed) nor promise exactness
+        assert_eq!(
+            index_search_note(None, false),
+            "served from the entity index — page only (full-text), no Apple Events"
+        );
     }
 
     #[test]

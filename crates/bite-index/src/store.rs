@@ -97,6 +97,13 @@ pub struct SearchQuery {
     pub title_contains: Option<String>,
     /// Case-insensitive substring match against content
     pub content_contains: Option<String>,
+    /// Filter-only queries normally pay a second `count_rows` scan so
+    /// `total` is exact. Set to skip that scan; `total` then comes back
+    /// `None` — the same shape full-text queries already return — and the
+    /// caller saves one full filtered pass over the table. Callers that
+    /// surface `total` or derive "are there more?" from it must keep this
+    /// unset (the default).
+    pub skip_exact_count: bool,
 }
 
 /// Columns `hits_from_stream` reads — the exact projection `search()`
@@ -152,8 +159,10 @@ pub struct Hit {
 #[derive(Debug, Clone, Serialize)]
 pub struct SearchResult {
     pub hits: Vec<Hit>,
-    /// Exact count when the query has no text component (filter-only COUNT);
-    /// null for FTS queries where only the requested page was materialized.
+    /// Exact count when the query has no text component and
+    /// `skip_exact_count` is unset (filter-only COUNT); null for FTS
+    /// queries where only the requested page was materialized, and for
+    /// any query where the caller skipped the count scan.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub total: Option<usize>,
 }
@@ -378,14 +387,15 @@ impl EntityIndex {
     }
 
     /// Search with optional full-text + scalar filters. `total` is exact for
-    /// filter-only queries; None for FTS (page-capped).
+    /// filter-only queries unless `skip_exact_count` is set (scan skipped,
+    /// `None` returned); always `None` for FTS (page-capped).
     pub fn search(&self, q: &SearchQuery) -> Result<SearchResult, IndexError> {
         self.rt.block_on(async {
             let table = self.table().await?;
             let filter = filter_sql(q);
 
             let mut total = None;
-            if q.text.is_none() {
+            if q.text.is_none() && !q.skip_exact_count {
                 total = Some(
                     table
                         .count_rows(filter.as_ref().map(|f| f.to_string()))
@@ -1102,6 +1112,65 @@ mod tests {
             .unwrap();
         assert_eq!(res.hits.len(), 2);
         assert_eq!(res.hits[0].id, "m_old");
+    }
+
+    #[test]
+    fn search_skip_exact_count_returns_none_total_for_filter_queries() {
+        // `skip_exact_count` trades the exact `total` (a second full
+        // filtered COUNT scan) for latency: total comes back None while
+        // the hits themselves are identical. The default stays exact.
+        let dir = temp_dir("skip-count");
+        let idx = EntityIndex::open(&dir).unwrap();
+        idx.ingest(&[
+            record("mail", "m1", "Invoice", "pay me", Some(false)),
+            record("mail", "m2", "Hello", "hi there", Some(true)),
+            record("notes", "n1", "Note", "remember", None),
+        ])
+        .unwrap();
+
+        // default: filter-only query pays the count scan → exact total
+        let exact = idx
+            .search(&SearchQuery {
+                app: Some("mail".into()),
+                limit: 10,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(exact.total, Some(2));
+        assert_eq!(exact.hits.len(), 2);
+
+        // skipped: same hits, no count scan → total is None
+        let skipped = idx
+            .search(&SearchQuery {
+                app: Some("mail".into()),
+                limit: 10,
+                skip_exact_count: true,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(skipped.total, None);
+        // (row order is not this test's subject — with newest-first ordering
+        // both rows have no updated_ms, so compare the SET of hits)
+        let mut got: Vec<_> = skipped.hits.iter().map(|h| h.id.clone()).collect();
+        let mut want: Vec<_> = exact.hits.iter().map(|h| h.id.clone()).collect();
+        got.sort();
+        want.sort();
+        assert_eq!(
+            got, want,
+            "skipping the count must not change the returned page"
+        );
+
+        // limit still applies with the count skipped
+        let page = idx
+            .search(&SearchQuery {
+                app: Some("mail".into()),
+                limit: 1,
+                skip_exact_count: true,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(page.total, None);
+        assert_eq!(page.hits.len(), 1);
     }
 
     #[test]

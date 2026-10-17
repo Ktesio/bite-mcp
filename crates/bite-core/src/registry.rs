@@ -277,6 +277,7 @@ pub static TOOLS: &[Tool] = &[
             ParamSpec::opt("until", ParamKind::Date, "sent before"),
             ParamSpec::opt("limit", ParamKind::Int, "max results (default 20, capped at 200)"),
             ParamSpec::opt("max_scan", ParamKind::Int, "max messages examined (default 400)"),
+            ParamSpec::opt("skip_count", ParamKind::Bool, "skip the exact-total COUNT scan (a second full pass) — `count` returns null like full-text queries; results unchanged"),
         ]),
     t("mail_message_get", App::Mail, "mail.message_get",
         "Full message: headers, body, attachment manifest. Pass the `mailbox` from the search result for a fast lookup.",
