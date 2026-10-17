@@ -25,6 +25,30 @@ static IN_INGEST_PENDING: AtomicBool = AtomicBool::new(false);
 /// Minimum gap between opportunistic auto-ingest attempts per process.
 const AUTO_INGEST_THROTTLE_MS: u64 = 30_000;
 
+/// TTL for the cached crawler-liveness verdict on READ-ONLY paths. Two mail
+/// tool calls within this window pay at most one kill+ps probe.
+const CRAWLER_LIVENESS_TTL_MS: u64 = 5_000;
+
+/// A cached alive verdict: the pidfile TEXT it was computed from (a
+/// rewritten pidfile means a new worker — the cache must miss), the pid it
+/// vouches for, and when it was taken.
+struct LivenessHit {
+    key: String,
+    pid: i32,
+    at_ms: u64,
+}
+
+static LIVENESS_CACHE: Mutex<Option<LivenessHit>> = Mutex::new(None);
+
+/// Last background index failures (auto-ingest, post-crawl FTS refresh).
+/// Those paths deliberately never fail the tool call that carried them —
+/// without this record the failure is visible only on this process's
+/// stderr. `index_status` surfaces the tail as `last_errors`.
+static LAST_INDEX_ERRORS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// Cap so a repeating failure can't grow the status payload unboundedly.
+const LAST_ERRORS_MAX: usize = 8;
+
 /// RAII guard for `IN_INGEST_PENDING`: set on acquire, cleared on drop —
 /// panic-safe, so a panicking ingest can never wedge this process's
 /// opportunistic ingest path permanently.
@@ -161,13 +185,32 @@ fn ingest_pending_if_due(index: &bite_index::EntityIndex) {
     let Ok(_writer) = index.lock_writer() else {
         return;
     };
-    let _ = bite_index::ingest_staged(index, &staging())
-        .map_err(|e| eprintln!("bite auto-ingest error: {e}"));
+    let _ = bite_index::ingest_staged(index, &staging()).map_err(|e| {
+        eprintln!("bite auto-ingest error: {e}");
+        record_index_error("auto-ingest", &e.to_string());
+    });
     let _ = fs2::FileExt::unlock(&lock);
     // writer lock still held here (guard `_writer` lives to fn end), so the
     // optimize serializes against concurrent ingests
     refresh_fts_if_crawl_settled(index);
     crate::jobs::set_pending_batches(pending_batches());
+}
+
+/// Record a background index failure for `index_status`'s `last_errors`.
+/// Consecutive identical entries are not stacked (a hot loop would spam the
+/// same line) and the list is capped — an agent needs the recent tail, not
+/// a full log.
+fn record_index_error(source: &str, err: &str) {
+    let mut errs = LAST_INDEX_ERRORS.lock().unwrap();
+    let entry = format!("{source}: {err}");
+    if errs.last().map(|l| l.as_str()) == Some(entry.as_str()) {
+        return;
+    }
+    errs.push(entry);
+    let overflow = errs.len().saturating_sub(LAST_ERRORS_MAX);
+    if overflow > 0 {
+        errs.drain(0..overflow);
+    }
 }
 
 /// Raw `crawl-state.json` text — the signature for "which crawl state has
@@ -201,13 +244,14 @@ fn fts_refresh_settled(state: &str, crawler_alive: bool) -> bool {
 
 /// Is there a settled crawl state whose rows have not been folded into the
 /// FTS index yet? Cheap: two small file reads, plus a pid check only when
-/// the crawl-state text actually differs from the marker.
+/// the crawl-state text actually differs from the marker. Read-only — uses
+/// the TTL-cached liveness probe.
 fn fts_refresh_pending() -> bool {
     let Some(raw) = crawl_state_raw() else {
         return false;
     };
     let marker = std::fs::read_to_string(fts_refresh_marker_path()).unwrap_or_default();
-    fts_refresh_due(&raw, &marker, crawl_running())
+    fts_refresh_due(&raw, &marker, crawl_running_cached())
 }
 
 /// Pure form of `fts_refresh_pending` (raw crawl-state text vs marker text).
@@ -236,7 +280,7 @@ fn refresh_fts_if_crawl_settled(index: &bite_index::EntityIndex) {
         return;
     };
     let marker = std::fs::read_to_string(fts_refresh_marker_path()).unwrap_or_default();
-    if !fts_refresh_due(&raw, &marker, crawl_running()) {
+    if !fts_refresh_due(&raw, &marker, crawl_running_cached()) {
         return;
     }
     match index.refresh_fts() {
@@ -245,7 +289,10 @@ fn refresh_fts_if_crawl_settled(index: &bite_index::EntityIndex) {
             // started meanwhile, its state text differs and stays pending
             std::fs::write(fts_refresh_marker_path(), raw).ok();
         }
-        Err(e) => eprintln!("bite-index: post-crawl FTS refresh failed: {e}"),
+        Err(e) => {
+            eprintln!("bite-index: post-crawl FTS refresh failed: {e}");
+            record_index_error("fts-refresh", &e.to_string());
+        }
     }
 }
 
@@ -357,30 +404,62 @@ pub fn status() -> Result<Value, BiteError> {
             .map_err(|e| BridgeError::new("index_error", e.to_string()))?;
         let staged = staged_batches();
         let quarantined = quarantined_batches();
-        let pending = staged + quarantined;
         let crawl = crawl_state();
-        let state_str = crawl
-            .get("state")
-            .and_then(|v| v.as_str())
-            .unwrap_or("unknown");
-        let failures = crawl.get("failures").and_then(|v| v.as_u64()).unwrap_or(0);
-        let mut base = json!({
-            "total": stats.total,
-            "per_app": stats.per_app.into_iter().map(|(a, n)| json!({"app": a, "rows": n})).collect::<Vec<_>>(),
-            "newest_updated_ms": stats.newest_updated_ms,
-            "fts_indexed": stats.fts_indexed,
-            "pending_batches": pending,
-            "crawl": {
-                "state": crawl,
-                "alive": live_crawler_pid().is_some(),
-            },
-            "jobs": crate::jobs::snapshot(),
-        });
-        if let Some(hint) = status_hint(state_str, staged, quarantined, failures) {
-            base["hint"] = json!(hint);
-        }
-        Ok(base)
+        let alive = live_crawler_pid_cached().is_some();
+        let jobs = crate::jobs::snapshot();
+        let last_errors = LAST_INDEX_ERRORS.lock().unwrap().clone();
+        Ok(status_json(
+            &stats,
+            staged,
+            quarantined,
+            crawl,
+            alive,
+            jobs,
+            &last_errors,
+        ))
     })
+}
+
+/// Pure assembly of the `index_status` JSON from already-fetched pieces
+/// (unit-testable; `alive` is passed in so no probe runs during tests).
+/// `last_errors` surfaces exactly when non-empty — healthy output stays
+/// key-stable.
+fn status_json(
+    stats: &bite_index::IndexStats,
+    staged: usize,
+    quarantined: usize,
+    crawl: Value,
+    alive: bool,
+    jobs: Value,
+    last_errors: &[String],
+) -> Value {
+    let pending = staged + quarantined;
+    let state_str = crawl
+        .get("state")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+    let failures = crawl.get("failures").and_then(|v| v.as_u64()).unwrap_or(0);
+    let mut base = json!({
+        "total": stats.total,
+        "per_app": stats.per_app.iter().map(|(a, n)| json!({"app": a, "rows": n})).collect::<Vec<_>>(),
+        "newest_updated_ms": stats.newest_updated_ms,
+        "fts_indexed": stats.fts_indexed,
+        "pending_batches": pending,
+        "crawl": {
+            "state": crawl,
+            "alive": alive,
+        },
+        "jobs": jobs,
+    });
+    if let Some(hint) = status_hint(state_str, staged, quarantined, failures) {
+        base["hint"] = json!(hint);
+    }
+    // background failures are only visible here — the auto-ingest / FTS
+    // paths never fail the tool call that carried them
+    if !last_errors.is_empty() {
+        base["last_errors"] = json!(last_errors);
+    }
+    base
 }
 
 // ── detached crawl process management ──
@@ -425,8 +504,16 @@ fn crawl_state() -> Value {
 }
 
 fn crawl_pid() -> Option<i32> {
+    crawl_pid_text()?.parse().ok()
+}
+
+/// Raw pidfile text — the cache key for the TTL-cached liveness verdict
+/// (a rewritten pidfile means a new worker and must invalidate the cache).
+fn crawl_pid_text() -> Option<String> {
     let path = bite_core::config::data_dir().join("crawl.pid");
-    std::fs::read_to_string(path).ok()?.trim().parse().ok()
+    std::fs::read_to_string(path)
+        .ok()
+        .map(|s| s.trim().to_string())
 }
 
 /// Does this pid actually belong to a bite-crawl process? Pids get recycled;
@@ -455,7 +542,8 @@ fn crawl_process_matches(pid: i32) -> bool {
 
 /// Pid from the pidfile only while a live bite-crawl owns it. Stale or
 /// recycled entries are removed so they can neither block spawns (permanent
-/// already_running) nor get signalled.
+/// already_running) nor get signalled. UNCACHED — this is the fresh probe;
+/// spawn/cancel paths depend on that.
 fn live_crawler_pid() -> Option<i32> {
     let pid = crawl_pid()?;
     if pid_alive(pid) && crawl_process_matches(pid) {
@@ -463,6 +551,68 @@ fn live_crawler_pid() -> Option<i32> {
     }
     let _ = std::fs::remove_file(bite_core::config::data_dir().join("crawl.pid"));
     None
+}
+
+/// Pure gate for the cached liveness verdict: usable only while the pidfile
+/// text still matches what the verdict was computed from AND the TTL has
+/// not elapsed.
+fn liveness_cache_usable(
+    cached_key: &str,
+    cached_at_ms: u64,
+    key: &str,
+    now_ms: u64,
+    ttl_ms: u64,
+) -> bool {
+    cached_key == key && now_ms.saturating_sub(cached_at_ms) <= ttl_ms
+}
+
+/// Injectable core of `live_crawler_pid_cached`: consult `cache` for an
+/// alive verdict for `key` still within `ttl_ms`; on cache miss or
+/// staleness run `fresh_probe` and cache ONLY an alive (Some) verdict — a
+/// dead (None) verdict must never be cached, so stale pidfiles keep
+/// getting cleared (that is what re-opens the eager auto-respawn).
+fn cached_alive_verdict(
+    cache: &Mutex<Option<LivenessHit>>,
+    key: &str,
+    now_ms: u64,
+    ttl_ms: u64,
+    fresh_probe: &mut dyn FnMut() -> Option<i32>,
+) -> Option<i32> {
+    if let Some(hit) = cache.lock().unwrap().as_ref() {
+        if liveness_cache_usable(&hit.key, hit.at_ms, key, now_ms, ttl_ms) {
+            return Some(hit.pid);
+        }
+    }
+    let pid = fresh_probe()?;
+    *cache.lock().unwrap() = Some(LivenessHit {
+        key: key.to_string(),
+        pid,
+        at_ms: now_ms,
+    });
+    Some(pid)
+}
+
+/// Read-only crawler liveness with a short TTL. Status rendering, the
+/// live-mail gate and the FTS gates call this many times per tool call (and
+/// across rapid successive calls), and each fresh probe is a kill + ps.
+/// Only the ALIVE verdict is cached: a not-alive result always goes through
+/// the fresh identity-checked probe, so stale pidfiles keep getting cleared
+/// (that is what re-opens the eager auto-respawn). Safety-critical paths —
+/// `spawn_crawl`'s already_running check, `bulk_spawn`'s busy check,
+/// `index_crawl_cancel` — call the uncached `live_crawler_pid()` instead.
+fn live_crawler_pid_cached() -> Option<i32> {
+    let key = crawl_pid_text()?;
+    cached_alive_verdict(
+        &LIVENESS_CACHE,
+        &key,
+        now_ms(),
+        CRAWLER_LIVENESS_TTL_MS,
+        &mut || live_crawler_pid(),
+    )
+}
+
+fn crawl_running_cached() -> bool {
+    live_crawler_pid_cached().is_some()
 }
 
 fn crawl_running() -> bool {
@@ -626,7 +776,7 @@ pub fn not_ready_response(why: &str) -> Value {
             "state": state.get("state").and_then(|v| v.as_str()).unwrap_or("unknown"),
             "processed": state.get("processed").and_then(|v| v.as_i64()).unwrap_or(0),
             "found": state.get("found").and_then(|v| v.as_i64()).unwrap_or(0),
-            "alive": crawl_running(),
+            "alive": crawl_running_cached(),
         },
         "why": why,
         "hint": "Mail indexing is still in progress. Searches may be slow or empty until it completes — poll index_status, or retry in a few minutes. You can still use mail_messages_get for a specific message id.",
@@ -700,7 +850,7 @@ pub fn gate_live_mail(name: &str, params: &Value) -> Option<Value> {
         return None; // caller accepts the slow live price
     }
     let rows = mail_rows_present().unwrap_or(0);
-    if rows > 0 && !crawl_running() {
+    if rows > 0 && !crawl_running_cached() {
         return None; // index ready, Mail calm — run live normally
     }
     let state = crawl_state();
@@ -745,12 +895,16 @@ fn auto_refresh_if_stale() {
         .and_then(|v| v.as_str())
         .unwrap_or("never_run");
     let failures = state.get("failures").and_then(|v| v.as_u64()).unwrap_or(0);
-    let is_running = state_str == "running" && crawl_running();
+    // cached liveness: this is only the early stand-down check — the
+    // authoritative already_running check inside spawn_crawl is always
+    // fresh, so a stale "alive" can delay a respawn by the TTL at most and
+    // can never double-spawn.
+    let is_running = state_str == "running" && crawl_running_cached();
     if is_running {
         return;
     }
     let hours: u64 = {
-        let cfg = bite_core::config::Config::load();
+        let cfg = bite_core::config::Config::cached();
         cfg.auto_refresh_hours.unwrap_or(24)
     };
     let stale = state
@@ -909,6 +1063,12 @@ pub fn run_local_unwrapped(
     }
 }
 
+/// Note on a spawned bulk job. Points at the REAL status tool: agents poll
+/// `index_status` (there is no `job_status` tool — the old note sent them
+/// polling a name that does not exist).
+const BULK_JOB_NOTE: &str =
+    "running detached — poll index_status; Mail does the iteration internally";
+
 /// bulk tools run in the detached crawler process (its AE path is the only
 /// fast one); mark/move/delete map to bite-crawl --bulk arguments.
 fn bulk_spawn(name: &str, params: &Value) -> Result<Value, BiteError> {
@@ -1047,7 +1207,7 @@ fn bulk_spawn(name: &str, params: &Value) -> Result<Value, BiteError> {
         "pid": pid,
         "mailbox": mailbox,
         "selection": selection_label,
-        "note": "running detached — poll job_status; Mail does the iteration internally"
+        "note": BULK_JOB_NOTE
     }))
 }
 
@@ -1252,6 +1412,220 @@ mod tests {
         assert_eq!(status_hint("cancelled", 0, 0, 0), None);
         assert_eq!(status_hint("partial", 0, 0, 0), None);
         assert_eq!(status_hint("waiting_mail", 0, 0, 0), None);
+    }
+
+    #[test]
+    fn bulk_job_note_points_at_the_real_status_tool() {
+        // agents poll index_status; there is no job_status tool — the old
+        // note sent them polling a name that does not exist
+        assert!(BULK_JOB_NOTE.contains("index_status"));
+        assert!(!BULK_JOB_NOTE.contains("job_status"));
+    }
+
+    #[test]
+    fn cached_alive_verdict_caches_only_alive_within_ttl() {
+        use std::cell::Cell;
+        let cache: Mutex<Option<LivenessHit>> = Mutex::new(None);
+        let calls = Cell::new(0u32);
+        let mut alive_probe = || {
+            calls.set(calls.get() + 1);
+            Some(7)
+        };
+        // first call: cache miss → probe runs
+        assert_eq!(
+            cached_alive_verdict(&cache, "1234", 1_000, 5_000, &mut alive_probe),
+            Some(7)
+        );
+        assert_eq!(calls.get(), 1);
+        // same pidfile text within the TTL → served from cache, NO probe
+        assert_eq!(
+            cached_alive_verdict(&cache, "1234", 1_000 + 4_999, 5_000, &mut alive_probe),
+            Some(7)
+        );
+        assert_eq!(calls.get(), 1);
+        // past the TTL → stale, re-probes
+        assert_eq!(
+            cached_alive_verdict(&cache, "1234", 1_000 + 5_001, 5_000, &mut alive_probe),
+            Some(7)
+        );
+        assert_eq!(calls.get(), 2);
+        // different pidfile text (new worker pid) → the cache is never
+        // trusted, whatever the age
+        assert_eq!(
+            cached_alive_verdict(&cache, "5678", 1_000 + 5_001, 5_000, &mut alive_probe),
+            Some(7)
+        );
+        assert_eq!(calls.get(), 3);
+
+        // a dead (None) verdict is NEVER cached: the probe runs again on
+        // the very next call so stale pidfiles keep getting cleared
+        let dead_calls = Cell::new(0u32);
+        let mut dead_probe = || {
+            dead_calls.set(dead_calls.get() + 1);
+            None
+        };
+        assert_eq!(
+            cached_alive_verdict(&cache, "1234", 0, 5_000, &mut dead_probe),
+            None
+        );
+        assert_eq!(
+            cached_alive_verdict(&cache, "1234", 1, 5_000, &mut dead_probe),
+            None
+        );
+        assert_eq!(dead_calls.get(), 2, "a None verdict must not be cached");
+    }
+
+    #[test]
+    fn spawn_cancel_bulk_paths_probe_fresh_not_cached() {
+        // Tripwire pinning the safety constraint the doc comments state
+        // (see `live_crawler_pid_cached`): crawl spawn, crawl cancel and
+        // bulk spawn must decide on the UNCACHED identity-checked probe —
+        // a TTL-stale "alive" verdict there could double-spawn crawlers
+        // against Mail or signal a recycled pid. All probe fns are
+        // private, so this pins the SOURCE text: swapping any of these
+        // call sites to the cached variant compiles and passes every
+        // behavioral test, but must fail here.
+        let src = include_str!("index.rs");
+
+        // naive body slice: from `fn <name>(` to the earliest of the next
+        // top-level `\nfn `, `\n///` doc comment, or the test module —
+        // the last bound keeps `fn bulk_spawn`'s slice (nothing follows
+        // it but `#[cfg(test)]`) from swallowing this test's own
+        // assertion strings and self-failing
+        let body = |marker: &str, known_line: &str| {
+            let start = src
+                .find(marker)
+                .unwrap_or_else(|| panic!("tripwire anchor lost: {marker}"));
+            let rest = &src[start..];
+            let end = [
+                rest.find("\nfn "),
+                rest.find("\n///"),
+                rest.find("\n#[cfg(test)]"),
+            ]
+            .into_iter()
+            .flatten()
+            .min()
+            .unwrap_or(rest.len());
+            let slice = &rest[..end];
+            assert!(
+                !slice.trim().is_empty() && slice.contains(known_line),
+                "tripwire slice for {marker} is empty or off-target — \
+                 the anchor or known-line drifted"
+            );
+            slice
+        };
+
+        let spawn = body("fn spawn_crawl(", "\"already_running\": true");
+        let cancel = body("fn cancel(", "\"no running crawler\"");
+        let bulk = body("fn bulk_spawn(", "\"--bulk-op\"");
+
+        for (name, slice) in [
+            ("spawn_crawl", spawn),
+            ("cancel", cancel),
+            ("bulk_spawn", bulk),
+        ] {
+            assert!(
+                slice.contains("crawl_running()") || slice.contains("live_crawler_pid()"),
+                "{name} must decide on the UNCACHED liveness probe"
+            );
+            assert!(
+                !slice.contains("crawl_running_cached()")
+                    && !slice.contains("live_crawler_pid_cached()"),
+                "{name} must not use the TTL-cached liveness probe"
+            );
+        }
+    }
+
+    #[test]
+    fn liveness_cache_gate_respects_key_and_ttl() {
+        const TTL: u64 = CRAWLER_LIVENESS_TTL_MS;
+        // same pidfile text, within the TTL (inclusive) → usable
+        assert!(liveness_cache_usable(
+            "1234",
+            1_000,
+            "1234",
+            1_000 + TTL,
+            TTL
+        ));
+        // one tick past the TTL → stale, re-probe
+        assert!(!liveness_cache_usable(
+            "1234",
+            1_000,
+            "1234",
+            1_000 + TTL + 1,
+            TTL
+        ));
+        // pidfile rewritten (new worker pid) → never trusted, whatever the age
+        assert!(!liveness_cache_usable("1234", 1_000, "5678", 1_000, TTL));
+        assert!(!liveness_cache_usable("1234", 1_000, "5678", 0, TTL));
+        // saturating math: elapsed clamps at 0 (never panics, never wraps)
+        assert!(liveness_cache_usable(
+            "1234",
+            u64::MAX,
+            "1234",
+            u64::MAX,
+            TTL
+        ));
+        // ttl 0: only a verdict taken at this exact instant is usable
+        assert!(liveness_cache_usable("1234", 1_000, "1234", 1_000, 0));
+        assert!(!liveness_cache_usable("1234", 999, "1234", 1_000, 0));
+    }
+
+    #[test]
+    fn index_error_record_dedupes_repeats_and_caps_length() {
+        // NOTE: global static — tolerates entries left by other tests
+        let before = LAST_INDEX_ERRORS.lock().unwrap().len();
+        record_index_error("auto-ingest", "boom");
+        record_index_error("auto-ingest", "boom"); // identical repeat: no stack-up
+        {
+            let errs = LAST_INDEX_ERRORS.lock().unwrap();
+            assert_eq!(errs.len(), before + 1);
+            assert_eq!(errs.last().unwrap(), "auto-ingest: boom");
+        }
+        // a flood of distinct failures stays capped at the tail
+        for i in 0..(LAST_ERRORS_MAX * 2) {
+            record_index_error("fts-refresh", &format!("e{i}"));
+        }
+        let errs = LAST_INDEX_ERRORS.lock().unwrap();
+        assert_eq!(errs.len(), LAST_ERRORS_MAX);
+        assert!(
+            errs.last()
+                .unwrap()
+                .ends_with(&format!("e{}", LAST_ERRORS_MAX * 2 - 1)),
+            "the newest failure survives the cap: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn status_json_surfaces_last_errors_only_when_present() {
+        let stats = bite_index::IndexStats {
+            total: 3,
+            per_app: vec![("mail".to_string(), 3)],
+            newest_updated_ms: Some(7),
+            fts_indexed: true,
+        };
+        let crawl = json!({ "state": "done", "failures": 0 });
+        let jobs = json!({ "jobs": [], "pending_batches": 0 });
+
+        // empty last_errors → NO last_errors key at all; the rest of the
+        // payload (hint, pending counts, crawl alive) is unchanged
+        let v = status_json(&stats, 1, 2, crawl.clone(), false, jobs.clone(), &[]);
+        assert_eq!(v["total"], 3);
+        assert_eq!(v["pending_batches"], 3);
+        assert_eq!(v["crawl"]["alive"], false);
+        assert!(v["hint"].is_string(), "got: {v}");
+        assert!(v.get("last_errors").is_none(), "got: {v}");
+
+        // non-empty → key present with the entries verbatim
+        let errs = vec![
+            "auto-ingest: boom".to_string(),
+            "fts-refresh: e1".to_string(),
+        ];
+        let v = status_json(&stats, 0, 0, crawl, true, jobs, &errs);
+        assert_eq!(v["last_errors"], json!(errs));
+        assert_eq!(v["crawl"]["alive"], true);
+        // nothing else pending + done state → still no hint, only the errors
+        assert!(v.get("hint").is_none(), "got: {v}");
     }
 
     #[test]

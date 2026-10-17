@@ -16,8 +16,10 @@ pub fn run(all_clients: bool, yes: bool) -> Result<i32, bite_core::BiteError> {
         Ok(path) => println!("ok ({})", path.display()),
         Err(e) => {
             println!();
+            // the rendered error already names its real fix — a hardcoded
+            // `xcode-select --install` hint here was wrong for every other
+            // failure mode (missing dir, sign failure, …)
             eprintln!("error: {}", bite_core::BiteError(e).render());
-            eprintln!("hint: run `xcode-select --install` and retry.");
             return Ok(1);
         }
     }
@@ -98,12 +100,56 @@ pub fn run(all_clients: bool, yes: bool) -> Result<i32, bite_core::BiteError> {
     Ok(if failed { 2 } else { 0 })
 }
 
-fn ask(prompt: &str) -> bool {
+/// The `[Y/n]` decision for one answer line: an EMPTY line is the default
+/// Yes; y/yes accept; everything else declines.
+fn yes_answer(line: &str) -> bool {
+    let l = line.trim().to_ascii_lowercase();
+    l.is_empty() || l == "y" || l == "yes"
+}
+
+/// One prompt answered from `input`. Returns false on EOF or a read error:
+/// a closed stdin (scripted/headless runs without `--yes`) must NOT read as
+/// "Yes" — silently registering every detected client is the opposite of
+/// consent. An explicit empty line (plain Enter) is still the default Yes.
+fn ask_reader<R: std::io::BufRead>(prompt: &str, input: &mut R) -> bool {
     use std::io::Write;
     print!("{prompt} ");
     std::io::stdout().flush().ok();
     let mut line = String::new();
-    std::io::stdin().read_line(&mut line).ok();
-    let l = line.trim().to_ascii_lowercase();
-    l.is_empty() || l == "y" || l == "yes"
+    match input.read_line(&mut line) {
+        Ok(0) | Err(_) => false, // EOF (closed stdin) / read error = No
+        Ok(_) => yes_answer(&line),
+    }
+}
+
+fn ask(prompt: &str) -> bool {
+    let mut stdin = std::io::stdin().lock();
+    ask_reader(prompt, &mut stdin)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ask_eof_is_no_but_empty_line_is_yes() {
+        let answer = |input: &'static [u8]| {
+            let mut r = std::io::BufReader::new(input);
+            ask_reader("  register? [Y/n]", &mut r)
+        };
+        // closed stdin (EOF, zero bytes) is "No" — scripted runs must not
+        // silently register every detected client
+        assert!(!answer(b""), "EOF must read as No");
+        // an explicit empty line (plain Enter) is still the [Y/n] default Yes
+        assert!(answer(b"\n"));
+        assert!(answer(b"  \n"));
+        // explicit y/yes/n/no
+        assert!(answer(b"y\n"));
+        assert!(answer(b"Y\n"));
+        assert!(answer(b" yes \n"));
+        assert!(!answer(b"n\n"));
+        assert!(!answer(b"No\n"));
+        // garbage declines rather than guessing
+        assert!(!answer(b"maybe\n"));
+    }
 }

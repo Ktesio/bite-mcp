@@ -33,6 +33,19 @@ a tag has a matching section here before it can ship.
   `updated_ms` in one projected scan instead of eight sequential index
   queries (#33).
 - Dependency floors raised to `dirs` 7, `toml` 1.1 and `toml_edit` 0.25 (#27).
+- Agent-CLI registrations write the resolved absolute `bite` path (dev-checkout
+  builds keep the bare `bite`), so GUI-launched clients without `~/.cargo/bin`
+  on their PATH can start the server.
+- Config is read once per process instead of on every tool call, and
+  crawler-liveness probes on read-only status paths are TTL-cached (5 s,
+  keyed on the pidfile) — crawl spawn/cancel still probe fresh.
+- `bite doctor` honesty: the missing Swift toolchain renders as a warning
+  (yellow ○) instead of a failing ✗ — it never counted toward the exit code —
+  while a denied crawler Mail probe now DOES count (exit 2, matching its ✗),
+  and the broken-helper fix hint prints without `--fix`. `--fix` opens each
+  System Settings pane once (mail/notes/messages share one Automation pane)
+  and skips apps that aren't installed; `--probe` warns on stderr before it
+  can raise permission prompts.
 - Index-backed search folds newly crawled rows into the full-text index as soon
   as a crawl settles, so fresh mail is searchable without an explicit rebuild (#14).
 - Mail crawl transport ported to OSA/NSAppleScript — the raw AppleEvents path is
@@ -42,6 +55,14 @@ a tag has a matching section here before it can ship.
 
 ### Fixed
 
+- Bulk-operation responses point agents at the real `index_status` tool instead
+  of the nonexistent `job_status`.
+- `bite setup` no longer suggests `xcode-select --install` for every helper
+  failure (the rendered error names its real fix), and closed stdin (EOF) at
+  the register prompt now counts as "No" — scripted runs without `--yes`
+  register nothing instead of every detected client.
+- Background index failures (auto-ingest, post-crawl FTS refresh) surface as
+  `last_errors` in `index_status` instead of being visible only on stderr.
 - `bite index stats` reports the true newest `updated_ms` — the limit-1
   lookup is now ordered (`updated_ms DESC NULLS LAST`) instead of returning
   an arbitrary row in scan order (#28).
