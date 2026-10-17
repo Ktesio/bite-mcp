@@ -113,7 +113,10 @@ operations*; the Rust control plane itself never sends Mail Apple Events.
 Live `mail.*` tools still go through the helper's ScriptingBridge —
 including the live fallback while the index has no Mail rows yet
 (`force_live`, `index_not_ready`). The two sides meet on disk in bite's data
-dir.
+dir. Result ordering from the index: filter-only searches (no `query` text)
+return newest-first (`updated_ms` descending, NULLs last), so a `limit` page
+is the newest page — matching the live `messages_search` walk — while
+full-text searches rank by BM25 relevance.
 
 ### crawl-state.json
 

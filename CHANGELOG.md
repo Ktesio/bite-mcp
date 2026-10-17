@@ -25,6 +25,10 @@ a tag has a matching section here before it can ship.
 
 ### Changed
 
+- Index-backed `search` returns newest-first for filter-only queries
+  (`updated_ms DESC NULLS LAST`) instead of an arbitrary scan-order page,
+  matching the live `messages_search` walk; full-text queries keep BM25
+  relevance ranking (#34).
 - Dependency floors raised to `dirs` 7, `toml` 1.1 and `toml_edit` 0.25 (#27).
 - Index-backed search folds newly crawled rows into the full-text index as soon
   as a crawl settles, so fresh mail is searchable without an explicit rebuild (#14).
