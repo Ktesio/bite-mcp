@@ -50,6 +50,17 @@ impl BridgeError {
         )
     }
 
+    /// Like [`BridgeError::helper_exited`], but the request provably never
+    /// reached the helper: the write itself failed or the transport was
+    /// already torn down before anything was written. The call did not run,
+    /// so replaying it is safe even for non-idempotent tools.
+    pub fn helper_exited_unsent() -> Self {
+        Self::new(
+            "helper_exited_unsent",
+            "the helper exited before the request was delivered — the call did not run",
+        )
+    }
+
     pub fn protocol(message: impl Into<String>) -> Self {
         Self::new("protocol_error", message)
     }
