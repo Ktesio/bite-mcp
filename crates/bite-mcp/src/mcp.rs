@@ -240,14 +240,18 @@ fn run_tool_retrying(state: &ServerState, name: &str, args: Value) -> Result<Val
     let mut handle = state.handle.lock().unwrap();
     match ops::run(handle.get()?, name, args.clone()) {
         Ok(v) => Ok(v),
-        Err(mut e) if e.code == "helper_exited" => {
-            // Respawn either way so the next call gets a fresh process. The
-            // dead call is only replayed for read-only/idempotent tools —
-            // the first attempt may already have committed inside the
-            // helper, and a blind retry could double-send mail or
-            // duplicate a create (same rationale as the timeout arm).
+        Err(mut e) if matches!(e.code.as_str(), "helper_exited" | "helper_exited_unsent") => {
+            // Respawn either way so the next call gets a fresh process.
+            // helper_exited_unsent means the request provably never reached
+            // the helper (the write itself failed or the transport was
+            // already torn down) — nothing ran, so replaying is safe for
+            // EVERY tool, mutating ones included. Plain helper_exited keeps
+            // the mid-call-death guard: the first attempt may already have
+            // committed inside the helper, and a blind retry could
+            // double-send mail or duplicate a create (same rationale as
+            // the timeout arm).
             handle.reset();
-            if registry::replay_safe(name) {
+            if e.code == "helper_exited_unsent" || registry::replay_safe(name) {
                 ops::run(handle.get()?, name, args).map_err(BiteError)
             } else {
                 e.message.push_str(

@@ -96,6 +96,24 @@ fn helper_exit_fails_pending_requests() {
 }
 
 #[test]
+fn undelivered_call_reports_helper_exited_unsent() {
+    // helper dies quietly ~150ms after hello; the next call finds the
+    // transport already torn down (stdin cleared, nothing written) and must
+    // report the request as never-delivered — a code distinct from a
+    // mid-call death, where the outcome is genuinely unknown and a replay
+    // of a mutating tool would be unsafe.
+    let path = scenario_file(&json!({ "exit_after_ms": 400 }));
+    let bridge = Bridge::spawn_args(fake_helper(), &[path.path().display().to_string()]).unwrap();
+    std::thread::sleep(Duration::from_millis(1000));
+    let err = bridge.call("sys.ping", &json!({})).unwrap_err();
+    assert_eq!(err.code, "helper_exited_unsent");
+    // and the failure is sticky: the transport stays dead, never a
+    // silent success on a later call
+    let err2 = bridge.call("sys.ping", &json!({})).unwrap_err();
+    assert_eq!(err2.code, "helper_exited_unsent");
+}
+
+#[test]
 fn spawn_failure_is_reported() {
     let err = Bridge::spawn("/nonexistent/bite-helper-xyz")
         .err()

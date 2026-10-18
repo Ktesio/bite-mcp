@@ -67,6 +67,17 @@ fn main() {
     {
         exit(0);
     }
+    if let Some(ms) = scenario.get("exit_after_ms").and_then(|v| v.as_u64()) {
+        // Quiet death while otherwise serving normally: a watchdog thread
+        // exits the process at the deadline, so calls made BEFORE it fire
+        // get answered and the host's NEXT call finds the transport
+        // already torn down — the unsent path, where a replay is provably
+        // safe (nothing ever ran).
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(ms));
+            exit(0);
+        });
+    }
 
     let stdin = std::io::stdin();
     for line in stdin.lock().lines() {

@@ -661,12 +661,14 @@ fn call(handle: &mut BridgeHandle, tool: &str, params: Value) -> Result<Value, B
     }
     match ops::run(handle.get()?, tool, params.clone()) {
         Ok(v) => Ok(v),
-        Err(mut e) if e.code == "helper_exited" => {
+        Err(mut e) if matches!(e.code.as_str(), "helper_exited" | "helper_exited_unsent") => {
             // Respawn either way; replay only read-only/idempotent tools —
-            // the first attempt may already have committed (see the guard
-            // in mcp::run_tool_retrying for the full rationale).
+            // unless the failure is helper_exited_unsent, which proves the
+            // request never reached the helper and a replay of ANY tool is
+            // safe (see the guard in mcp::run_tool_retrying for the full
+            // rationale).
             handle.reset();
-            if bite_core::registry::replay_safe(tool) {
+            if e.code == "helper_exited_unsent" || bite_core::registry::replay_safe(tool) {
                 ops::run(handle.get()?, tool, params).map_err(BiteError)
             } else {
                 e.message.push_str(

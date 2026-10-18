@@ -118,7 +118,10 @@ impl Bridge {
                         }
                     }
                 }
-                // stdout closed: helper is gone; fail every pending request
+                // stdout closed: helper is gone; fail every pending request.
+                // These were delivered (or at least written) — the helper
+                // may have committed before dying, so this stays the
+                // AMBIGUOUS helper_exited, never the unsent variant.
                 if let Some(mut child) = child_slot.lock().unwrap().take() {
                     let _ = child.wait();
                 }
@@ -206,13 +209,21 @@ impl Bridge {
                     if !write_ok {
                         drop(guard);
                         self.inner.pending.lock().unwrap().remove(&id);
-                        return Err(BridgeError::helper_exited());
+                        // A failed write/flush means the request never
+                        // landed as a complete line: at worst a truncated
+                        // fragment reached the pipe, which the helper
+                        // cannot parse (and so cannot execute). The call
+                        // provably did not run — unlike the mid-call-death
+                        // path, replaying is safe for any tool.
+                        return Err(BridgeError::helper_exited_unsent());
                     }
                 }
                 None => {
                     drop(guard);
                     self.inner.pending.lock().unwrap().remove(&id);
-                    return Err(BridgeError::helper_exited());
+                    // The reader thread already tore the transport down
+                    // (helper gone): nothing was ever written for this id.
+                    return Err(BridgeError::helper_exited_unsent());
                 }
             }
         }
@@ -222,6 +233,9 @@ impl Bridge {
             Err(_) => {
                 self.inner.pending.lock().unwrap().remove(&id);
                 if !self.is_alive() {
+                    // The request was written but no response arrived before
+                    // the death — the outcome is genuinely unknown (may have
+                    // committed), so this stays the ambiguous code.
                     Err(BridgeError::helper_exited())
                 } else {
                     Err(BridgeError::timeout(format!(

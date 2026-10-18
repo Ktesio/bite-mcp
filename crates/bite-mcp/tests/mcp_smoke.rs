@@ -377,3 +377,62 @@ fn helper_death_never_replays_mutating_tools() {
     );
     assert_eq!(call["isError"], json!(false));
 }
+
+/// A mutating tool (mail_send) whose helper died BEFORE the request was
+/// delivered IS safely replayed against the respawned helper: an unsent
+/// death (transport already torn down when the call was made) proves
+/// nothing ran the first time, so a retry cannot double-send. The rewrite
+/// discriminator proves the replay really reached the fresh process: the
+/// respawned helper reads the rewritten script and answers with a marker
+/// only a replay would return.
+#[test]
+fn unsent_death_replays_mutating_tools_safely() {
+    let mut mcp = McpProc::start_scenario(json!({ "echo": true, "exit_after_ms": 1000 }), &[]);
+
+    let init = mcp.request(
+        "initialize",
+        json!({
+            "protocolVersion": "2025-06-18",
+            "capabilities": {},
+            "clientInfo": { "name": "smoke", "version": "0" }
+        }),
+    );
+    assert_eq!(init["serverInfo"]["name"], json!("bite-mcp"));
+
+    // Warm-up read: spawns helper H1 now; it echoes and then exits on its
+    // own ~200ms later (quiet death, nothing pending).
+    let warmup = mcp.request(
+        "tools/call",
+        json!({ "name": "notes_folders", "arguments": {} }),
+    );
+    assert_eq!(warmup["isError"], json!(false));
+
+    // Wait past H1's death so the mail_send below finds the transport
+    // already torn down (unsent death) rather than racing a mid-call
+    // death (ambiguous, correctly NOT replayed). The 2.5s margin covers
+    // slow runners where the warm-up itself eats into the 1s deadline.
+    std::thread::sleep(std::time::Duration::from_millis(2500));
+
+    // Only the respawned helper reads this script; the replay must consume
+    // its marker response and succeed.
+    mcp.rewrite_scenario(json!({
+        "echo": true,
+        "responses": { "mail.send": [{ "sent": true, "delivered_by": "safe-replay" }] }
+    }));
+
+    let call = mcp.request(
+        "tools/call",
+        json!({
+            "name": "mail_send",
+            "arguments": { "to": ["a@b.c"], "subject": "hi", "body": "x" }
+        }),
+    );
+    assert_eq!(call["isError"], json!(false));
+    let text = call["content"][0]["text"].as_str().unwrap();
+    let parsed: Value = serde_json::from_str(text).unwrap();
+    assert_eq!(
+        parsed["delivered_by"],
+        json!("safe-replay"),
+        "the mutating call must be replayed against the respawned helper"
+    );
+}

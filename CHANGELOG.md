@@ -20,6 +20,13 @@ a tag has a matching section here before it can ship.
   retry could double-send mail or duplicate a create. Applies to both the MCP
   server and the CLI dispatch path; classification lives in the tool registry
   and unknown tools default to never replay.
+- New `helper_exited_unsent` transport error distinguishes a request that
+  provably never reached the helper (the write failed or the transport was
+  already torn down) from a mid-call death of unknown outcome. Unsent
+  failures replay safely for every tool, mutating ones included — nothing
+  ran the first time — while the ambiguous mid-call death keeps the
+  not-replayed guard above. Applies to both the MCP server and the CLI
+  dispatch path.
 
 ## [v0.4.0] - 2026-10-18
 
