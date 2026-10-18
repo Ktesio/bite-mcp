@@ -244,6 +244,24 @@ fn run_tool_retrying(state: &ServerState, name: &str, args: Value) -> Result<Val
             handle.reset();
             ops::run(handle.get()?, name, args).map_err(BiteError)
         }
+        // Alive but wedged (a stuck Apple Events call): recycle the helper so
+        // the next call gets a fresh process instead of queueing behind the
+        // stuck one while this mutex is held. The abandoned call is NOT
+        // replayed — it may already have committed inside the helper, and a
+        // blind retry could double-send mail or repeat a delete.
+        Err(mut e) if e.code == "timeout" => {
+            handle.reset();
+            e.message.push_str(
+                "; the wedged helper was recycled and the call was abandoned — \
+                 it may or may not have taken effect",
+            );
+            e.fix = Some(
+                "re-check state (search before re-sending, list before deleting) \
+                 before re-issuing non-idempotent operations"
+                    .to_string(),
+            );
+            Err(BiteError(e))
+        }
         Err(e) => Err(BiteError(e)),
     }
 }

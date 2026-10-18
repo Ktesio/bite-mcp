@@ -19,11 +19,21 @@ use serde_json::Value;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    let scenario: Value = if args.len() > 1 {
-        let text = std::fs::read_to_string(&args[1]).expect("scenario file");
-        serde_json::from_str(&text).expect("scenario json")
+    // Scenario source: argv[1] when spawned with one, else the
+    // `BITE_FAKE_SCENARIO` env (set by the MCP smoke harness, which spawns
+    // the server process and can only reach the helper through the
+    // environment), else plain echo.
+    let scenario_path: Option<String> = if args.len() > 1 {
+        Some(args[1].clone())
     } else {
-        serde_json::json!({ "echo": true })
+        std::env::var("BITE_FAKE_SCENARIO").ok()
+    };
+    let scenario: Value = match &scenario_path {
+        Some(path) => {
+            let text = std::fs::read_to_string(path).expect("scenario file");
+            serde_json::from_str(&text).expect("scenario json")
+        }
+        None => serde_json::json!({ "echo": true }),
     };
     let echo = scenario
         .get("echo")

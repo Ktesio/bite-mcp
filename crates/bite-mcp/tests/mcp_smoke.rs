@@ -25,36 +25,51 @@ struct McpProc {
     reader: BufReader<std::process::ChildStdout>,
     next_id: i64,
     /// Scenario file for the spawned server; lives (and is deleted) with the
-    /// proc — never read, held only for its Drop.
+    /// proc — held only for its Drop.
     _scenario: Option<tempfile::NamedTempFile>,
+    /// Same file as `_scenario`, addressable for mid-test rewrites.
+    scenario_path: std::path::PathBuf,
 }
 
 impl McpProc {
     fn start() -> Self {
-        let mut scenario = tempfile::Builder::new()
+        Self::start_scenario(json!({ "echo": true }), &[])
+    }
+
+    /// Start with an explicit helper scenario and extra env for the server
+    /// process (e.g. `BITE_TIMEOUT_SECS` to bound per-call budgets).
+    fn start_scenario(scenario: Value, extra_env: &[(&str, &str)]) -> Self {
+        let mut scenario_file = tempfile::Builder::new()
             .prefix("bite-mcp-smoke-")
             .suffix(".json")
             .tempfile()
             .expect("scenario temp file");
-        write!(scenario, "{}", json!({ "echo": true })).unwrap();
-        let mut child = Command::new(env!("CARGO_BIN_EXE_bite"))
-            .args(["mcp"])
+        write!(scenario_file, "{}", scenario).unwrap();
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_bite"));
+        cmd.args(["mcp"])
             .env("BITE_HELPER_BIN", fake_helper_path())
-            .env("BITE_FAKE_SCENARIO", scenario.path())
+            .env("BITE_FAKE_SCENARIO", scenario_file.path())
+            .envs(extra_env.iter().copied())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
-            .spawn()
-            .expect("spawn bite mcp");
+            .stderr(Stdio::inherit());
+        let mut child = cmd.spawn().expect("spawn bite mcp");
         let stdin = child.stdin.take().unwrap();
         let stdout = child.stdout.take().unwrap();
         Self {
+            scenario_path: scenario_file.path().to_path_buf(),
             child,
             stdin,
             reader: BufReader::new(stdout),
             next_id: 0,
-            _scenario: Some(scenario),
+            _scenario: Some(scenario_file),
         }
+    }
+
+    /// Replace the helper scenario on disk — only a helper (re)spawned after
+    /// this point reads the new content; a live one keeps its old script.
+    fn rewrite_scenario(&self, scenario: Value) {
+        std::fs::write(&self.scenario_path, scenario.to_string()).expect("rewrite scenario");
     }
 
     fn request(&mut self, method: &str, params: Value) -> Value {
@@ -68,6 +83,18 @@ impl McpProc {
         let v: Value = serde_json::from_str(buf.trim()).expect("valid json response");
         assert_eq!(v["id"], json!(self.next_id));
         v["result"].clone()
+    }
+
+    /// One raw request returning the full response object (errors included).
+    fn request_raw(&mut self, method: &str, params: Value) -> Value {
+        self.next_id += 1;
+        let line =
+            json!({ "jsonrpc": "2.0", "id": self.next_id, "method": method, "params": params });
+        writeln!(self.stdin, "{line}").unwrap();
+        self.stdin.flush().unwrap();
+        let mut buf = String::new();
+        self.reader.read_line(&mut buf).expect("response line");
+        serde_json::from_str(buf.trim()).expect("valid json response")
     }
 }
 
@@ -180,4 +207,59 @@ fn assert_unknown_method(mcp: &mut McpProc) {
     mcp.reader.read_line(&mut buf).unwrap();
     let v: Value = serde_json::from_str(buf.trim()).unwrap();
     assert_eq!(v["error"]["code"], json!(-32601));
+}
+
+/// A wedged helper (alive but stuck past the per-call budget) must surface a
+/// timeout error, be recycled, and NOT have its call blindly replayed; the
+/// next call must succeed through a fresh helper instead of queueing behind
+/// the stuck one.
+#[test]
+fn wedged_helper_times_out_and_recycles() {
+    let mut mcp = McpProc::start_scenario(
+        json!({ "echo": true, "sleep_ms_per_call": 30_000 }),
+        &[("BITE_TIMEOUT_SECS", "1")],
+    );
+
+    let init = mcp.request(
+        "initialize",
+        json!({
+            "protocolVersion": "2025-06-18",
+            "capabilities": {},
+            "clientInfo": { "name": "smoke", "version": "0" }
+        }),
+    );
+    assert_eq!(init["serverInfo"]["name"], json!("bite-mcp"));
+
+    // sleeps past the 1s budget → timeout error that says the helper was
+    // recycled and the call abandoned (with a fix hint), not a JSON-RPC hang
+    let resp = mcp.request_raw(
+        "tools/call",
+        json!({ "name": "calendar_list_calendars", "arguments": {} }),
+    );
+    assert_eq!(resp["error"]["code"], json!(-32000));
+    let msg = resp["error"]["message"].as_str().expect("error message");
+    assert!(
+        msg.contains("recycled"),
+        "message should mention the recycle: {msg}"
+    );
+    assert!(
+        msg.contains("abandoned"),
+        "message should mention the abandoned call: {msg}"
+    );
+    assert!(
+        msg.contains("fix:"),
+        "message should carry the fix hint: {msg}"
+    );
+
+    // recovery: only a respawned helper reads the rewritten scenario — if the
+    // wedged process were still behind the handle, this call would time out
+    mcp.rewrite_scenario(json!({ "echo": true }));
+    let call = mcp.request(
+        "tools/call",
+        json!({ "name": "calendar_list_calendars", "arguments": {} }),
+    );
+    assert_eq!(call["isError"], json!(false));
+    let text = call["content"][0]["text"].as_str().unwrap();
+    let parsed: Value = serde_json::from_str(text).unwrap();
+    assert_eq!(parsed["ok"], json!(true));
 }

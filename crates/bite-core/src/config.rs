@@ -13,7 +13,7 @@ pub struct Config {
     /// Default mail account for sends when none passed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_mail_account: Option<String>,
-    /// Per-request bridge timeout in seconds.
+    /// Per-request bridge timeout in seconds (env override: `BITE_TIMEOUT_SECS`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_secs: Option<u64>,
     /// GitHub repo for prebuilt helper downloads (`owner/repo`).
@@ -65,10 +65,20 @@ impl Config {
     }
 
     pub fn load() -> Self {
-        std::fs::read_to_string(config_path())
+        let mut cfg: Self = std::fs::read_to_string(config_path())
             .ok()
             .and_then(|s| toml::from_str(&s).ok())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        // `BITE_TIMEOUT_SECS` env override: wins over the config file. Tests
+        // use it to bound per-call budgets to something the suite can wait
+        // for; it also serves as a one-off ops lever without editing the file.
+        if let Some(secs) = std::env::var("BITE_TIMEOUT_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+        {
+            cfg.timeout_secs = Some(secs);
+        }
+        cfg
     }
 
     pub fn save(&self) -> std::io::Result<()> {
