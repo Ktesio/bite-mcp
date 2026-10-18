@@ -10,6 +10,8 @@ a tag has a matching section here before it can ship.
 
 ## [Unreleased]
 
+## [v0.4.0] - 2026-10-18
+
 ### Added
 
 - cargo-deny supply-chain checks in CI: license allow-list, wildcard-version
@@ -42,17 +44,17 @@ a tag has a matching section here before it can ship.
 - Dependency floors raised to `dirs` 7, `toml` 1.1 and `toml_edit` 0.25 (#27).
 - Agent-CLI registrations write the resolved absolute `bite` path (dev-checkout
   builds keep the bare `bite`), so GUI-launched clients without `~/.cargo/bin`
-  on their PATH can start the server.
+  on their PATH can start the server (#36).
 - Config is read once per process instead of on every tool call, and
   crawler-liveness probes on read-only status paths are TTL-cached (5 s,
-  keyed on the pidfile) — crawl spawn/cancel still probe fresh.
+  keyed on the pidfile) — crawl spawn/cancel still probe fresh (#36).
 - `bite doctor` honesty: the missing Swift toolchain renders as a warning
   (yellow ○) instead of a failing ✗ — it never counted toward the exit code —
   while a denied crawler Mail probe now DOES count (exit 2, matching its ✗),
   and the broken-helper fix hint prints without `--fix`. `--fix` opens each
   System Settings pane once (mail/notes/messages share one Automation pane)
   and skips apps that aren't installed; `--probe` warns on stderr before it
-  can raise permission prompts.
+  can raise permission prompts (#36).
 - Index-backed search folds newly crawled rows into the full-text index as soon
   as a crawl settles, so fresh mail is searchable without an explicit rebuild (#14).
 - Mail crawl transport ported to OSA/NSAppleScript — the raw AppleEvents path is
@@ -68,7 +70,7 @@ a tag has a matching section here before it can ship.
   stuck process until its 300s budget expired, each while holding the lock.
   The abandoned call is never blindly replayed (it may already have committed
   inside the helper) and its error says so, with a verify-before-reissuing
-  hint. The per-call budget gains a `BITE_TIMEOUT_SECS` env override.
+  hint. The per-call budget gains a `BITE_TIMEOUT_SECS` env override (#37).
 - Bulk-operation responses point agents at the real `index_status` tool instead
   of the nonexistent `job_status`.
 - `bite setup` no longer suggests `xcode-select --install` for every helper
