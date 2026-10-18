@@ -25,6 +25,10 @@ a tag has a matching section here before it can ship.
 
 ### Added
 
+- Opt-in `skip_count` on `mail_messages_search`: index-served filter-only
+  searches normally pay a second full COUNT scan for the exact `count`;
+  passing `skip_count: true` skips it — `count` comes back null (the same
+  shape full-text queries return) and the page is unchanged.
 - cargo-deny supply-chain checks in CI: license allow-list, wildcard-version
   bans with duplicate-major warnings, and a crates.io-only source policy
   (`deny.toml`), layered onto the cargo-audit lane (#26).
