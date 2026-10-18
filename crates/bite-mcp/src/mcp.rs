@@ -6,7 +6,7 @@
 use std::io::{BufRead, Write};
 use std::sync::Mutex;
 
-use bite_core::{json_schema, ops, BiteError};
+use bite_core::{json_schema, ops, registry, BiteError};
 use serde_json::{json, Value};
 
 use crate::helper::BridgeHandle;
@@ -240,9 +240,27 @@ fn run_tool_retrying(state: &ServerState, name: &str, args: Value) -> Result<Val
     let mut handle = state.handle.lock().unwrap();
     match ops::run(handle.get()?, name, args.clone()) {
         Ok(v) => Ok(v),
-        Err(e) if e.code == "helper_exited" => {
+        Err(mut e) if e.code == "helper_exited" => {
+            // Respawn either way so the next call gets a fresh process. The
+            // dead call is only replayed for read-only/idempotent tools —
+            // the first attempt may already have committed inside the
+            // helper, and a blind retry could double-send mail or
+            // duplicate a create (same rationale as the timeout arm).
             handle.reset();
-            ops::run(handle.get()?, name, args).map_err(BiteError)
+            if registry::replay_safe(name) {
+                ops::run(handle.get()?, name, args).map_err(BiteError)
+            } else {
+                e.message.push_str(
+                    "; the helper was respawned but the call was not replayed — \
+                     it may or may not have taken effect",
+                );
+                e.fix = Some(
+                    "re-check state (search before re-sending, list before deleting) \
+                     before re-issuing non-idempotent operations"
+                        .to_string(),
+                );
+                Err(BiteError(e))
+            }
         }
         // Alive but wedged (a stuck Apple Events call): recycle the helper so
         // the next call gets a fresh process instead of queueing behind the

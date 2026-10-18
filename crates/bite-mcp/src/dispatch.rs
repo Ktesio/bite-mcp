@@ -661,9 +661,25 @@ fn call(handle: &mut BridgeHandle, tool: &str, params: Value) -> Result<Value, B
     }
     match ops::run(handle.get()?, tool, params.clone()) {
         Ok(v) => Ok(v),
-        Err(e) if e.code == "helper_exited" => {
+        Err(mut e) if e.code == "helper_exited" => {
+            // Respawn either way; replay only read-only/idempotent tools —
+            // the first attempt may already have committed (see the guard
+            // in mcp::run_tool_retrying for the full rationale).
             handle.reset();
-            ops::run(handle.get()?, tool, params).map_err(BiteError)
+            if bite_core::registry::replay_safe(tool) {
+                ops::run(handle.get()?, tool, params).map_err(BiteError)
+            } else {
+                e.message.push_str(
+                    "; the helper was respawned but the call was not replayed — \
+                     it may or may not have taken effect",
+                );
+                e.fix = Some(
+                    "re-check state (search before re-sending, list before deleting) \
+                     before re-issuing non-idempotent operations"
+                        .to_string(),
+                );
+                Err(BiteError(e))
+            }
         }
         Err(e) => Err(BiteError(e)),
     }
