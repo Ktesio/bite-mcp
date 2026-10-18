@@ -75,6 +75,13 @@ pub struct Tool {
     /// Destructive tools require `confirm: true` (the helper returns a preview
     /// otherwise — the agent shows it to the user first).
     pub destructive: bool,
+    /// Read-only / idempotent tools may be transparently replayed when the
+    /// helper dies mid-call (a replay of a read has no side effects). Tools
+    /// that mutate state — send/create/update and the destructive class —
+    /// must never be blind-replayed: the first attempt may already have
+    /// committed before the helper died, and a replay would double-send or
+    /// duplicate. See `replay_safe()`.
+    pub replay_safe: bool,
 }
 
 const fn t(
@@ -91,10 +98,12 @@ const fn t(
         description,
         params,
         destructive: false,
+        replay_safe: true,
     }
 }
 
 /// Destructive tool: helper returns a preview until `confirm: true`.
+/// Never replayed across a helper restart.
 const fn td(
     name: &'static str,
     app: App,
@@ -109,6 +118,28 @@ const fn td(
         description,
         params,
         destructive: true,
+        replay_safe: false,
+    }
+}
+
+/// Mutating but non-destructive tool (send/create/update class): no preview
+/// gate, but a call that may already have committed is never replayed when
+/// the helper dies mid-call — the caller must re-check state and re-issue.
+const fn tn(
+    name: &'static str,
+    app: App,
+    method: &'static str,
+    description: &'static str,
+    params: &'static [ParamSpec],
+) -> Tool {
+    Tool {
+        name,
+        app,
+        method,
+        description,
+        params,
+        destructive: false,
+        replay_safe: false,
     }
 }
 
@@ -132,7 +163,7 @@ pub static TOOLS: &[Tool] = &[
     t("calendar_event_get", App::Calendar, "calendar.event_get",
         "Fetch one event by id.",
         ps![ParamSpec::req("id", ParamKind::Str, "event id from a search result")]),
-    t("calendar_event_create", App::Calendar, "calendar.event_create",
+    tn("calendar_event_create", App::Calendar, "calendar.event_create",
         "Create a calendar event. Recurrence, relative and absolute alarms supported. Attendee invites are not supported yet (ROADMAP).",
         ps![
             ParamSpec::req("title", ParamKind::Str, "event title"),
@@ -148,7 +179,7 @@ pub static TOOLS: &[Tool] = &[
             ParamSpec::opt("alarm_times", ParamKind::StrArray, "absolute alarm datetimes, ISO 8601"),
             ParamSpec::opt("recurrence", ParamKind::Obj, r#"{"freq":"daily|weekly|monthly|yearly","interval":N,"count":N or "until":"ISO"}"#),
         ]),
-    t("calendar_event_update", App::Calendar, "calendar.event_update",
+    tn("calendar_event_update", App::Calendar, "calendar.event_update",
         "Update event fields (reschedule by passing start/end, move calendar by calendar_id). Single-occurrence edit for recurring events.",
         ps![
             ParamSpec::req("id", ParamKind::Str, "event id"),
@@ -191,7 +222,7 @@ pub static TOOLS: &[Tool] = &[
             ParamSpec::opt("due_within_days", ParamKind::Int, "only incomplete due within N days"),
             ParamSpec::opt("limit", ParamKind::Int, "max results (default 100)"),
         ]),
-    t("reminders_create", App::Reminders, "reminders.create",
+    tn("reminders_create", App::Reminders, "reminders.create",
         "Create a reminder with optional due date and absolute time alarm.",
         ps![
             ParamSpec::req("title", ParamKind::Str, "reminder title"),
@@ -204,7 +235,7 @@ pub static TOOLS: &[Tool] = &[
             ParamSpec::opt("due_has_time", ParamKind::Bool, "default true"),
             ParamSpec::opt("alarm_time", ParamKind::Date, "absolute alarm"),
         ]),
-    t("reminders_update", App::Reminders, "reminders.update",
+    tn("reminders_update", App::Reminders, "reminders.update",
         "Update a reminder: rename, reschedule, complete/uncomplete, move list, set alarm.",
         ps![
             ParamSpec::req("id", ParamKind::Str, "reminder id"),
@@ -254,7 +285,7 @@ pub static TOOLS: &[Tool] = &[
             ParamSpec::opt("mailbox", ParamKind::Str, "mailbox from the search result"),
             ParamSpec::opt("account", ParamKind::Str, "account name"),
         ]),
-    t("mail_send", App::Mail, "mail.send",
+    tn("mail_send", App::Mail, "mail.send",
         "Send an email. Body accepts Markdown by default (html:true to pass raw HTML). Attachments are file paths.",
         ps![
             ParamSpec::req("to", ParamKind::StrArray, "recipient addresses"),
@@ -266,7 +297,7 @@ pub static TOOLS: &[Tool] = &[
             ParamSpec::opt("account", ParamKind::Str, "sender account"),
             ParamSpec::opt("attachments", ParamKind::StrArray, "absolute file paths to attach"),
         ]),
-    t("mail_reply", App::Mail, "mail.reply",
+    tn("mail_reply", App::Mail, "mail.reply",
         "Reply to a message with a quoted original (reply_all includes cc's).",
         ps![
             ParamSpec::req("id", ParamKind::Str, "message id"),
@@ -276,7 +307,7 @@ pub static TOOLS: &[Tool] = &[
             ParamSpec::opt("body", ParamKind::Str, "reply text (markdown)"),
             ParamSpec::opt("html", ParamKind::Bool, "body is raw HTML"),
         ]),
-    t("mail_forward", App::Mail, "mail.forward",
+    tn("mail_forward", App::Mail, "mail.forward",
         "Forward a message with a quoted original.",
         ps![
             ParamSpec::req("id", ParamKind::Str, "message id"),
@@ -368,7 +399,7 @@ pub static TOOLS: &[Tool] = &[
     t("notes_get", App::Notes, "notes.get",
         "Full note: HTML body plus a markdown rendering.",
         ps![ParamSpec::req("id", ParamKind::Str, "note id")]),
-    t("notes_create", App::Notes, "notes.create",
+    tn("notes_create", App::Notes, "notes.create",
         "Create a note. `body` accepts Markdown (converted to Notes HTML).",
         ps![
             ParamSpec::opt("title", ParamKind::Str, "note title; default 'New Note'"),
@@ -377,7 +408,7 @@ pub static TOOLS: &[Tool] = &[
             ParamSpec::opt("account", ParamKind::Str, "account name"),
             ParamSpec::opt("html", ParamKind::Bool, "body is raw HTML"),
         ]),
-    t("notes_update", App::Notes, "notes.update",
+    tn("notes_update", App::Notes, "notes.update",
         "Update a note: set/append body (markdown), rename, or move folder.",
         ps![
             ParamSpec::req("id", ParamKind::Str, "note id"),
@@ -403,7 +434,7 @@ pub static TOOLS: &[Tool] = &[
         ]),
     t("contacts_get", App::Contacts, "contacts.get", "Fetch one contact by id.",
         ps![ParamSpec::req("id", ParamKind::Str, "contact id")]),
-    t("contacts_create", App::Contacts, "contacts.create",
+    tn("contacts_create", App::Contacts, "contacts.create",
         "Create a contact. emails/phones/urls are arrays of {label,value}.",
         ps![
             ParamSpec::opt("first", ParamKind::Str, "given name"),
@@ -414,7 +445,7 @@ pub static TOOLS: &[Tool] = &[
             ParamSpec::opt("phones", ParamKind::StrArray, r#"[{"label":"mobile","value":"+1555…"}]"#),
             ParamSpec::opt("urls", ParamKind::StrArray, r#"[{"label":"home","value":"https://…"}]"#),
         ]),
-    t("contacts_update", App::Contacts, "contacts.update",
+    tn("contacts_update", App::Contacts, "contacts.update",
         "Update contact fields. emails/phones/urls replace the whole list when passed.",
         ps![
             ParamSpec::req("id", ParamKind::Str, "contact id"),
@@ -435,7 +466,7 @@ pub static TOOLS: &[Tool] = &[
     t("contacts_groups", App::Contacts, "contacts.groups", "List contact groups with member counts.", &[]),
 
     // ─── Entity index ───────────────────────────────────────────────────────
-    t("index_rebuild", App::Index, "index.crawl",
+    tn("index_rebuild", App::Index, "index.crawl",
         "Rebuild/refresh the bite entity index for Mail. When the last crawl completed recently (within 7 days), runs a fast delta window covering only what changed since — pass full: true for the entire 30-day window + 10-day backfill schedule. Poll index_status for progress. Fast local search serves from the index once populated.",
         ps![
             ParamSpec::opt("window_days", ParamKind::Int, "initial window in days (default 30; backfill continues in 10-day batches)"),
@@ -457,7 +488,7 @@ pub static TOOLS: &[Tool] = &[
         ]),
 
     // ─── Messages ───────────────────────────────────────────────────────────
-    t("messages_send", App::Messages, "messages.send",
+    tn("messages_send", App::Messages, "messages.send",
         "Send an iMessage/SMS. The recipient must be reachable in Messages (have a conversation history) — routing is automatic.",
         ps![
             ParamSpec::req("to", ParamKind::Str, "phone or email of the recipient"),
@@ -480,6 +511,13 @@ pub fn tools() -> &'static [Tool] {
 
 pub fn find(name: &str) -> Option<&'static Tool> {
     TOOLS.iter().find(|t| t.name == name)
+}
+
+/// May a call to `name` be transparently replayed after the helper died
+/// mid-call? Default-deny: an unknown tool name is never replayed — new
+/// tools must be classified via `t`/`tn`/`td` explicitly.
+pub fn replay_safe(name: &str) -> bool {
+    find(name).is_some_and(|tool| tool.replay_safe)
 }
 
 /// JSON Schema (subset) for MCP tools/list.
@@ -573,6 +611,71 @@ mod tests {
                     t.name
                 );
             }
+        }
+    }
+
+    #[test]
+    fn replay_classification_is_conservative() {
+        // Unknown names default-deny: never replay what isn't classified.
+        assert!(!replay_safe("definitely_not_a_tool"));
+        assert!(!replay_safe(""));
+
+        // The send/create/update class (tn): mutates state, must not replay.
+        let non_replaying = [
+            "calendar_event_create",
+            "calendar_event_update",
+            "reminders_create",
+            "reminders_update",
+            "mail_send",
+            "mail_reply",
+            "mail_forward",
+            "notes_create",
+            "notes_update",
+            "contacts_create",
+            "contacts_update",
+            "messages_send",
+            "index_rebuild",
+        ];
+        for name in non_replaying {
+            let tool = find(name).unwrap_or_else(|| panic!("missing tool {name}"));
+            assert!(!tool.replay_safe, "{name} must never be blind-replayed");
+            assert!(
+                !tool.destructive,
+                "{name} is the non-destructive class, not td"
+            );
+        }
+
+        // Structural guard against future additions: any name carrying a
+        // mutating verb (or the rebuild/cancel-a-crawl semantics) must never
+        // be replay-safe.
+        for tool in TOOLS {
+            let n = tool.name;
+            let mutating = n.ends_with("_create")
+                || n.ends_with("_update")
+                || n.ends_with("_send")
+                || n.ends_with("_reply")
+                || n.ends_with("_forward")
+                || n.ends_with("_delete")
+                || n.ends_with("_move")
+                || n.starts_with("mail_bulk_")
+                || n == "index_rebuild";
+            if mutating {
+                assert!(!tool.replay_safe, "{n} mutates state and must never replay");
+            }
+        }
+
+        // Reads and set-to-fixed-state calls stay transparently replayable:
+        // a replayed mark sets the same flag again (idempotent), a replayed
+        // cancel of a finished crawl is a no-op.
+        for name in [
+            "calendar_list_calendars",
+            "mail_messages_search",
+            "search",
+            "index_status",
+            "mail_mark",
+            "index_crawl_cancel",
+        ] {
+            assert!(replay_safe(name), "{name} should remain replay-safe");
         }
     }
 }

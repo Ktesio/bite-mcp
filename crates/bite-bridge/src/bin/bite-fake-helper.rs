@@ -10,6 +10,8 @@
 //! }
 //! ```
 //! Each method consumes entries from its queue in order; the last entry repeats.
+//! A queue entry of `{"exit": true}` kills the helper instead of replying —
+//! for testing call abandonment when the process dies mid-call.
 
 use std::collections::HashMap;
 use std::io::{BufRead, Write};
@@ -88,6 +90,12 @@ fn main() {
                 } else {
                     queue.remove(0)
                 };
+                if item.get("exit").and_then(|v| v.as_bool()) == Some(true) {
+                    // Simulate a helper that dies mid-call: whatever the call
+                    // did may already have committed, but the response never
+                    // lands on the wire.
+                    exit(1);
+                }
                 if let Some(err) = item.get("error") {
                     serde_json::json!({ "id": id, "error": err })
                 } else {

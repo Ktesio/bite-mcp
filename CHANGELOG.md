@@ -10,6 +10,17 @@ a tag has a matching section here before it can ship.
 
 ## [Unreleased]
 
+### Security
+
+- Helper-death retries no longer blind-replay mutating tools: when the native
+  helper exits mid-call, read-only/idempotent tools are transparently retried
+  against the respawned helper, while the send/create/update class (and all
+  destructive tools) return an explicit not-replayed error with a re-check
+  hint instead — the first attempt may already have committed, so a silent
+  retry could double-send mail or duplicate a create. Applies to both the MCP
+  server and the CLI dispatch path; classification lives in the tool registry
+  and unknown tools default to never replay.
+
 ## [v0.4.0] - 2026-10-18
 
 ### Added

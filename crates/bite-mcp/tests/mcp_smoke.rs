@@ -263,3 +263,117 @@ fn wedged_helper_times_out_and_recycles() {
     let parsed: Value = serde_json::from_str(text).unwrap();
     assert_eq!(parsed["ok"], json!(true));
 }
+
+/// When the helper DIES mid-call (process exit, not a wedge), read-only tools
+/// are transparently replayed against the respawned helper — the caller never
+/// notices. The rewrite discriminator proves the replay really went to a
+/// fresh process: the first helper is spawned lazily by a warm-up call (so
+/// it holds the spawn-time script whose only scripted response for the
+/// method is to exit), while a respawn re-reads the rewritten file.
+#[test]
+fn helper_death_replays_read_tools_transparently() {
+    let mut mcp = McpProc::start_scenario(
+        json!({ "echo": true, "responses": { "calendar.list_calendars": [{ "exit": true }] } }),
+        &[],
+    );
+
+    let init = mcp.request(
+        "initialize",
+        json!({
+            "protocolVersion": "2025-06-18",
+            "capabilities": {},
+            "clientInfo": { "name": "smoke", "version": "0" }
+        }),
+    );
+    assert_eq!(init["serverInfo"]["name"], json!("bite-mcp"));
+
+    // Warm-up: spawns the first helper NOW, while the scenario file still
+    // holds the exit script (helpers read the file once, at spawn).
+    let warmup = mcp.request(
+        "tools/call",
+        json!({ "name": "notes_folders", "arguments": {} }),
+    );
+    assert_eq!(warmup["isError"], json!(false));
+
+    // The respawned helper reads this script; the live one keeps its exit
+    // entry queued and dies on the call.
+    mcp.rewrite_scenario(json!({ "echo": true }));
+
+    let call = mcp.request(
+        "tools/call",
+        json!({ "name": "calendar_list_calendars", "arguments": {} }),
+    );
+    assert_eq!(call["isError"], json!(false));
+    let text = call["content"][0]["text"].as_str().unwrap();
+    let parsed: Value = serde_json::from_str(text).unwrap();
+    assert_eq!(parsed["ok"], json!(true));
+}
+
+/// A mutating tool (mail_send) whose helper died mid-call must NOT be
+/// replayed — the first attempt may already have committed, and a blind
+/// retry could double-send. The guard must still respawn the helper. The
+/// rewrite discriminator: if a replay happened, it would hit the respawned
+/// helper (which reads the rewritten script and answers with a marker) and
+/// the call would SUCCEED; with the guard the caller gets an explicit
+/// not-replayed error instead.
+#[test]
+fn helper_death_never_replays_mutating_tools() {
+    let mut mcp = McpProc::start_scenario(
+        json!({ "echo": true, "responses": { "mail.send": [{ "exit": true }] } }),
+        &[],
+    );
+
+    let init = mcp.request(
+        "initialize",
+        json!({
+            "protocolVersion": "2025-06-18",
+            "capabilities": {},
+            "clientInfo": { "name": "smoke", "version": "0" }
+        }),
+    );
+    assert_eq!(init["serverInfo"]["name"], json!("bite-mcp"));
+
+    // Warm-up read: spawns the first helper on the exit script.
+    let warmup = mcp.request(
+        "tools/call",
+        json!({ "name": "calendar_list_calendars", "arguments": {} }),
+    );
+    assert_eq!(warmup["isError"], json!(false));
+
+    // Any replay would consume THIS response and return success — proving
+    // the discriminator catches an unguarded retry.
+    mcp.rewrite_scenario(json!({
+        "echo": true,
+        "responses": { "mail.send": [{ "sent": true, "would_be": "a second dispatch" }] }
+    }));
+
+    let resp = mcp.request_raw(
+        "tools/call",
+        json!({
+            "name": "mail_send",
+            "arguments": { "to": ["a@b.c"], "subject": "hi", "body": "x" }
+        }),
+    );
+    assert_eq!(resp["error"]["code"], json!(-32000));
+    let msg = resp["error"]["message"].as_str().expect("error message");
+    assert!(
+        msg.contains("not replayed"),
+        "message should say the call was not replayed: {msg}"
+    );
+    assert!(
+        msg.contains("may or may not have taken effect"),
+        "message should disclose the uncertain outcome: {msg}"
+    );
+    assert!(
+        msg.contains("fix:"),
+        "message should carry the fix hint: {msg}"
+    );
+
+    // The helper WAS respawned: a follow-up read succeeds through the fresh
+    // process (which serves the rewritten script).
+    let call = mcp.request(
+        "tools/call",
+        json!({ "name": "calendar_list_calendars", "arguments": {} }),
+    );
+    assert_eq!(call["isError"], json!(false));
+}
