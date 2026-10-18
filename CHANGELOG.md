@@ -35,6 +35,10 @@ a tag has a matching section here before it can ship.
 - Index search projects only the columns each hit consumes: `search_text`
   (the full text-search concat, which duplicates title + content) and
   `props` are no longer scanned and shipped per result row (#35).
+- The job registry caps terminal-job history: `done`/`failed`/`cancelled` jobs
+  are pruned oldest-first beyond 100 entries (running jobs are always kept), so
+  `index_status` responses no longer grow without bound over a long-lived
+  session (#38).
 - Dependency floors raised to `dirs` 7, `toml` 1.1 and `toml_edit` 0.25 (#27).
 - Agent-CLI registrations write the resolved absolute `bite` path (dev-checkout
   builds keep the bare `bite`), so GUI-launched clients without `~/.cargo/bin`
