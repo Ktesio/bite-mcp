@@ -58,6 +58,13 @@ a tag has a matching section here before it can ship.
 
 ### Fixed
 
+- A wedged helper (alive but stuck in a slow Apple Events call past the
+  per-call timeout) is now recycled instead of staying behind the server-wide
+  bridge lock — previously every subsequent MCP tool call queued behind the
+  stuck process until its 300s budget expired, each while holding the lock.
+  The abandoned call is never blindly replayed (it may already have committed
+  inside the helper) and its error says so, with a verify-before-reissuing
+  hint. The per-call budget gains a `BITE_TIMEOUT_SECS` env override.
 - Bulk-operation responses point agents at the real `index_status` tool instead
   of the nonexistent `job_status`.
 - `bite setup` no longer suggests `xcode-select --install` for every helper
