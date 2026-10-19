@@ -6,11 +6,13 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-# `remote` required: upstream 0.39.0 references the remote-gated Error::Http
-# unconditionally in job.rs, so default-feature builds fail to compile
+# `remote` required: upstream (0.39–0.40) references the remote-gated
+# Error::Http unconditionally in job.rs, so default-feature builds fail to
+# compile
+# Arrow types come from the `lancedb::arrow` re-export — never declare direct
+# arrow-array/arrow-schema deps here; a mismatched direct version splits the
+# crate graph and the store stops compiling (lancedb/lancedb#3575).
 lancedb = { version = "0.40", features = ["remote"] }
-arrow-array = "60"
-arrow-schema = "60"
 tokio = { version = "1", features = ["rt-multi-thread"] }
 futures = "0.3"
 serde = { version = "1", features = ["derive"] }

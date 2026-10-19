@@ -13,11 +13,16 @@ use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use arrow_array::{
+// Use the arrow line re-exported by lancedb (`lancedb::arrow`) instead of
+// declaring direct arrow-array/arrow-schema dependencies: lancedb's traits
+// (Scannable, RecordBatchReader) are implemented only for ITS arrow version,
+// so a direct dep that resolves to any other arrow release splits the crate
+// graph in two and the store stops compiling (lancedb/lancedb#3575).
+use lancedb::arrow::arrow_array::{
     builder::{BooleanBuilder, Int32Builder, Int64Builder, StringBuilder},
     Array, BooleanArray, Int64Array, RecordBatch, StringArray,
 };
-use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use lancedb::arrow::arrow_schema::{DataType, Field, Schema, SchemaRef};
 use lancedb::index::scalar::FullTextSearchQuery;
 use lancedb::index::Index;
 use lancedb::query::{ExecutableQuery, QueryBase};
@@ -180,7 +185,7 @@ pub enum IndexError {
     #[error("lancedb: {0}")]
     Lance(#[from] lancedb::Error),
     #[error("arrow: {0}")]
-    Arrow(#[from] arrow_schema::ArrowError),
+    Arrow(#[from] lancedb::arrow::arrow_schema::ArrowError),
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
     #[error("json: {0}")]
@@ -320,7 +325,10 @@ impl EntityIndex {
             let mut updated_rows: usize = 0;
             for chunk in records.chunks(512) {
                 let batch = record_batch(chunk)?;
-                let reader = arrow_array::RecordBatchIterator::new(vec![Ok(batch)], schema());
+                let reader = lancedb::arrow::arrow_array::RecordBatchIterator::new(
+                    vec![Ok(batch)],
+                    schema(),
+                );
                 let mut mi = table.merge_insert(&["app", "account", "id"]);
                 mi.when_matched_update_all(None)
                     .when_not_matched_insert_all();
