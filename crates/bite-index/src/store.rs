@@ -874,6 +874,63 @@ mod tests {
     }
 
     #[test]
+    fn scoped_purge_deletes_only_scope_and_masks_fts() {
+        // pins the primitives the index_forget tool composes: scoped count →
+        // scoped delete → survivors intact → full-text no longer surfaces the
+        // purged bodies (Lance deletion vectors mask deleted rows in every
+        // query path, including FTS, before compaction even runs)
+        let dir = temp_dir("scoped-purge");
+        let idx = EntityIndex::open(&dir).unwrap();
+
+        let mut junk = record("mail", "j1", "Spam", "buy cheap widgets now", Some(false));
+        junk.container = Some("Junk".into());
+        let inbox = record(
+            "mail",
+            "m1",
+            "Real",
+            "quarterly report attached",
+            Some(true),
+        );
+        let cal = record("calendar", "c1", "Standup", "daily sync", None);
+        idx.ingest(&[junk, inbox, cal]).unwrap();
+
+        let filter = "app = 'mail' AND container = 'Junk'";
+        assert_eq!(idx.count(Some(filter)).unwrap(), 1, "preview count");
+        idx.delete_where(filter).unwrap();
+        // the compaction forget() folds in after a purge must run clean
+        idx.refresh_fts().unwrap();
+
+        assert_eq!(idx.count(Some(filter)).unwrap(), 0, "purged scope is empty");
+        assert_eq!(
+            idx.count(Some("app = 'mail'")).unwrap(),
+            1,
+            "sibling container survives"
+        );
+        assert_eq!(
+            idx.count(Some("app = 'calendar'")).unwrap(),
+            1,
+            "other app survives"
+        );
+
+        let res = idx
+            .search(&SearchQuery {
+                text: Some("widgets".into()),
+                limit: 10,
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(res.hits.is_empty(), "FTS must not surface purged bodies");
+        let res = idx
+            .search(&SearchQuery {
+                text: Some("quarterly".into()),
+                limit: 10,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(res.hits.len(), 1, "surviving rows stay searchable");
+    }
+
+    #[test]
     fn stats_newest_updated_ms_is_max_not_scan_order() {
         // regression: the limit-1 `updated_ms` query had no ORDER BY, so
         // `newest_updated_ms` echoed whichever row the scan happened to

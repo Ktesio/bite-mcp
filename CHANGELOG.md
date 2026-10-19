@@ -10,6 +10,22 @@ a tag has a matching section here before it can ship.
 
 ## [Unreleased]
 
+### Added
+
+- New `index_forget` tool for scoped purges of the local search index:
+  `index_forget {app?, container?, confirm?}` drops the LOCAL LanceDB rows
+  for one app and/or container (exact names) and immediately compacts the
+  FTS fragments so purged bodies stop answering queries — Apple data is
+  never touched. Without `confirm` it returns a `would_delete` count; an
+  unscoped call is refused (the complete reset stays on `index_wipe`, which
+  also clears the crawl watermark). Documented as a reset, not retention:
+  delta crawls do not resurrect purged rows, but any full re-crawl
+  re-imports them. Retention and purge paths are now covered in PRIVACY.md
+  and docs/protocol.md. The purge takes the store's cross-process writer
+  lock across its delete + compaction (Busy returns an explicit retryable
+  error), so a concurrent ingest in any bite process can never interleave
+  with the delete.
+
 ### Security
 
 - Helper-death retries no longer blind-replay mutating tools: when the native
