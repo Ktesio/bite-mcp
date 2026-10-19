@@ -10,6 +10,17 @@ a tag has a matching section here before it can ship.
 
 ## [Unreleased]
 
+### Changed
+
+- `with_index` no longer holds the process-wide index mutex across
+  opportunistic ingest and the post-crawl FTS refresh: the mutex now guards
+  only the lazy open (the handle is shared as an `Arc`). Previously one
+  caller's maintenance — a merge-insert plus `optimize`, which can take
+  seconds — queued every other index tool call in the process behind it.
+  Writes still serialize on the store's cross-process `.writer.lock` and
+  opportunistic ingest still deduplicates on `.ingest.lock`, so behavior is
+  unchanged for callers; only the queueing is gone.
+
 ### Security
 
 - Helper-death retries no longer blind-replay mutating tools: when the native
