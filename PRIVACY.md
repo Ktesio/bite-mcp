@@ -49,6 +49,16 @@ with your data. bite itself adds no network hop; choose agents you trust.
 - Destructive operations (deleting events/reminders/mail/notes/contacts,
   moving mail) always return a preview first and require an explicit
   `confirm: true`.
+- **The local index, and how to purge it.** The LanceDB entity index lives
+  in the same 0700 data dir and holds full-text copies of indexed Calendar,
+  Reminders, Mail, Notes, Contacts and Messages data for fast local search.
+  `index_forget` (MCP, scoped to one app and/or container — mailbox,
+  calendar, list, folder or chat) drops those rows after a
+  `would_delete` preview; `bite index wipe` (CLI) removes the entire index
+  plus the crawl watermark. Both act on the LOCAL copy only and neither is
+  a retention guarantee: any full re-crawl re-imports whatever still exists
+  in your Apple apps. To keep specific data out of the index, remove it in
+  the source app, then purge the index scope (a wipe gives a clean slate).
 
 ## Intended use
 

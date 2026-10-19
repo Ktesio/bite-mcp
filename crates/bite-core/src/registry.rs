@@ -487,6 +487,13 @@ pub static TOOLS: &[Tool] = &[
             ParamSpec::opt("app", ParamKind::Str, "scope to one app (mail/calendar/reminders/contacts/notes/messages)"),
             ParamSpec::opt("limit", ParamKind::Int, "max results (default 20, capped at 200)"),
         ]),
+    td("index_forget", App::Index, "index.forget",
+        "Drop rows from the LOCAL search index — Apple data is never touched. Scope with app and/or container (exact names; see search results' fields). First call without confirm returns a would_delete preview. This is a reset, not retention: a full re-crawl re-imports the same rows from Apple. For a complete wipe (index + delta watermark) use index_wipe from the CLI.",
+        ps![
+            ParamSpec::opt("app", ParamKind::Str, "scope to one app (mail/calendar/reminders/contacts/notes/messages)"),
+            ParamSpec::opt("container", ParamKind::Str, "scope to one container (mailbox/calendar/list/folder/chat name, exact match)"),
+            ParamSpec::opt("confirm", ParamKind::Bool, "true to perform the deletion"),
+        ]),
 
     // ─── Messages ───────────────────────────────────────────────────────────
     tn("messages_send", App::Messages, "messages.send",
