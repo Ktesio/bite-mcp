@@ -1096,6 +1096,22 @@ pub fn forget(params: &Value) -> Result<Value, BiteError> {
         }
         // Count first: delete_where reports nothing, and the caller deserves
         // to know how many rows actually left.
+        //
+        // Writer lock around delete + compaction: this is a WRITE, and the
+        // process-wide INDEX mutex is not a write lock (once the lock-scope
+        // change lands it only guards the lazy open). wipe/ingest serialize
+        // on the store's cross-process `.writer.lock` — a purge must too, or
+        // a concurrent auto-ingest (this or another process) can interleave
+        // merge-inserts with the delete. Busy is an explicit error, not a
+        // silent skip: user-initiated destructive call, deserves a retry.
+        let _writer = index.lock_writer().map_err(|e| {
+            BridgeError::new(
+                "index_lock_error",
+                format!(
+                    "index is being written by another bite process — retry index_forget shortly ({e})"
+                ),
+            )
+        })?;
         let n = index
             .count(Some(&filter))
             .map_err(|e| BridgeError::new("index_error", e.to_string()))?;

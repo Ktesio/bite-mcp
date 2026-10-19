@@ -21,7 +21,10 @@ a tag has a matching section here before it can ship.
   also clears the crawl watermark). Documented as a reset, not retention:
   delta crawls do not resurrect purged rows, but any full re-crawl
   re-imports them. Retention and purge paths are now covered in PRIVACY.md
-  and docs/protocol.md.
+  and docs/protocol.md. The purge takes the store's cross-process writer
+  lock across its delete + compaction (Busy returns an explicit retryable
+  error), so a concurrent ingest in any bite process can never interleave
+  with the delete.
 
 ### Security
 
