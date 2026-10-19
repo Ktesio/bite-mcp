@@ -8,9 +8,9 @@ license.workspace = true
 [dependencies]
 # `remote` required: upstream 0.39.0 references the remote-gated Error::Http
 # unconditionally in job.rs, so default-feature builds fail to compile
-lancedb = { version = "0.39", features = ["remote"] }
-arrow-array = "58"
-arrow-schema = "58"
+lancedb = { version = "0.40", features = ["remote"] }
+arrow-array = "60"
+arrow-schema = "60"
 tokio = { version = "1", features = ["rt-multi-thread"] }
 futures = "0.3"
 serde = { version = "1", features = ["derive"] }
