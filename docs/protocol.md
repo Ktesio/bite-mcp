@@ -207,9 +207,10 @@ watermark along with the index (a wiped index always re-runs the full
 schedule); `index_rebuild` with `full: true` (CLI `bite index rebuild
 --full`, worker `--full`) forces the full replay explicitly.
 `window_days` is accepted (tool param and `--window-days`) and pins the
-lead window width of a full plan; store-body-off (`--no-body`) is currently
-reachable only via the undeclared `no_body` MCP param on `index_rebuild` —
-the CLI has no flag.
+lead window width of a full plan; `no_body` (tool param, CLI
+`bite index rebuild --no-body`, worker `--no-body`) rebuilds with mail
+metadata only — message bodies are never stored, the data-minimization
+counterpart to `index_forget`'s scoped purge.
 
 ### Scoped purge
 
