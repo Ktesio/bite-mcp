@@ -171,7 +171,7 @@ before this enrichment carry the sender only until a full reindex).
 Ingest deletes batches on success
 (merge-insert makes re-ingest idempotent). Staged batches are ingested
 automatically: index touches that read the index (`index_status`,
-`search`, `index_wipe`) opportunistically ingest pending batches first —
+`search`, `index_wipe`, `index_forget`) opportunistically ingest pending batches first —
 throttled to once per 30 s per process (the throttle is checked before any
 staging-dir scan), serialized across processes by an exclusive
 `.ingest.lock` PLUS the store's writer lock — the same writer lock the
@@ -210,6 +210,21 @@ schedule); `index_rebuild` with `full: true` (CLI `bite index rebuild
 lead window width of a full plan; store-body-off (`--no-body`) is currently
 reachable only via the undeclared `no_body` MCP param on `index_rebuild` —
 the CLI has no flag.
+
+### Scoped purge
+
+`index.forget` (MCP `index_forget {app?, container?, confirm?}`) drops rows
+from the LOCAL index only — Apple data is never touched — scoped by exact
+`app` and/or `container` names. Without `confirm` it returns a
+`would_delete` count; with `confirm` it deletes the scope, then compacts
+the FTS index so purged bodies stop answering queries (dead fragments would
+otherwise hold plaintext until the next optimize). It is a reset, not
+retention: the delta watermark survives a scoped forget, so a delta crawl
+does not resurrect the purged rows — but any full crawl (`index_rebuild`
+with `full: true`, the full schedule a stale/failed predecessor triggers,
+or `index_wipe` + rebuild) re-imports them from Apple. An unscoped call is
+refused: the complete reset stays on `index_wipe`, which also clears the
+watermark and staging dir.
 
 Unparseable batches are quarantined to `batches/quarantine/` — ingest
 continues; the quarantine keeps at most 200 files (evicted oldest-by-mtime).

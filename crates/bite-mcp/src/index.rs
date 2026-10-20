@@ -845,6 +845,7 @@ pub const LOCAL_TOOLS: &[&str] = &[
     "index_status",
     "index_crawl_cancel",
     "index_wipe",
+    "index_forget",
     "search",
     "mail_bulk_mark",
     "mail_bulk_move",
@@ -1050,6 +1051,105 @@ pub fn wipe(confirm: bool) -> Result<Value, BiteError> {
     })
 }
 
+/// SQL filter for the scoped purge. Reuses the store's single-quote escape so
+/// a container like `O'Brien` can never break out of the literal.
+fn forget_filter(app: Option<&str>, container: Option<&str>) -> String {
+    let mut parts = Vec::new();
+    if let Some(a) = app {
+        parts.push(format!("app = {}", bite_index::store::sql_str(a)));
+    }
+    if let Some(c) = container {
+        parts.push(format!("container = {}", bite_index::store::sql_str(c)));
+    }
+    parts.join(" AND ")
+}
+
+/// Scoped purge of index rows (app and/or container) — the LOCAL copy only;
+/// Apple data is never touched. Full reset stays on `index_wipe` (which also
+/// clears the delta watermark): an unscoped forget is refused so a bare
+/// `confirm:true` can't nuke the index without the wipe-shaped response.
+///
+/// Reset semantics, not retention: the delta watermark survives a scoped
+/// forget, so a delta crawl does NOT resurrect purged rows — but any full
+/// crawl (`index_rebuild full:true`, `index_wipe` + rebuild, or the 365-day
+/// backfill schedule) re-imports them from Apple. Documented as such in the
+/// tool description and PRIVACY.md.
+pub fn forget(params: &Value) -> Result<Value, BiteError> {
+    // Empty strings count as absent: a JSON `"app": ""` must be refused like
+    // a missing one, not become a filter matching nothing-but-still-scanned.
+    let app = params
+        .get("app")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned);
+    let container = params
+        .get("container")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned);
+    let confirm = params
+        .get("confirm")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    if app.is_none() && container.is_none() {
+        return Ok(json!({
+            "error": "index_forget requires a scope: pass app and/or container (exact names). For a complete reset use index_wipe (CLI: bite index wipe), which also clears the crawl watermark.",
+        }));
+    }
+    let filter = forget_filter(app.as_deref(), container.as_deref());
+    with_index(|index| {
+        let scope = json!({ "app": app, "container": container });
+        if !confirm {
+            let n = index
+                .count(Some(&filter))
+                .map_err(|e| BridgeError::new("index_error", e.to_string()))?;
+            return Ok(json!({
+                "would_delete": n,
+                "scope": scope,
+                "filter": filter,
+                "confirm_required": true,
+            }));
+        }
+        // Count first: delete_where reports nothing, and the caller deserves
+        // to know how many rows actually left.
+        //
+        // Writer lock around delete + compaction: this is a WRITE, and the
+        // process-wide INDEX mutex is not a write lock (once the lock-scope
+        // change lands it only guards the lazy open). wipe/ingest serialize
+        // on the store's cross-process `.writer.lock` — a purge must too, or
+        // a concurrent auto-ingest (this or another process) can interleave
+        // merge-inserts with the delete. Busy is an explicit error, not a
+        // silent skip: user-initiated destructive call, deserves a retry.
+        let _writer = index.lock_writer().map_err(|e| {
+            BridgeError::new(
+                "index_lock_error",
+                format!(
+                    "index is being written by another bite process — retry index_forget shortly ({e})"
+                ),
+            )
+        })?;
+        let n = index
+            .count(Some(&filter))
+            .map_err(|e| BridgeError::new("index_error", e.to_string()))?;
+        index
+            .delete_where(&filter)
+            .map_err(|e| BridgeError::new("index_error", e.to_string()))?;
+        // Deleted rows leave dead FTS fragments that still hold plaintext
+        // until compaction — fold them away immediately instead of waiting
+        // for the next crawl-settled optimize.
+        index
+            .refresh_fts()
+            .map_err(|e| BridgeError::new("index_error", e.to_string()))?;
+        Ok(json!({
+            "deleted": n,
+            "scope": scope,
+            "note": "local index only — Apple data untouched; a full re-crawl re-imports these rows (reset, not retention)",
+        }))
+    })
+}
+
 /// Execute a local index tool. Returns None when `name` is not local.
 pub fn run_local(
     name: &str,
@@ -1083,6 +1183,7 @@ pub fn run_local(
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false),
         )),
+        "index_forget" => Some(forget(params)),
         "search" => Some(unified_search(params)),
         "mail_bulk_mark" | "mail_bulk_move" | "mail_bulk_delete" => Some(bulk_spawn(name, params)),
         _ => None,
@@ -1317,6 +1418,37 @@ mod tests {
                 && with.contains("refresh_fts_after_settled_crawl(&index)"),
             "with_index must fetch the shared handle and run the post-settle refresh"
         );
+    }
+
+    #[test]
+    fn forget_filter_scopes_and_escapes() {
+        assert_eq!(forget_filter(Some("mail"), None), "app = 'mail'");
+        assert_eq!(forget_filter(None, Some("INBOX")), "container = 'INBOX'");
+        // both scopes AND together
+        assert_eq!(
+            forget_filter(Some("mail"), Some("INBOX")),
+            "app = 'mail' AND container = 'INBOX'"
+        );
+        // single quotes in names must never break out of the SQL literal
+        assert_eq!(
+            forget_filter(None, Some("O'Brien's")),
+            "container = 'O''Brien''s'"
+        );
+    }
+
+    #[test]
+    fn forget_without_scope_is_refused_before_touching_the_index() {
+        // no app and no container → refusal (and it must NOT open the index:
+        // the call returns before with_index, so this runs on any machine)
+        let out = forget(&json!({ "confirm": true })).unwrap();
+        assert!(out.get("error").is_some(), "unscoped forget must refuse");
+        assert!(
+            out["error"].as_str().unwrap().contains("index_wipe"),
+            "refusal must point at the full-reset path"
+        );
+        // a scope of empty strings is as good as no scope — refuse too
+        let out = forget(&json!({ "app": "", "container": "" })).unwrap();
+        assert!(out.get("error").is_some());
     }
 
     #[test]

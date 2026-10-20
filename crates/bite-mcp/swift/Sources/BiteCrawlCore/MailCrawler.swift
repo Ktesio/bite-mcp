@@ -211,9 +211,12 @@ public enum MailCrawler {
     }
 
     /// Methods the index layer implements (conformance-checked by CI).
+    /// Served by the Rust control plane unless noted: crawl/bulk_* run in the
+    /// detached bite-crawl process; crawl_status/search/forget are local.
     public static let supportedIndexMethods = [
         "index.crawl", "index.crawl_cancel", "index.crawl_status",
         "index.bulk_mark", "index.bulk_move", "index.bulk_delete", "index.search",
+        "index.forget",
     ]
 
     static func isTerminalState(_ state: String) -> Bool {
