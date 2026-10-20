@@ -179,6 +179,18 @@ pub enum IndexCmd {
     Status,
     /// Cancel a running crawl
     Cancel,
+    /// Purge indexed rows scoped by --app and/or --container (local index
+    /// only; Apple data is never touched). Without --yes prints a
+    /// would_delete preview. The delta watermark survives, so a delta
+    /// crawl does not resurrect purged rows — a full crawl re-imports them.
+    Forget {
+        #[arg(long)]
+        app: Option<String>,
+        #[arg(long)]
+        container: Option<String>,
+        #[arg(long)]
+        yes: bool,
+    },
     /// Destroy the entity index (requires --yes)
     Wipe {
         #[arg(long)]
