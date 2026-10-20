@@ -3,7 +3,7 @@
 //! index-backed fast path for Mail search.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
 use bite_bridge::BridgeError;
@@ -13,7 +13,7 @@ use serde_json::{json, Value};
 
 use crate::helper::BridgeHandle;
 
-static INDEX: Mutex<Option<bite_index::EntityIndex>> = Mutex::new(None);
+static INDEX: Mutex<Option<Arc<bite_index::EntityIndex>>> = Mutex::new(None);
 /// Epoch-ms of the last crawl spawn attempt (auto-refresh or explicit).
 static LAST_SPAWN_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// Epoch-ms of the last opportunistic auto-ingest attempt.
@@ -104,12 +104,10 @@ pub(crate) fn staged_batch_count_in(dir: &std::path::Path) -> usize {
         .unwrap_or(0)
 }
 
-/// Open (or reuse) the entity index and run `f`. Opportunistically ingests
-/// staged batches first (throttled + cross-process locked — see
-/// `ingest_pending_if_due`), so queries and status see fresh data.
-pub fn with_index<T>(
-    f: impl FnOnce(&bite_index::EntityIndex) -> Result<T, BiteError>,
-) -> Result<T, BiteError> {
+/// Open-once cell for the process-wide index handle. The mutex guards ONLY
+/// lazy initialization — one thread opens the store, everyone else clones
+/// the `Arc`. It is deliberately never held across queries or maintenance.
+fn shared_index() -> Result<Arc<bite_index::EntityIndex>, BiteError> {
     let mut guard = INDEX.lock().unwrap();
     if guard.is_none() {
         let index = bite_index::EntityIndex::open(&dir()).map_err(|e| {
@@ -118,23 +116,43 @@ pub fn with_index<T>(
                 format!("cannot open entity index: {e}"),
             )
         })?;
-        *guard = Some(index);
+        *guard = Some(Arc::new(index));
     }
-    let index = guard.as_ref().unwrap();
+    Ok(Arc::clone(guard.as_ref().unwrap()))
+}
+
+/// Open (or reuse) the entity index and run `f`. Opportunistically ingests
+/// staged batches first (throttled + cross-process locked — see
+/// `ingest_pending_if_due`), so queries and status see fresh data.
+///
+/// The global `INDEX` mutex is released BEFORE ingest/query/FTS-refresh run:
+/// maintenance here can take seconds (a merge-insert plus `optimize`), and
+/// holding the process-wide lock across it made EVERY other index tool call
+/// queue behind one caller's maintenance. Correctness without the big lock:
+/// writes serialize on the store's cross-process `.writer.lock` (see
+/// `ingest_pending_if_due` and `EntityIndex::lock_writer`), opportunistic
+/// ingest deduplicates itself on the `.ingest.lock` file lock, and `f` only
+/// ever reads — concurrent LanceDB readers each pin the dataset version they
+/// open, the same way reads already coexist with the detached crawler's
+/// writes in another process.
+pub fn with_index<T>(
+    f: impl FnOnce(&bite_index::EntityIndex) -> Result<T, BiteError>,
+) -> Result<T, BiteError> {
+    let index = shared_index()?;
     // Ordering: ingest BEFORE f, so queries see fresh data. Never fails the
     // outer call. The detached bite-crawl worker stages batches via atomic
     // rename, so this snapshot of the staging dir is always well-formed;
     // batches that appear mid-ingest are picked up on a later call.
     if !IN_INGEST_PENDING.load(Ordering::SeqCst) {
-        ingest_pending_if_due(index);
+        ingest_pending_if_due(&index);
     }
-    let out = f(index);
+    let out = f(&index);
     // Post-settle FTS refresh LAST: batches that landed after the final
     // mid-crawl ingest must be folded in only after they were ingested
     // (fold-then-ingest would mark a crawl state whose newest rows stay
     // unindexed until the next crawl). No-op within milliseconds when the
     // marker already matches — unindexed rows stay searchable meanwhile.
-    refresh_fts_after_settled_crawl(index);
+    refresh_fts_after_settled_crawl(&index);
     out
 }
 
@@ -1335,6 +1353,72 @@ fn bulk_spawn(name: &str, params: &Value) -> Result<Value, BiteError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn global_index_mutex_guards_only_the_open() {
+        // Tripwire pinning the concurrency shape of `with_index`: the
+        // process-wide INDEX mutex must be taken in EXACTLY ONE place
+        // (`shared_index`, which only opens-or-clones and returns), so the
+        // opportunistic ingest + FTS refresh + the caller's query all run
+        // OUTSIDE the global lock. Reintroducing a `.lock()` into
+        // `with_index` itself (or any other fn) compiles and passes every
+        // behavioral test while silently re-serializing every index tool
+        // call behind one caller's maintenance — it must fail here.
+        let src = include_str!("index.rs");
+        // count only PRODUCTION code: this test's own literals would
+        // otherwise match (include_str! embeds the test module too)
+        let prod = &src[..src.find("\n#[cfg(test)]").expect("test module marker")];
+        let lock_sites: Vec<usize> = prod.match_indices("INDEX.lock()").map(|(i, _)| i).collect();
+        assert_eq!(
+            lock_sites.len(),
+            1,
+            "the global INDEX mutex must have exactly one lock site (shared_index)"
+        );
+
+        let body = |marker: &str, known_line: &str| {
+            let start = prod
+                .find(marker)
+                .unwrap_or_else(|| panic!("tripwire anchor lost: {marker}"));
+            let rest = &prod[start..];
+            let end = [
+                rest.find("\nfn "),
+                rest.find("\npub fn "),
+                rest.find("\n///"),
+                rest.find("\n#[cfg(test)]"),
+            ]
+            .into_iter()
+            .flatten()
+            .min()
+            .unwrap_or(rest.len());
+            let slice = &rest[..end];
+            assert!(
+                !slice.trim().is_empty() && slice.contains(known_line),
+                "tripwire slice for {marker} is empty or off-target"
+            );
+            slice
+        };
+
+        // the single lock site lives inside shared_index, which does no
+        // maintenance of its own
+        let shared = body("fn shared_index(", "Arc::clone(guard.as_ref().unwrap())");
+        assert!(
+            !shared.contains("ingest") && !shared.contains("refresh_fts"),
+            "shared_index must only open-or-clone — no maintenance under the lock"
+        );
+
+        // and with_index runs the maintenance + query WITHOUT touching the
+        // global mutex (it goes through shared_index instead)
+        let with = body("pub fn with_index<", "ingest_pending_if_due(&index)");
+        assert!(
+            !with.contains("INDEX.lock()"),
+            "with_index must not hold the global INDEX mutex"
+        );
+        assert!(
+            with.contains("shared_index()?")
+                && with.contains("refresh_fts_after_settled_crawl(&index)"),
+            "with_index must fetch the shared handle and run the post-settle refresh"
+        );
+    }
 
     #[test]
     fn forget_filter_scopes_and_escapes() {
