@@ -10,6 +10,17 @@ a tag has a matching section here before it can ship.
 
 ## [Unreleased]
 
+### Security
+
+- The crawl liveness probe (`pid_alive`) and the crawl-cancel signal now
+  resolve `kill` from absolute locations (`/bin/kill`, `/usr/bin/kill` —
+  first that executes) instead of PATH, closing the same plantable-binary
+  gap the `ps` probes were already hardened from; these were the last
+  bare-name spawns in production code. When no kill binary can be executed
+  at all the liveness probe now fails safe (crawler assumed alive) instead
+  of treating it as dead — the old mapping deleted a live crawler's
+  pidfile and double-spawned a second crawl against Mail.
+
 ### Added
 
 - New `index_forget` tool for scoped purges of the local search index:

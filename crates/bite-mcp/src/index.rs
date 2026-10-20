@@ -475,15 +475,45 @@ fn crawl_binary() -> Result<std::path::PathBuf, BiteError> {
     )))
 }
 
+/// Absolute `kill` candidates, in preference order. The liveness probe and
+/// the crawl-cancel signal must never resolve `kill` through PATH: a
+/// plantable `kill` earlier on PATH would be executed instead — the same
+/// gap the `ps` probes were hardened from (see `crawl_process_matches`).
+const KILL_CANDIDATES: [&str; 2] = ["/bin/kill", "/usr/bin/kill"];
+
+/// Run `kill` from the first candidate that actually executes.
+/// Testable core of the probe/cancel paths — pass explicit candidates.
+/// Returns `Some(status)` when a kill binary ran, `None` when no candidate
+/// could be exec'd at all (callers must treat that as UNKNOWN, never as
+/// success or failure).
+fn run_kill_from(candidates: &[&str], args: &[&str]) -> Option<std::process::ExitStatus> {
+    for kill in candidates {
+        match std::process::Command::new(kill)
+            .args(args)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+        {
+            Ok(st) => return Some(st),
+            Err(_) => continue, // try the next kill location
+        }
+    }
+    None
+}
+
+fn run_kill(args: &[&str]) -> Option<std::process::ExitStatus> {
+    run_kill_from(&KILL_CANDIDATES, args)
+}
+
 fn pid_alive(pid: i32) -> bool {
-    // signal 0 = liveness probe
-    std::process::Command::new("kill")
-        .args(["-0", &pid.to_string()])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
+    // signal 0 = liveness probe, from an absolute path (never PATH).
+    // If NO kill binary could be executed at all, fail SAFE and report
+    // alive: mapping "no probe ran" onto "dead" would make
+    // `live_crawler_pid()` delete a live crawler's pidfile and double-spawn
+    // a second crawl against Mail (mirrors the ps probes' fail-safe).
+    run_kill(&["-0", &pid.to_string()])
         .map(|s| s.success())
-        .unwrap_or(false)
+        .unwrap_or(true)
 }
 
 pub fn mail_rows_present() -> Option<usize> {
@@ -976,9 +1006,11 @@ fn cancel(handle: Option<&mut BridgeHandle>) -> Result<Value, BiteError> {
     }
     match live_crawler_pid() {
         Some(pid) => {
-            let ok = std::process::Command::new("kill")
-                .args([&pid.to_string()])
-                .status()
+            // absolute-path kill (plantable-binary hardening). None (no
+            // binary ran) maps to NOT ok: cancel then reports
+            // `cancelled: false` and never touches the pidfile — the safe
+            // outcome when the signal could not provably be delivered.
+            let ok = run_kill(&[&pid.to_string()])
                 .map(|s| s.success())
                 .unwrap_or(false);
             if ok {
@@ -1365,6 +1397,44 @@ mod tests {
         // a scope of empty strings is as good as no scope — refuse too
         let out = forget(&json!({ "app": "", "container": "" })).unwrap();
         assert!(out.get("error").is_some());
+    }
+
+    #[test]
+    fn kill_resolves_from_absolute_paths_only() {
+        // Tripwire mirroring the ps hardening: production code must never
+        // spawn `kill` by bare name — a plantable PATH binary would then own
+        // the crawl liveness probe and the cancel signal.
+        let src = include_str!("index.rs");
+        let prod = &src[..src.find("\n#[cfg(test)]").expect("test module marker")];
+        assert!(
+            !prod.contains("Command::new(\"kill\")"),
+            "kill must run from the absolute KILL_CANDIDATES (run_kill), never via PATH"
+        );
+    }
+
+    #[test]
+    fn run_kill_reports_when_no_binary_ran() {
+        // unrunnable candidates → None: the UNKNOWN verdict callers must
+        // fail safe on, never read as success or failure
+        assert!(run_kill_from(
+            &["/nonexistent/kill/a", "/nonexistent/kill/b"],
+            &["-0", "1"]
+        )
+        .is_none());
+        // the real candidates: at least one must exec and report a status
+        // (signal 0 to pid 1 may pass or fail on permission — what matters
+        // is that a binary RAN)
+        assert!(
+            run_kill_from(&KILL_CANDIDATES, &["-0", "1"]).is_some(),
+            "no absolute kill candidate executed on this host"
+        );
+    }
+
+    #[test]
+    fn pid_alive_probes_own_process_alive() {
+        // behavioral anchor for the probe: our own pid is provably alive,
+        // so the absolute-path probe must agree
+        assert!(pid_alive(std::process::id() as i32));
     }
 
     #[test]
