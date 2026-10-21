@@ -473,6 +473,7 @@ pub static TOOLS: &[Tool] = &[
             ParamSpec::opt("window_days", ParamKind::Int, "initial window in days (default 30; backfill continues in 10-day batches)"),
             ParamSpec::opt("mailbox", ParamKind::Str, "restrict crawl to one mailbox name"),
             ParamSpec::opt("full", ParamKind::Bool, "skip the delta fast path and replay the full 365-day schedule"),
+            ParamSpec::opt("no_body", ParamKind::Bool, "store mail metadata only — skip message bodies (data minimization)"),
         ]),
     t("index_status", App::Index, "index.crawl_status",
         "Entity index state: rows per app, freshness, FTS index, pending crawl batches.",
