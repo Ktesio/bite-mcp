@@ -36,6 +36,12 @@ a tag has a matching section here before it can ship.
   lock across its delete + compaction (Busy returns an explicit retryable
   error), so a concurrent ingest in any bite process can never interleave
   with the delete.
+- The CLI grows `bite index forget --app <name> [--container <name>]`, the
+  CLI surface for the scoped purge above (preview without `--yes`, delete
+  with it — the same confirm gate as the MCP tool). Previously the purge
+  was reachable only over MCP while `index_wipe` already had
+  `bite index wipe`; scripted/terminal retention hygiene now matches the
+  documented toolset. docs/protocol.md notes the CLI form.
 - `index_rebuild` now declares its `no_body` param in the tool registry and
   the CLI grows `bite index rebuild --no-body`. Body-off indexing (mail
   metadata only, message bodies never stored — the data-minimization

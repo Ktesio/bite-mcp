@@ -214,7 +214,9 @@ counterpart to `index_forget`'s scoped purge.
 
 ### Scoped purge
 
-`index.forget` (MCP `index_forget {app?, container?, confirm?}`) drops rows
+`index.forget` (MCP `index_forget {app?, container?, confirm?}`; CLI
+`bite index forget --app <name> [--container <name>]` — add `--yes` to
+delete, omit it for the preview) drops rows
 from the LOCAL index only — Apple data is never touched — scoped by exact
 `app` and/or `container` names. Without `confirm` it returns a
 `would_delete` count; with `confirm` it deletes the scope, then compacts

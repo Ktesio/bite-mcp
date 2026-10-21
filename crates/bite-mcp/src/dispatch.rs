@@ -627,6 +627,21 @@ fn dispatch(cli: crate::cli::Cli) -> Result<i32, BiteError> {
                     &json!({}),
                     Some(&mut h),
                 )?),
+                IndexCmd::Forget {
+                    app,
+                    container,
+                    yes,
+                } => {
+                    let mut p = Map::new();
+                    insert_opt(&mut p, "app", app);
+                    insert_opt(&mut p, "container", container);
+                    p.insert("confirm".into(), json!(yes));
+                    finish(crate::index::run_local_unwrapped(
+                        "index_forget",
+                        &Value::Object(p),
+                        Some(&mut h),
+                    )?)
+                }
                 IndexCmd::Wipe { yes } => finish(crate::index::wipe(yes)?),
             }
         }
