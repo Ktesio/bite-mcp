@@ -173,7 +173,7 @@ fn collect(fix: bool, probe: bool) -> Result<DoctorReport, bite_core::BiteError>
     let toolchain = probe_toolchain();
 
     // ── Helper ──
-    let mut handle = BridgeHandle::new();
+    let handle = BridgeHandle::new();
     let helper = match handle.get() {
         Ok(bridge) => {
             let caps = bridge.capabilities();

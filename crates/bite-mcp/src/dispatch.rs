@@ -52,7 +52,7 @@ fn dispatch(cli: crate::cli::Cli) -> Result<i32, BiteError> {
         }
 
         Cmd::Helper { cmd } => {
-            let mut h = BridgeHandle::new();
+            let h = BridgeHandle::new();
             match cmd {
                 crate::cli::HelperCmd::Ping => {
                     let r = h.get()?.call("sys.ping", &json!({})).map_err(BiteError)?;
@@ -524,7 +524,7 @@ fn dispatch(cli: crate::cli::Cli) -> Result<i32, BiteError> {
             )?)
         }
         Cmd::MailBulk { cmd } => {
-            let mut h = BridgeHandle::new();
+            let h = BridgeHandle::new();
             let (tool, p) = match cmd {
                 MailBulkCmd::Mark {
                     mailbox,
@@ -589,12 +589,12 @@ fn dispatch(cli: crate::cli::Cli) -> Result<i32, BiteError> {
             finish(crate::index::run_local_unwrapped(
                 tool,
                 &Value::Object(p),
-                Some(&mut h),
+                Some(&h),
             )?)
         }
 
         Cmd::Index { cmd } => {
-            let mut h = crate::helper::BridgeHandle::new();
+            let h = crate::helper::BridgeHandle::new();
             match cmd {
                 crate::cli::IndexCmd::Rebuild {
                     window_days,
@@ -614,18 +614,18 @@ fn dispatch(cli: crate::cli::Cli) -> Result<i32, BiteError> {
                     finish(crate::index::run_local_unwrapped(
                         "index_rebuild",
                         &Value::Object(p),
-                        Some(&mut h),
+                        Some(&h),
                     )?)
                 }
                 IndexCmd::Status => finish(crate::index::run_local_unwrapped(
                     "index_status",
                     &json!({}),
-                    Some(&mut h),
+                    Some(&h),
                 )?),
                 IndexCmd::Cancel => finish(crate::index::run_local_unwrapped(
                     "index_crawl_cancel",
                     &json!({}),
-                    Some(&mut h),
+                    Some(&h),
                 )?),
                 IndexCmd::Forget {
                     app,
@@ -639,7 +639,7 @@ fn dispatch(cli: crate::cli::Cli) -> Result<i32, BiteError> {
                     finish(crate::index::run_local_unwrapped(
                         "index_forget",
                         &Value::Object(p),
-                        Some(&mut h),
+                        Some(&h),
                     )?)
                 }
                 IndexCmd::Wipe { yes } => finish(crate::index::wipe(yes)?),
@@ -678,7 +678,8 @@ fn call(handle: &mut BridgeHandle, tool: &str, params: Value) -> Result<Value, B
             return Ok(deferred);
         }
     }
-    match ops::run(handle.get()?, tool, params.clone()) {
+    let bridge = handle.get()?;
+    match ops::run(&bridge, tool, params.clone()) {
         Ok(v) => Ok(v),
         Err(mut e) if matches!(e.code.as_str(), "helper_exited" | "helper_exited_unsent") => {
             // Respawn either way; replay only read-only/idempotent tools —
@@ -688,7 +689,8 @@ fn call(handle: &mut BridgeHandle, tool: &str, params: Value) -> Result<Value, B
             // rationale).
             handle.reset();
             if e.code == "helper_exited_unsent" || bite_core::registry::replay_safe(tool) {
-                ops::run(handle.get()?, tool, params).map_err(BiteError)
+                let fresh = handle.get()?;
+                ops::run(&fresh, tool, params).map_err(BiteError)
             } else {
                 e.message.push_str(
                     "; the helper was respawned but the call was not replayed — \

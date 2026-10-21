@@ -80,11 +80,17 @@ fn main() {
     }
 
     let stdin = std::io::stdin();
-    for line in stdin.lock().lines() {
-        let Ok(line) = line else { exit(0) };
-        let Ok(v) = serde_json::from_str::<Value>(&line) else {
-            continue;
-        };
+    // Optional concurrent dispatch: each request line is answered on its own
+    // thread (responses printed under a stdout lock), modelling a helper that
+    // processes calls concurrently — the shape the multiplexing client
+    // expects when several requests are in flight over one transport.
+    let handler_threads = scenario
+        .get("handler_threads")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as usize;
+    let responses = std::sync::Arc::new(std::sync::Mutex::new(responses));
+    let answer = std::sync::Arc::new(move |line: &str| -> Option<Value> {
+        let v: Value = serde_json::from_str(line).ok()?;
         let id = v.get("id").cloned().unwrap_or(Value::Null);
         let method = v
             .get("method")
@@ -94,6 +100,7 @@ fn main() {
         if sleep_ms > 0 {
             std::thread::sleep(std::time::Duration::from_millis(sleep_ms));
         }
+        let mut responses = responses.lock().unwrap();
         let out = match responses.get_mut(&method) {
             Some(queue) if !queue.is_empty() => {
                 let item = if queue.len() == 1 {
@@ -120,7 +127,29 @@ fn main() {
                 serde_json::json!({ "id": id, "error": { "code": "unknown_method", "message": format!("no scripted response for {method}") } })
             }
         };
-        println!("{out}");
-        let _ = std::io::stdout().flush();
+        Some(out)
+    });
+    for line in stdin.lock().lines() {
+        let Ok(line) = line else { exit(0) };
+        if handler_threads == 0 {
+            if let Some(out) = answer(&line) {
+                println!("{out}");
+                let _ = std::io::stdout().flush();
+            }
+        } else {
+            let answer = std::sync::Arc::clone(&answer);
+            std::thread::spawn(move || {
+                if let Some(out) = answer(&line) {
+                    // serialize writes; flush under the same lock so a
+                    // response line is never interleaved
+                    let _guard = PRINT_LOCK.lock().unwrap();
+                    println!("{out}");
+                    let _ = std::io::stdout().flush();
+                }
+            });
+        }
     }
 }
+
+/// Serializes response printing across handler threads.
+static PRINT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());

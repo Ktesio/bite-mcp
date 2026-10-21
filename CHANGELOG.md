@@ -10,6 +10,20 @@ a tag has a matching section here before it can ship.
 
 ## [Unreleased]
 
+### Changed
+
+- The MCP server now dispatches each request on its own thread: a slow
+  helper round-trip (Apple Events can take the full per-call timeout) no
+  longer stalls unrelated traffic — pings, tools/list and other pipelined
+  requests are answered while a tool call is still in flight (JSON-RPC
+  responses correlate by id). The process-wide bridge handle became
+  interior-mutable for this: request threads hold `Arc` clones and the lock
+  is touched only for the (rare) spawn or clone, never across a
+  round-trip. Helper recycling after a crash/timeout is generation-safe
+  (`reset_if_same`): only the failed bridge generation is killed, so a
+  helper a sibling thread already respawned survives, and in-flight calls
+  on a killed generation surface as the ambiguous `helper_exited`.
+
 ### Security
 
 - The crawl liveness probe (`pid_alive`) and the crawl-cancel signal now

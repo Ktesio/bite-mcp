@@ -179,6 +179,18 @@ impl Bridge {
         }
     }
 
+    /// Kill the helper process now, without waiting for this `Bridge` to be
+    /// dropped. Recycling a failed/wedged generation must take effect even
+    /// while sibling callers still hold clones: their in-flight requests
+    /// were already written, so the closed pipes surface them as the
+    /// ambiguous `helper_exited`, never the unsent variant.
+    pub fn kill_child(&self) {
+        if let Some(mut child) = self.child.lock().unwrap().take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+
     /// Send one request and block for the correlated response.
     pub fn call(&self, method: &str, params: &Value) -> Result<Value, BridgeError> {
         self.call_timeout(method, params, DEFAULT_TIMEOUT)

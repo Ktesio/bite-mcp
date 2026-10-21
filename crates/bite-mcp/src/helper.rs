@@ -2,6 +2,7 @@
 
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::{Arc, Mutex};
 
 use bite_bridge::{Bridge, BridgeError};
 
@@ -362,35 +363,67 @@ fn adhoc_sign(path: &PathBuf) {
     }
 }
 
-/// Process-wide bridge (spawned lazily, reused).
+/// Process-wide bridge (spawned lazily, reused). Interior-mutable: request
+/// threads fetch `Arc<Bridge>` clones and the lock is held only for the
+/// (rare) spawn or the clone — never across a helper round-trip, so a slow
+/// or wedged Apple Events call cannot stall unrelated requests.
 pub struct BridgeHandle {
-    bridge: Option<Bridge>,
+    bridge: Mutex<Option<Arc<Bridge>>>,
 }
 
 impl BridgeHandle {
     pub fn new() -> Self {
-        Self { bridge: None }
+        Self {
+            bridge: Mutex::new(None),
+        }
     }
 
-    pub fn get(&mut self) -> Result<&Bridge, BridgeError> {
-        if self.bridge.is_none() {
+    pub fn get(&self) -> Result<Arc<Bridge>, BridgeError> {
+        let mut guard = self.bridge.lock().unwrap();
+        if guard.is_none() {
             let path = ensure_helper()?;
             let bridge = Bridge::spawn(path.to_string_lossy().to_string())?;
-            bridge.set_notification_handler(std::sync::Arc::new(|method, params| {
+            bridge.set_notification_handler(Arc::new(|method, params| {
                 crate::jobs::handle_notification(method, params);
                 if method == "job_progress" {
                     // opportunistically ingest staged batches while a crawl runs
                     let _ = crate::index::ingest_pending();
                 }
             }));
-            self.bridge = Some(bridge);
+            *guard = Some(Arc::new(bridge));
         }
-        Ok(self.bridge.as_ref().unwrap())
+        Ok(Arc::clone(guard.as_ref().unwrap()))
     }
 
-    /// Reset after a helper exit so the next call respawns.
+    /// Recycle ONLY the generation `observed` failed on. A sibling request
+    /// thread may already have respawned a fresh helper after the same
+    /// crash — killing that new generation for an old one's failure would
+    /// needlessly fail its in-flight calls. The old child is killed
+    /// outright (not merely dropped) so a wedged helper dies immediately
+    /// even while other callers still hold clones of it.
+    pub fn reset_if_same(&self, observed: &Arc<Bridge>) {
+        let mut guard = self.bridge.lock().unwrap();
+        let is_current = guard
+            .as_ref()
+            .map(|current| Arc::ptr_eq(current, observed))
+            .unwrap_or(false);
+        if is_current {
+            if let Some(old) = guard.take() {
+                old.kill_child();
+            }
+        }
+    }
+
+    /// Reset after a helper exit so the next call respawns (for owners that
+    /// hold the handle exclusively, e.g. one-shot CLI verbs).
     pub fn reset(&mut self) {
-        self.bridge = None;
+        self.reset_current();
+    }
+
+    fn reset_current(&self) {
+        if let Some(old) = self.bridge.lock().unwrap().take() {
+            old.kill_child();
+        }
     }
 }
 

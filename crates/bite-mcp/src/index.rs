@@ -1012,13 +1012,13 @@ fn stale_after_ms(age_ms: u64, threshold_hours: u64) -> bool {
 
 // ── tool entry points ──
 
-fn rebuild(params: &Value, handle: &mut BridgeHandle) -> Result<Value, BiteError> {
+fn rebuild(params: &Value, handle: &BridgeHandle) -> Result<Value, BiteError> {
     // warm the helper so the TCC identity is established for future Mail ops
     let _ = handle.get()?;
     spawn_crawl(params)
 }
 
-fn cancel(handle: Option<&mut BridgeHandle>) -> Result<Value, BiteError> {
+fn cancel(handle: Option<&BridgeHandle>) -> Result<Value, BiteError> {
     if let Some(h) = handle {
         let _ = h.get()?;
     }
@@ -1186,7 +1186,7 @@ pub fn forget(params: &Value) -> Result<Value, BiteError> {
 pub fn run_local(
     name: &str,
     params: &Value,
-    handle: Option<&mut BridgeHandle>,
+    handle: Option<&BridgeHandle>,
 ) -> Option<Result<Value, BiteError>> {
     match name {
         "index_status" => {
@@ -1226,7 +1226,7 @@ pub fn run_local(
 pub fn run_local_unwrapped(
     name: &str,
     params: &Value,
-    handle: Option<&mut BridgeHandle>,
+    handle: Option<&BridgeHandle>,
 ) -> Result<Value, BiteError> {
     match run_local(name, params, handle) {
         Some(r) => r,
