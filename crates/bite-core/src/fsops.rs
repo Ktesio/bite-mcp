@@ -45,16 +45,35 @@ pub fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
     Ok(())
 }
 
-/// Enforce privacy on everything bite owns under its data dir: the dir tree is
-/// 0700; config and lock files 0600. Called at CLI/MCP startup, install, and
-/// setup so fixes apply retroactively to older installs.
+/// Enforce privacy on everything bite owns under its data dir: the dir tree
+/// is 0700 (root, `batches/`, its subdirs like `quarantine/`, and the
+/// `index.lance` store); config, lock, batch and quarantined files 0600.
+/// Called at CLI/MCP startup (dispatch), install, and setup so fixes apply
+/// retroactively to older installs — including a crawl-first lifecycle where
+/// the helper materialized the dirs before any Rust code ran.
 pub fn enforce_private_data_dir(data_dir: &Path) -> io::Result<()> {
     ensure_private_dir(data_dir)?;
     tighten_file(&data_dir.join("config.toml")).ok();
     tighten_file(&data_dir.join(".writer.lock")).ok();
-    if let Ok(entries) = std::fs::read_dir(data_dir.join("batches")) {
+    tighten_dir(&data_dir.join("index.lance")).ok();
+    // batches/ itself (the old code tightened only its files — a dir created
+    // by the Swift crawler with FileManager defaults stayed 0755), every
+    // subdir (quarantine/), and every file at both levels.
+    let batches = data_dir.join("batches");
+    if let Ok(entries) = std::fs::read_dir(&batches) {
+        tighten_dir(&batches).ok();
         for e in entries.flatten() {
-            tighten_file(&e.path()).ok();
+            let path = e.path();
+            if path.is_dir() {
+                tighten_dir(&path).ok();
+                if let Ok(inner) = std::fs::read_dir(&path) {
+                    for q in inner.flatten() {
+                        tighten_file(&q.path()).ok();
+                    }
+                }
+            } else {
+                tighten_file(&path).ok();
+            }
         }
     }
     Ok(())
@@ -113,5 +132,56 @@ mod tests {
         write_private(&file, b"x=2").unwrap();
         let fmode = std::fs::metadata(&file).unwrap().permissions().mode() & 0o777;
         assert_eq!(fmode, 0o600);
+    }
+
+    #[test]
+    fn enforce_tightens_batches_dirs_and_quarantine() {
+        let base = tempfile::Builder::new()
+            .prefix("bite-enforce-test-")
+            .tempdir()
+            .unwrap();
+        let dir = base.path().join("bite");
+        // simulate a crawl-first lifecycle: dirs and files exist at loose
+        // modes exactly as FileManager.createDirectory defaults leave them
+        let batches = dir.join("batches");
+        let quarantine = batches.join("quarantine");
+        std::fs::create_dir_all(&quarantine).unwrap();
+        std::fs::write(batches.join("crawl-1-0.jsonl"), b"{}").unwrap();
+        std::fs::write(quarantine.join("crawl-0-9.jsonl"), b"bad").unwrap();
+        std::fs::write(dir.join("config.toml"), b"x=1").unwrap();
+        std::fs::create_dir(dir.join("index.lance")).unwrap();
+        // Permissions/PermissionsExt come from the parent module via super::*
+        let loosen = |p: &std::path::Path| {
+            std::fs::set_permissions(p, Permissions::from_mode(0o755)).unwrap();
+        };
+        loosen(&dir);
+        loosen(&batches);
+        loosen(&quarantine);
+        loosen(&dir.join("index.lance"));
+
+        enforce_private_data_dir(&dir).unwrap();
+
+        let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&dir), 0o700, "data dir root");
+        assert_eq!(mode(&batches), 0o700, "batches/ dir itself");
+        assert_eq!(mode(&batches.join("crawl-1-0.jsonl")), 0o600, "batch file");
+        assert_eq!(mode(&quarantine), 0o700, "quarantine/ dir");
+        assert_eq!(
+            mode(&quarantine.join("crawl-0-9.jsonl")),
+            0o600,
+            "quarantined file"
+        );
+        assert_eq!(mode(&dir.join("config.toml")), 0o600, "config.toml");
+        assert_eq!(mode(&dir.join("index.lance")), 0o700, "index.lance dir");
+    }
+
+    #[test]
+    fn enforce_on_missing_tree_is_ok() {
+        // fresh install: nothing exists yet — enforcement must not error
+        let base = tempfile::Builder::new()
+            .prefix("bite-enforce-empty-")
+            .tempdir()
+            .unwrap();
+        assert!(enforce_private_data_dir(&base.path().join("bite")).is_ok());
     }
 }

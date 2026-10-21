@@ -17,6 +17,12 @@ use crate::{doctor, mcp, setup};
 static FORCE_LIVE: AtomicBool = AtomicBool::new(false);
 
 pub fn run(cli: crate::cli::Cli) -> i32 {
+    // Privacy enforcement runs at EVERY startup — CLI verbs and the MCP
+    // server alike — so a crawl-first lifecycle (helper materialized
+    // batches/ before any `bite setup` ran) gets tightened retroactively
+    // instead of staying listable until manual intervention. Best-effort:
+    // a failure here must not block the command; `bite doctor` reports it.
+    let _ = bite_core::fsops::enforce_private_data_dir(&bite_core::config::data_dir());
     FORCE_LIVE.store(cli.force_live, Ordering::SeqCst);
     match dispatch(cli) {
         Ok(code) => code,

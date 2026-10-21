@@ -40,7 +40,10 @@ One command, four stages, in order:
 
 1. **Data dir hardening** (silent) — `~/Library/Application Support/bite`
    and its contents are enforced to 0700/0600, including on upgrades of
-   older installs. Nothing is sent anywhere; bite is local-only.
+   older installs. The same enforcement also runs at every CLI/MCP startup,
+   so a data dir first materialized by a crawl (before `bite setup` ever
+   ran) is tightened automatically. Nothing is sent anywhere; bite is
+   local-only.
 2. **Native helper install** — compiles (first run) or refreshes
    `bite-helper` at a stable path under the data dir. The stable path is
    deliberate: macOS ties permission grants to the binary's path, so a

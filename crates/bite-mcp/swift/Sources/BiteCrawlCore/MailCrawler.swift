@@ -193,16 +193,23 @@ public final class CrawlState {
 
 public enum MailCrawler {
     /// bite data dir root (batches/ and crawl-state.json live here).
+    /// Created 0700 — mail batch payloads land here, so the dir must never
+    /// be listable by other local users (matches the Rust side's
+    /// enforce_private_data_dir, which also fixes this retroactively).
     public static func dataDir() -> URL {
         let url = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("bite", isDirectory: true)
-        try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+        try? FileManager.default.createDirectory(
+            at: url, withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700])
         return url
     }
 
     public static func stagingDir() -> URL {
         let url = dataDir().appendingPathComponent("batches", isDirectory: true)
-        try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+        try? FileManager.default.createDirectory(
+            at: url, withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700])
         return url
     }
 
