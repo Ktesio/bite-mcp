@@ -59,6 +59,9 @@ with your data. bite itself adds no network hop; choose agents you trust.
   a retention guarantee: any full re-crawl re-imports whatever still exists
   in your Apple apps. To keep specific data out of the index, remove it in
   the source app, then purge the index scope (a wipe gives a clean slate).
+  Rebuilds can also be run body-off (`index_rebuild` with `no_body`, CLI
+  `bite index rebuild --no-body`): the index stores mail metadata only and
+  message bodies never enter the local store.
 
 ## Intended use
 

@@ -42,6 +42,12 @@ a tag has a matching section here before it can ship.
   was reachable only over MCP while `index_wipe` already had
   `bite index wipe`; scripted/terminal retention hygiene now matches the
   documented toolset. docs/protocol.md notes the CLI form.
+- `index_rebuild` now declares its `no_body` param in the tool registry and
+  the CLI grows `bite index rebuild --no-body`. Body-off indexing (mail
+  metadata only, message bodies never stored — the data-minimization
+  counterpart to `index_forget`'s scoped purge) was already honored by the
+  crawl worker but reachable only through an undeclared MCP param, so
+  clients could not discover it.
 
 ### Changed
 
