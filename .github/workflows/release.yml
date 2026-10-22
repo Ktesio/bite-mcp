@@ -77,7 +77,7 @@ jobs:
             echo "publishing $pkg failed after 3 attempts"; return 1
           }
           publish_one bite-bridge
-          publish_one bite-index
           publish_one bite-core
+          publish_one bite-index
           sleep 20
           publish_one bite-mcp
