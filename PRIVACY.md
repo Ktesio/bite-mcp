@@ -55,13 +55,14 @@ with your data. bite itself adds no network hop; choose agents you trust.
   `index_forget` (MCP, scoped to one app and/or container — mailbox,
   calendar, list, folder or chat) drops those rows after a
   `would_delete` preview; `bite index wipe` (CLI) removes the entire index
-  plus the crawl watermark. Both act on the LOCAL copy only and neither is
-  a retention guarantee: any full re-crawl re-imports whatever still exists
-  in your Apple apps. To keep specific data out of the index, remove it in
-  the source app, then purge the index scope (a wipe gives a clean slate).
-  Rebuilds can also be run body-off (`index_rebuild` with `no_body`, CLI
-  `bite index rebuild --no-body`): the index stores mail metadata only and
-  message bodies never enter the local store.
+  plus the crawl watermark. Both act on the LOCAL copy only. A scoped
+  `index_forget` is durable: the scope is recorded and later crawls skip
+  it, so a full re-crawl does not re-import what you deliberately purged
+  (`index_status` lists the recorded scopes). To re-include a purged
+  scope, `bite index wipe` gives a clean slate with no purge records and a
+  fresh rebuild. Rebuilds can also be run body-off (`index_rebuild` with
+  `no_body`, CLI `bite index rebuild --no-body`): the index stores mail
+  metadata only and message bodies never enter the local store.
 
 ## Intended use
 
