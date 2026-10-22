@@ -27,21 +27,52 @@ pub fn tighten_file(path: &Path) -> io::Result<()> {
     set_mode(path, 0o600)
 }
 
-/// Write a file with 0600 from the start (write to temp + rename keeps the
-/// window where content exists at looser perms as small as possible).
+/// Write a file with 0600 from the start (write to a per-call temp +
+/// rename keeps the window where content exists at looser perms as small
+/// as possible, and unique temp names keep concurrent writers to the same
+/// destination from interleaving into one shared inode).
 pub fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let tmp = path.with_extension("tmp-private");
-    {
-        let mut f = std::fs::File::create(&tmp)?;
+    // One temp file per call (pid + nanos): two concurrent writers to the
+    // same destination (e.g. two `bite config set` invocations) must never
+    // share a temp inode — interleaved write_alls would publish a mix of
+    // both payloads under the surviving rename, and the loser's rename can
+    // fail ENOENT after the winner already moved the shared temp away.
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0u128, |d| d.as_nanos());
+    let pid = std::process::id();
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("file")
+        .to_owned();
+    let tmp = path.with_file_name(format!("{name}.tmp-private-{nanos}-{pid}"));
+    let write = || -> io::Result<()> {
         use std::io::Write as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+        // 0600 at creation: File::create would honor umask (0666 & ~umask)
+        // and leave a world-readable window until a later chmod.
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp)?;
         f.write_all(bytes)?;
         f.sync_all().ok();
+        Ok(())
+    };
+    if let Err(e) = write() {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
     }
-    tighten_file(&tmp)?;
-    std::fs::rename(&tmp, path)?;
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
     Ok(())
 }
 
@@ -132,6 +163,53 @@ mod tests {
         write_private(&file, b"x=2").unwrap();
         let fmode = std::fs::metadata(&file).unwrap().permissions().mode() & 0o777;
         assert_eq!(fmode, 0o600);
+    }
+
+    #[test]
+    fn concurrent_write_private_never_corrupts_destination() {
+        // Two writers to the same destination previously shared ONE fixed
+        // temp name (`tmp-private`): interleaved `write_all`s into the same
+        // inode could publish a mix of both payloads under the surviving
+        // rename, and the rename race surfaced as spurious ENOENT errors.
+        // Each write must use its own temp file so concurrent writers never
+        // touch each other's bytes.
+        let base = tempfile::Builder::new()
+            .prefix("bite-wpriv-race-")
+            .tempdir()
+            .unwrap();
+        let dest = base.path().join("config.toml");
+        write_private(&dest, b"init").unwrap();
+        let dest = std::sync::Arc::new(dest);
+        let handles: Vec<_> = (0..8u8)
+            .map(|t| {
+                let dest = std::sync::Arc::clone(&dest);
+                std::thread::spawn(move || {
+                    // payload = one writer-identifying byte repeated: a
+                    // legitimate outcome is exactly one distinct byte
+                    // everywhere; ANY mix of two bytes (or a short file) is
+                    // cross-writer corruption
+                    let payload = [b'a' + t; 8192];
+                    for _ in 0..200 {
+                        write_private(&dest, &payload)
+                            .unwrap_or_else(|e| panic!("write failed: {e}"));
+                        let got = std::fs::read(&*dest).unwrap();
+                        assert_eq!(got.len(), 8192, "destination truncated");
+                        assert!(
+                            got.iter().all(|&b| b == got[0]),
+                            "destination holds a mix of writers' bytes"
+                        );
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        // quiescent: no temp litter left behind
+        for e in std::fs::read_dir(base.path()).unwrap().flatten() {
+            let name = e.file_name().to_string_lossy().into_owned();
+            assert!(!name.contains("tmp-private"), "temp file leaked: {name}");
+        }
     }
 
     #[test]

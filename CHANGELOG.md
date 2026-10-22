@@ -51,6 +51,18 @@ a tag has a matching section here before it can ship.
 
 ## [Unreleased]
 
+### Fixed
+
+- `write_private` (the 0600 writer behind `config.toml` and the helper
+  install meta) used one fixed temp name, so two concurrent writers to the
+  same destination — e.g. two `bite config set` invocations — interleaved
+  into the SAME temp file: the surviving rename could publish a mix of
+  both payloads, and the loser's rename failed with ENOENT after the
+  winner moved the shared temp away. Each write now creates its own
+  pid+nanos temp file, opens it 0600 from creation (no umask window
+  before the old post-hoc chmod), and cleans the temp up on a failed
+  write or rename.
+
 ### Changed
 
 - The MCP server now dispatches each request on its own thread: a slow
