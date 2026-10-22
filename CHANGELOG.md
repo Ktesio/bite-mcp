@@ -22,7 +22,7 @@ a tag has a matching section here before it can ship.
   round-trip. Helper recycling after a crash/timeout is generation-safe
   (`reset_if_same`): only the failed bridge generation is killed, so a
   helper a sibling thread already respawned survives, and in-flight calls
-  on a killed generation surface as the ambiguous `helper_exited`.
+  on a killed generation surface as the ambiguous `helper_exited`. (#50)
 
 ### Security
 
@@ -36,7 +36,7 @@ a tag has a matching section here before it can ship.
   `doctor` already expected at 0700. Creation-time privacy closes the
   mid-session gap for long-running servers: the Swift crawl worker creates
   its directories with 0700 attributes up front, and the Rust ingest path
-  chmods a freshly created `quarantine/` at creation.
+  chmods a freshly created `quarantine/` at creation. (#49)
 - The crawl liveness probe (`pid_alive`) and the crawl-cancel signal now
   resolve `kill` from absolute locations (`/bin/kill`, `/usr/bin/kill` —
   first that executes) instead of PATH, closing the same plantable-binary
@@ -44,7 +44,7 @@ a tag has a matching section here before it can ship.
   bare-name spawns in production code. When no kill binary can be executed
   at all the liveness probe now fails safe (crawler assumed alive) instead
   of treating it as dead — the old mapping deleted a live crawler's
-  pidfile and double-spawned a second crawl against Mail.
+  pidfile and double-spawned a second crawl against Mail. (#46)
 
 ### Added
 
@@ -54,25 +54,27 @@ a tag has a matching section here before it can ship.
   FTS fragments so purged bodies stop answering queries — Apple data is
   never touched. Without `confirm` it returns a `would_delete` count; an
   unscoped call is refused (the complete reset stays on `index_wipe`, which
-  also clears the crawl watermark). Documented as a reset, not retention:
-  delta crawls do not resurrect purged rows, but any full re-crawl
-  re-imports them. Retention and purge paths are now covered in PRIVACY.md
+  also clears the crawl watermark). The purge is durable: the confirmed
+  scope is recorded (0600 `purge-scopes.json` in the data dir) and later
+  crawls skip it — `index_status` lists recorded scopes and ingest reports
+  rows skipped for them (`skipped_purged`); `index_wipe` clears the record.
+  Retention and purge paths are now covered in PRIVACY.md
   and docs/protocol.md. The purge takes the store's cross-process writer
   lock across its delete + compaction (Busy returns an explicit retryable
   error), so a concurrent ingest in any bite process can never interleave
-  with the delete.
+  with the delete. (#44)
 - The CLI grows `bite index forget --app <name> [--container <name>]`, the
   CLI surface for the scoped purge above (preview without `--yes`, delete
   with it — the same confirm gate as the MCP tool). Previously the purge
   was reachable only over MCP while `index_wipe` already had
   `bite index wipe`; scripted/terminal retention hygiene now matches the
-  documented toolset. docs/protocol.md notes the CLI form.
+  documented toolset. docs/protocol.md notes the CLI form. (#48)
 - `index_rebuild` now declares its `no_body` param in the tool registry and
   the CLI grows `bite index rebuild --no-body`. Body-off indexing (mail
   metadata only, message bodies never stored — the data-minimization
   counterpart to `index_forget`'s scoped purge) was already honored by the
   crawl worker but reachable only through an undeclared MCP param, so
-  clients could not discover it.
+  clients could not discover it. (#47)
 - New docs-conformance test fence (`docs_conformance`): every tool the
   registry exposes must be documented in docs/protocol.md — helper-facing
   methods in the Method table's group shorthand (both directions, plus a
@@ -91,7 +93,7 @@ a tag has a matching section here before it can ship.
   seconds — queued every other index tool call in the process behind it.
   Writes still serialize on the store's cross-process `.writer.lock` and
   opportunistic ingest still deduplicates on `.ingest.lock`, so behavior is
-  unchanged for callers; only the queueing is gone.
+  unchanged for callers; only the queueing is gone. (#45)
 
 ### Security
 
@@ -102,14 +104,25 @@ a tag has a matching section here before it can ship.
   hint instead — the first attempt may already have committed, so a silent
   retry could double-send mail or duplicate a create. Applies to both the MCP
   server and the CLI dispatch path; classification lives in the tool registry
-  and unknown tools default to never replay.
+  and unknown tools default to never replay. (#39)
 - New `helper_exited_unsent` transport error distinguishes a request that
   provably never reached the helper (the write failed or the transport was
   already torn down) from a mid-call death of unknown outcome. Unsent
   failures replay safely for every tool, mutating ones included — nothing
   ran the first time — while the ambiguous mid-call death keeps the
   not-replayed guard above. Applies to both the MCP server and the CLI
-  dispatch path.
+  dispatch path. (#41)
+- `index_forget` purges are now durable across re-crawls: the confirmed
+  scope is recorded as a tombstone (0600 `purge-scopes.json` in the data
+  dir) and every later ingest skips rows inside it, so a full rebuild
+  (`index_rebuild full:true`), the 365-day backfill and a wipe+re-crawl of
+  a different index no longer silently re-import what was deliberately
+  purged — the registry and docs previously documented exactly that
+  undoing. Matching mirrors the purge's delete filter (exact app/container,
+  `None` matches any), `index_status` lists the recorded scopes, ingest
+  responses report `skipped_purged` when rows were dropped, and
+  `index_wipe` remains the complete reset — it clears the tombstones too,
+  so a wiped-and-rebuilt index starts clean.
 
 ## [v0.4.0] - 2026-10-18
 

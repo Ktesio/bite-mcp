@@ -9,6 +9,51 @@ pub use store::{
     WriteGuard,
 };
 
+/// One recorded `index_forget` scope. Records whose (app, container) match a
+/// recorded scope are SKIPPED at ingest, so a deliberate purge survives the
+/// full re-crawls that would otherwise re-import the same rows from Apple
+/// (`index_rebuild full:true`, `index_wipe` + rebuild, the 365-day backfill).
+///
+/// Matching mirrors the purge's delete filter exactly: a `None` field matches
+/// any value, a `Some` field is an exact (case-sensitive) equality, and a
+/// `Some(container)` never matches a record with no container — so "rows a
+/// scope filter would delete" and "rows the scope skips at ingest" are the
+/// same set. `recorded_ms` is operator context only (never consulted for
+/// matching), and `index_wipe` clears the whole set: it is the complete
+/// reset, including the purge record.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct PurgeScope {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub container: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recorded_ms: Option<i64>,
+}
+
+impl PurgeScope {
+    /// True when a record with this app/container falls inside the scope.
+    pub fn matches(&self, app: &str, container: Option<&str>) -> bool {
+        if let Some(a) = &self.app {
+            if a != app {
+                return false;
+            }
+        }
+        if let Some(c) = &self.container {
+            if container != Some(c.as_str()) {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Same app+container (the identity that matters — `recorded_ms` is not
+    /// part of it, so re-forgetting a scope never duplicates the entry).
+    pub fn same_scope(&self, app: Option<&str>, container: Option<&str>) -> bool {
+        self.app.as_deref() == app && self.container.as_deref() == container
+    }
+}
+
 /// Total-order sort key for batch files: `(job_ts, seq, path)`. Batch names
 /// are `crawl-<job_ts>-<seq>.jsonl`; ordering by the job timestamp FIRST
 /// keeps a dead crashed job's leftovers (`crawl-<T1>-40`) from out-ranking
@@ -37,12 +82,15 @@ fn batch_order_key(path: &Path) -> (u64, u64, std::path::PathBuf) {
 
 /// Ingest every un-ingested `*.jsonl` batch in the staging dir (deleting each
 /// file on success — merge-insert makes re-ingest idempotent). Returns the
-/// number of batches ingested, the total rows written, and the number of
-/// unreadable batches quarantined (moved to `<staging>/quarantine/`).
+/// number of batches ingested, the total rows written, the number of
+/// unreadable batches quarantined (moved to `<staging>/quarantine/`), and the
+/// rows dropped because they matched a recorded purge scope (`index_forget`)
+/// — purged scopes must not come back with the next full crawl.
 pub fn ingest_staged(
     index: &EntityIndex,
     staging: &Path,
-) -> Result<(usize, usize, usize), store::IndexError> {
+    purge_scopes: &[PurgeScope],
+) -> Result<(usize, usize, usize, usize), store::IndexError> {
     let mut files: Vec<_> = std::fs::read_dir(staging)
         .map(|it| {
             it.filter_map(|e| e.ok())
@@ -156,12 +204,34 @@ pub fn ingest_staged(
             "bite-index: deduplicated {dedup_dropped} duplicate (app,account,id) rows across batches"
         );
     }
+    // Purge-scope tombstones: drop rows inside a recorded `index_forget`
+    // scope BEFORE the upsert. Applied after dedup (fewer comparisons) and
+    // to the dedup SURVIVOR so a newer batch can never resurrect a purged
+    // key through keep-last. Empty slice = no tombstones recorded = the
+    // historical behavior (everything ingests).
+    let skipped_purged = if purge_scopes.is_empty() {
+        0
+    } else {
+        let before = unique.len();
+        unique.retain(|r| {
+            !purge_scopes
+                .iter()
+                .any(|s| s.matches(&r.app, r.container.as_deref()))
+        });
+        let skipped = before - unique.len();
+        if skipped > 0 {
+            eprintln!(
+                "bite-index: skipped {skipped} rows matching recorded purge scopes (index_forget)"
+            );
+        }
+        skipped
+    };
     let stats = index.ingest(&unique)?;
     for file in &staged_files {
         std::fs::remove_file(file).ok();
     }
     let batches = staged_files.len();
-    Ok((batches, stats.rows, quarantined))
+    Ok((batches, stats.rows, quarantined, skipped_purged))
 }
 
 #[cfg(test)]
@@ -238,7 +308,7 @@ mod tests {
                 mail_record("4127", Some("iCloud"), "from iCloud"),
             ],
         );
-        let (batches, _rows, quarantined) = ingest_staged(&idx, &staging).unwrap();
+        let (batches, _rows, quarantined, _skipped) = ingest_staged(&idx, &staging, &[]).unwrap();
         assert_eq!((batches, quarantined), (1, 0));
         assert_eq!(idx.count(Some("app = 'mail'")).unwrap(), 2);
 
@@ -253,7 +323,7 @@ mod tests {
                 mail_record("4127", Some("Work"), "from Work v2"),
             ],
         );
-        let _ = ingest_staged(&idx, &staging).unwrap();
+        let _ = ingest_staged(&idx, &staging, &[]).unwrap();
         assert_eq!(idx.count(Some("app = 'mail'")).unwrap(), 2);
         let mut got = mail_hits(&idx);
         got.sort();
@@ -284,7 +354,7 @@ mod tests {
             "crawl-1790958250-9.jsonl",
             &[mail_record("77", Some("Work"), "older")],
         );
-        let _ = ingest_staged(&idx, &staging).unwrap();
+        let _ = ingest_staged(&idx, &staging, &[]).unwrap();
         assert_eq!(idx.count(Some("app = 'mail'")).unwrap(), 1);
         let got = mail_hits(&idx);
         assert_eq!(got, vec![("Work".to_string(), "newer".to_string())]);
@@ -311,7 +381,7 @@ mod tests {
             &format!("crawl-{dead}-40.jsonl"),
             &[mail_record("77", Some("Work"), "dead job")],
         );
-        let _ = ingest_staged(&idx, &staging).unwrap();
+        let _ = ingest_staged(&idx, &staging, &[]).unwrap();
         assert_eq!(idx.count(Some("app = 'mail'")).unwrap(), 1);
         let got = mail_hits(&idx);
         assert_eq!(got, vec![("Work".to_string(), "live job".to_string())]);
@@ -342,7 +412,7 @@ mod tests {
             "notes.jsonl",
             &[mail_record("6", Some("Work"), "no seq at all")],
         );
-        let (batches, _rows, _quarantined) = ingest_staged(&idx, &staging).unwrap();
+        let (batches, _rows, _quarantined, _skipped) = ingest_staged(&idx, &staging, &[]).unwrap();
         assert_eq!(batches, 3);
         assert_eq!(idx.count(Some("app = 'mail'")).unwrap(), 2);
         let mut got = mail_hits(&idx);
@@ -364,10 +434,10 @@ mod tests {
         let idx = EntityIndex::open(&staging.join("index.lance")).unwrap();
         let line = r#"{"app":"mail","id":"5","title":"no account"}"#;
         std::fs::write(staging.join("crawl-1-0.jsonl"), format!("{line}\n")).unwrap();
-        let _ = ingest_staged(&idx, &staging).unwrap();
+        let _ = ingest_staged(&idx, &staging, &[]).unwrap();
         // re-ingest the same record (fresh file — merge key must match)
         std::fs::write(staging.join("crawl-1-1.jsonl"), format!("{line}\n")).unwrap();
-        let _ = ingest_staged(&idx, &staging).unwrap();
+        let _ = ingest_staged(&idx, &staging, &[]).unwrap();
         assert_eq!(idx.count(Some("app = 'mail'")).unwrap(), 1);
         assert_eq!(idx.count(Some("account = ''")).unwrap(), 1);
     }
@@ -377,8 +447,89 @@ mod tests {
         let staging = temp_staging("dir");
         let idx = EntityIndex::open(&staging.join("index.lance")).unwrap();
         std::fs::create_dir_all(staging.join("weird.jsonl")).unwrap();
-        let (batches, _rows, quarantined) = ingest_staged(&idx, &staging).unwrap();
+        let (batches, _rows, quarantined, _skipped) = ingest_staged(&idx, &staging, &[]).unwrap();
         assert_eq!((batches, quarantined), (0, 0));
         assert!(staging.join("weird.jsonl").is_dir(), "directory untouched");
+    }
+
+    fn junk_record(id: &str, title: &str) -> Record {
+        let mut r = mail_record(id, Some("Work"), title);
+        r.container = Some("Junk".into());
+        r
+    }
+
+    #[test]
+    fn purge_scope_matching_mirrors_the_delete_filter() {
+        let scope = |app: Option<&str>, container: Option<&str>| PurgeScope {
+            app: app.map(String::from),
+            container: container.map(String::from),
+            recorded_ms: None,
+        };
+        // app+container: exact both ways
+        let s = scope(Some("mail"), Some("Junk"));
+        assert!(s.matches("mail", Some("Junk")));
+        assert!(!s.matches("mail", Some("INBOX")));
+        assert!(!s.matches("notes", Some("Junk")));
+        // a Some container never matches a containerless record (same as
+        // SQL `container = 'Junk'` never matching NULL)
+        assert!(!s.matches("mail", None));
+        // app-only scope: any container, including none
+        let app_only = scope(Some("mail"), None);
+        assert!(app_only.matches("mail", Some("INBOX")));
+        assert!(app_only.matches("mail", None));
+        assert!(!app_only.matches("calendar", Some("INBOX")));
+        // container-only scope: any app
+        let c_only = scope(None, Some("Junk"));
+        assert!(c_only.matches("mail", Some("Junk")));
+        assert!(c_only.matches("notes", Some("Junk")));
+        assert!(!c_only.matches("mail", Some("junk")), "case-sensitive");
+        // identity ignores recorded_ms: re-forgetting never duplicates
+        assert!(scope(Some("mail"), Some("Junk")).same_scope(Some("mail"), Some("Junk")));
+        assert!(!scope(Some("mail"), None).same_scope(Some("mail"), Some("Junk")));
+    }
+
+    #[test]
+    fn recorded_purge_scope_survives_reingest_and_newer_batches() {
+        let staging = temp_staging("purge");
+        let idx = EntityIndex::open(&staging.join("index.lance")).unwrap();
+        write_batch(
+            &staging,
+            "crawl-1-0.jsonl",
+            &[
+                mail_record("10", Some("Work"), "kept inbox"),
+                junk_record("11", "purged junk"),
+            ],
+        );
+        let scopes = vec![PurgeScope {
+            app: Some("mail".into()),
+            container: Some("Junk".into()),
+            recorded_ms: None,
+        }];
+        let (batches, rows, quarantined, skipped) = ingest_staged(&idx, &staging, &scopes).unwrap();
+        assert_eq!((batches, quarantined, skipped), (1, 0, 1));
+        assert_eq!(rows, 1, "only the inbox row was written");
+        assert_eq!(idx.count(Some("app = 'mail'")).unwrap(), 1);
+        assert_eq!(idx.count(Some("container = 'Junk'")).unwrap(), 0);
+
+        // a LATER full crawl re-delivers the junk row (and re-touches the
+        // kept one): the tombstone must still drop it — this is the exact
+        // scenario the old "reset, not retention" wording admitted to
+        write_batch(
+            &staging,
+            "crawl-2-0.jsonl",
+            &[
+                junk_record("11", "purged junk v2"),
+                mail_record("10", Some("Work"), "kept inbox v2"),
+            ],
+        );
+        let (_b, rows2, _q, skipped2) = ingest_staged(&idx, &staging, &scopes).unwrap();
+        assert_eq!((rows2, skipped2), (1, 1));
+        assert_eq!(idx.count(Some("app = 'mail'")).unwrap(), 1);
+        assert!(mail_hits(&idx)[0].1.contains("v2"), "kept row refreshed");
+
+        // no recorded scopes (the index_wipe shape) → the row CAN come back
+        write_batch(&staging, "crawl-3-0.jsonl", &[junk_record("11", "back")]);
+        let _ = ingest_staged(&idx, &staging, &[]).unwrap();
+        assert_eq!(idx.count(Some("container = 'Junk'")).unwrap(), 1);
     }
 }

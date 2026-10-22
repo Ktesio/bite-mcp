@@ -221,13 +221,17 @@ from the LOCAL index only — Apple data is never touched — scoped by exact
 `app` and/or `container` names. Without `confirm` it returns a
 `would_delete` count; with `confirm` it deletes the scope, then compacts
 the FTS index so purged bodies stop answering queries (dead fragments would
-otherwise hold plaintext until the next optimize). It is a reset, not
-retention: the delta watermark survives a scoped forget, so a delta crawl
-does not resurrect the purged rows — but any full crawl (`index_rebuild`
-with `full: true`, the full schedule a stale/failed predecessor triggers,
-or `index_wipe` + rebuild) re-imports them from Apple. An unscoped call is
-refused: the complete reset stays on `index_wipe`, which also clears the
-watermark and staging dir.
+otherwise hold plaintext until the next optimize). The purge is DURABLE:
+the confirmed scope is recorded (0600 `purge-scopes.json` in the data dir)
+and every later ingest skips rows inside it, so delta crawls, `full: true`
+rebuilds, the full schedule a stale/failed predecessor triggers, and the
+365-day backfill all leave the scope out — a full re-crawl no longer
+re-imports what was deliberately purged. `index_status` lists the recorded
+scopes (`purge_scopes`), and ingest reports how many rows it skipped for
+them (`skipped_purged`). An unscoped call is refused: the complete reset
+stays on `index_wipe`, which also clears the watermark, the staging dir and
+the recorded purge scopes — a wiped-and-rebuilt index starts with no
+tombstones.
 
 Unparseable batches are quarantined to `batches/quarantine/` — ingest
 continues; the quarantine keeps at most 200 files (evicted oldest-by-mtime).

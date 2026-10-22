@@ -489,7 +489,7 @@ pub static TOOLS: &[Tool] = &[
             ParamSpec::opt("limit", ParamKind::Int, "max results (default 20, capped at 200)"),
         ]),
     td("index_forget", App::Index, "index.forget",
-        "Drop rows from the LOCAL search index — Apple data is never touched. Scope with app and/or container (exact names; see search results' fields). First call without confirm returns a would_delete preview. This is a reset, not retention: a full re-crawl re-imports the same rows from Apple. For a complete wipe (index + delta watermark) use index_wipe from the CLI.",
+        "Drop rows from the LOCAL search index — Apple data is never touched. Scope with app and/or container (exact names; see search results' fields). First call without confirm returns a would_delete preview. The purge is durable: the scope is recorded and later crawls (delta, full rebuild, backfill) skip it — index_status lists recorded scopes. For a complete wipe (index + delta watermark + purge records) use index_wipe from the CLI.",
         ps![
             ParamSpec::opt("app", ParamKind::Str, "scope to one app (mail/calendar/reminders/contacts/notes/messages)"),
             ParamSpec::opt("container", ParamKind::Str, "scope to one container (mailbox/calendar/list/folder/chat name, exact match)"),
