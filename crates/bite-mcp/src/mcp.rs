@@ -4,7 +4,6 @@
 //! this keeps `bite` dependency-light and immune to SDK API churn.
 
 use std::io::{BufRead, Write};
-use std::sync::Mutex;
 
 use bite_core::{json_schema, ops, registry, BiteError};
 use serde_json::{json, Value};
@@ -15,15 +14,17 @@ const SERVER_NAME: &str = "bite-mcp";
 const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 struct ServerState {
-    handle: Mutex<BridgeHandle>,
+    /// Interior-mutable bridge holder: request threads fetch `Arc` clones
+    /// and never hold a lock across a helper round-trip.
+    handle: BridgeHandle,
 }
 
 pub fn serve() -> i32 {
-    let state = ServerState {
-        handle: Mutex::new(BridgeHandle::new()),
-    };
+    let state = std::sync::Arc::new(ServerState {
+        handle: BridgeHandle::new(),
+    });
+    let stdout = std::sync::Arc::new(std::io::stdout());
     let stdin = std::io::stdin();
-    let stdout = std::io::stdout();
     for line in stdin.lock().lines() {
         let Ok(line) = line else { break };
         if line.trim().is_empty() {
@@ -51,14 +52,35 @@ pub fn serve() -> i32 {
             .unwrap_or("")
             .to_string();
         let params = request.get("params").cloned().unwrap_or(json!({}));
-        let result = handle_request(&state, &method, &params);
-        let resp = match result {
-            Ok(v) => json!({ "jsonrpc": "2.0", "id": id, "result": v }),
-            Err((code, message)) => {
-                json!({ "jsonrpc": "2.0", "id": id, "error": {"code": code, "message": message} })
-            }
-        };
-        write_line(&stdout, &resp);
+        // Dispatch each request on its own thread: a slow helper round-trip
+        // (Apple Events can take the full per-call timeout) must not stall
+        // unrelated traffic — pings, tools/list and other pipelined requests
+        // are answered while a tool call is still in flight. JSON-RPC
+        // responses correlate by id, so completion order is free. Threads
+        // are detached: when stdin closes the client is gone and in-flight
+        // work has no audience.
+        let state = std::sync::Arc::clone(&state);
+        let resp_stdout = std::sync::Arc::clone(&stdout);
+        let resp_id = id.clone();
+        let spawned = std::thread::Builder::new()
+            .name("bite-mcp-request".to_owned())
+            .spawn(move || {
+                let result = handle_request(&state, &method, &params);
+                let resp = match result {
+                    Ok(v) => json!({ "jsonrpc": "2.0", "id": resp_id, "result": v }),
+                    Err((code, message)) => {
+                        json!({ "jsonrpc": "2.0", "id": resp_id, "error": { "code": code, "message": message } })
+                    }
+                };
+                write_line(&resp_stdout, &resp);
+            });
+        if let Err(e) = spawned {
+            let resp = json!({
+                "jsonrpc": "2.0", "id": id,
+                "error": {"code": -32603, "message": format!("internal error: could not dispatch request: {e}")}
+            });
+            write_line(&stdout, &resp);
+        }
     }
     0
 }
@@ -133,12 +155,12 @@ fn handle_request(state: &ServerState, method: &str, params: &Value) -> Result<V
                     }
                     Some(Err(e)) => return Err(err(-32000, e.render())),
                     None => {
-                        let mut handle = state.handle.lock().unwrap();
-                        let bridge = handle
+                        let bridge = state
+                            .handle
                             .get()
                             .map_err(|e| err(-32000, bite_core::BiteError::from(e).render()))?;
                         let short = std::time::Duration::from_secs(45);
-                        match bite_core::ops::run_with_timeout(bridge, name, args.clone(), short) {
+                        match bite_core::ops::run_with_timeout(&bridge, name, args.clone(), short) {
                             Ok(value) => {
                                 let mut value = value;
                                 value["source"] = json!("live");
@@ -176,8 +198,7 @@ fn handle_request(state: &ServerState, method: &str, params: &Value) -> Result<V
                 }
             }
             if crate::index::is_local_tool(name) {
-                let mut handle = state.handle.lock().unwrap();
-                let value = crate::index::run_local_unwrapped(name, &args, Some(&mut handle))
+                let value = crate::index::run_local_unwrapped(name, &args, Some(&state.handle))
                     .map_err(|e| err(-32000, e.render()))?;
                 return Ok(json!({
                     "content": [ { "type": "text", "text": serde_json::to_string_pretty(&value).unwrap_or_default() } ],
@@ -236,12 +257,19 @@ fn handle_request(state: &ServerState, method: &str, params: &Value) -> Result<V
 }
 
 /// Run a tool through the bridge; if the helper exited, respawn once.
+/// The `Arc<Bridge>` clone is held across the round-trip (the bridge client
+/// multiplexes by request id); the handle's lock is touched only inside
+/// `get`/`reset_if_same`, so concurrent requests never serialize behind
+/// this call or its respawn.
 fn run_tool_retrying(state: &ServerState, name: &str, args: Value) -> Result<Value, BiteError> {
-    let mut handle = state.handle.lock().unwrap();
-    match ops::run(handle.get()?, name, args.clone()) {
+    let bridge = state.handle.get()?;
+    match ops::run(&bridge, name, args.clone()) {
         Ok(v) => Ok(v),
         Err(mut e) if matches!(e.code.as_str(), "helper_exited" | "helper_exited_unsent") => {
-            // Respawn either way so the next call gets a fresh process.
+            // Respawn either way so the next call gets a fresh process —
+            // recycling only the failed generation: a sibling request thread
+            // may already have respawned a helper that must not be killed
+            // for an older generation's crash.
             // helper_exited_unsent means the request provably never reached
             // the helper (the write itself failed or the transport was
             // already torn down) — nothing ran, so replaying is safe for
@@ -250,9 +278,10 @@ fn run_tool_retrying(state: &ServerState, name: &str, args: Value) -> Result<Val
             // committed inside the helper, and a blind retry could
             // double-send mail or duplicate a create (same rationale as
             // the timeout arm).
-            handle.reset();
+            state.handle.reset_if_same(&bridge);
             if e.code == "helper_exited_unsent" || registry::replay_safe(name) {
-                ops::run(handle.get()?, name, args).map_err(BiteError)
+                let fresh = state.handle.get()?;
+                ops::run(&fresh, name, args).map_err(BiteError)
             } else {
                 e.message.push_str(
                     "; the helper was respawned but the call was not replayed — \
@@ -272,7 +301,7 @@ fn run_tool_retrying(state: &ServerState, name: &str, args: Value) -> Result<Val
         // replayed — it may already have committed inside the helper, and a
         // blind retry could double-send mail or repeat a delete.
         Err(mut e) if e.code == "timeout" => {
-            handle.reset();
+            state.handle.reset_if_same(&bridge);
             e.message.push_str(
                 "; the wedged helper was recycled and the call was abandoned — \
                  it may or may not have taken effect",

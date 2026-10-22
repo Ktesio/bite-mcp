@@ -125,3 +125,70 @@ fn spawn_failure_is_reported() {
         .output();
     let _ = std::io::stdout().flush();
 }
+
+/// The bridge client multiplexes by request id: concurrent round-trips over
+/// ONE transport interleave instead of serializing. The fake helper answers
+/// each request on its own thread after a fixed delay, so four concurrent
+/// calls must finish in roughly one delay — a serialized client (or helper)
+/// would take four.
+#[test]
+fn concurrent_calls_multiplex_one_bridge() {
+    let scenario = scenario_file(&json!({
+        "echo": true,
+        "sleep_ms_per_call": 300,
+        "handler_threads": 4,
+    }));
+    let bridge = Bridge::spawn_args(
+        fake_helper(),
+        &[scenario.path().to_string_lossy().to_string()],
+    )
+    .unwrap();
+    let bridge = std::sync::Arc::new(bridge);
+
+    let start = std::time::Instant::now();
+    let callers: Vec<_> = (0..4)
+        .map(|i| {
+            let b = std::sync::Arc::clone(&bridge);
+            std::thread::spawn(move || {
+                let res = b.call(&format!("tool.{i}"), &json!({})).unwrap();
+                assert_eq!(res["ok"], json!(true));
+            })
+        })
+        .collect();
+    for c in callers {
+        c.join().unwrap();
+    }
+    let elapsed = start.elapsed();
+    // Serial floor: 4 × 300 ms = 1200 ms. Concurrent reality: ~320 ms.
+    assert!(
+        elapsed < Duration::from_millis(900),
+        "concurrent round-trips serialized behind each other: {elapsed:?}"
+    );
+}
+
+/// `kill_child` recycles a wedged generation immediately while callers still
+/// hold clones: their already-written in-flight requests surface as the
+/// AMBIGUOUS `helper_exited` (never unsent, never a silent hang).
+#[test]
+fn kill_child_fails_inflight_calls_as_ambiguous_exit() {
+    let scenario = scenario_file(&json!({
+        "echo": true,
+        "sleep_ms_per_call": 1200,
+    }));
+    let bridge = std::sync::Arc::new(
+        Bridge::spawn_args(
+            fake_helper(),
+            &[scenario.path().to_string_lossy().to_string()],
+        )
+        .unwrap(),
+    );
+
+    let caller = {
+        let b = std::sync::Arc::clone(&bridge);
+        std::thread::spawn(move || b.call_timeout("slow.tool", &json!({}), Duration::from_secs(8)))
+    };
+    std::thread::sleep(Duration::from_millis(250)); // request is written, helper busy
+    bridge.kill_child();
+    let err = caller.join().unwrap().unwrap_err();
+    assert_eq!(err.code, "helper_exited");
+}
