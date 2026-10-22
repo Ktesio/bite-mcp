@@ -75,6 +75,14 @@ a tag has a matching section here before it can ship.
   counterpart to `index_forget`'s scoped purge) was already honored by the
   crawl worker but reachable only through an undeclared MCP param, so
   clients could not discover it. (#47)
+- New docs-conformance test fence (`docs_conformance`): every tool the
+  registry exposes must be documented in docs/protocol.md — helper-facing
+  methods in the Method table's group shorthand (both directions, plus a
+  required-params check against the `{...}` shorthand), index-plane tools
+  by MCP name in the index sections. The method table was previously
+  hand-maintained with nothing machine-checking it; the 38-vs-45 as-built
+  drift was caught by eye. A registry addition or removal that skips the
+  docs now reds CI instead of drifting.
 
 ### Changed
 
