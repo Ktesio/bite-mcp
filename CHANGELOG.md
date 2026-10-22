@@ -1,5 +1,46 @@
 # Changelog
 
+## v0.5.0 - 2026-10-22
+
+This release adds scoped, durable index purges (index_forget MCP tool and bite index forget CLI), an opt-in skip of the exact-total count scan, and safer helper-death replay semantics. It also enforces data-dir privacy at startup, resolves kill from absolute paths, dispatches requests concurrently, and updates dependencies including rustls-webpki for RUSTSEC-2026-0382.
+
+Bump: `minor` (product-facing feature commit found in commit history).
+Range: `v0.4.0` -> `v0.5.0`.
+
+### Commits
+- `8385e18` fix(mcp): never blind-replay mutating tools after a helper death
+- `e0d8cc6` Merge pull request #39 from Ktesio/feat/replay-safe-tools
+- `f2f9ac7` perf(index): opt-in skip of the exact-total count scan
+- `1fe8fbf` fix(bridge): split helper_exited_unsent so safe replays are not refused
+- `11176db` Merge pull request #40 from Ktesio/perf/skip-exact-count
+- `972b0e9` Merge pull request #41 from Ktesio/feat/unsent-replay-split
+- `2e248ea` feat(index): scoped purge of local index rows via index_forget
+- `fcb8bc5` perf(index): scope the global index mutex to the lazy open
+- `4bb5956` fix(index): hold the store writer lock across index_forget's delete
+- `3d6f1da` Merge pull request #44 from Ktesio/feat/index-purge
+- `13da74f` chore(deps): bump the lance-arrow-stack group with 3 updates (#42)
+- `30e8ba1` chore(deps): bump the cargo-lockfile-only group with 2 updates (#43)
+- `9435eee` Merge remote-tracking branch 'origin/main' into perf/index-lock-scope
+- `727cc02` security(index): resolve kill from absolute paths, fail safe when no probe runs
+- `d081a10` perf(index): scope the global index mutex to the lazy open (#45)
+- `51428e6` Merge pull request #46 from Ktesio/security/absolute-kill-path
+- `fcc7a5e` feat(index): declare the no_body param on index_rebuild and add the --no-body CLI flag
+- `eb31ac8` chore(deps): bump rustls-webpki to 0.103.16 for RUSTSEC-2026-0382
+- `dd3beb0` feat(cli): add 'bite index forget' subcommand for scoped purges
+- `6189a1e` chore(deps): bump rustls-webpki to 0.103.16 for RUSTSEC-2026-0382
+- `d247723` Merge pull request #47 from Ktesio/feat/index-rebuild-no-body
+- `38caacf` Merge remote-tracking branch 'origin/main' into feat/index-forget-cli
+- `f1220e6` Merge pull request #48 from Ktesio/feat/index-forget-cli
+- `be48caf` security(core): enforce data-dir privacy at every startup, cover batches/quarantine
+- `31dc858` perf(mcp): dispatch requests concurrently, narrow the bridge lock to spawn/clone
+- `5d9db52` Merge pull request #49 from Ktesio/security/data-dir-privacy-enforcement
+- `4a45aa8` Merge pull request #50 from Ktesio/perf/concurrent-request-dispatch
+- `92aa962` feat(index): make index_forget purges durable across re-crawls
+- `7d90504` test(docs): fence docs/protocol.md against tool-registry drift
+- `5676c7d` Merge pull request #51 from Ktesio/feat/durable-purge-scopes
+- `fffa1aa` Merge branch 'main' into docs/protocol-registry-fence
+- `5f2a8a0` Merge pull request #52 from Ktesio/docs/protocol-registry-fence
+
 All notable changes to this project are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
