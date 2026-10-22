@@ -12,6 +12,17 @@ a tag has a matching section here before it can ship.
 
 ### Security
 
+- Data-dir privacy enforcement now runs at every CLI/MCP startup, not only
+  `bite setup` — a crawl-first lifecycle (the helper materializes
+  `~/Library/Application Support/bite` and `batches/` before setup ever
+  ran) left those directories listable at 0755 until a manual setup. The
+  enforcement pass itself now also tightens the `batches/` directory
+  (previously only its files), the `quarantine/` subdirectory and the
+  quarantined files inside it, and the `index.lance` store directory that
+  `doctor` already expected at 0700. Creation-time privacy closes the
+  mid-session gap for long-running servers: the Swift crawl worker creates
+  its directories with 0700 attributes up front, and the Rust ingest path
+  chmods a freshly created `quarantine/` at creation.
 - The crawl liveness probe (`pid_alive`) and the crawl-cancel signal now
   resolve `kill` from absolute locations (`/bin/kill`, `/usr/bin/kill` —
   first that executes) instead of PATH, closing the same plantable-binary

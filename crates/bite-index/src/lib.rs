@@ -74,6 +74,15 @@ pub fn ingest_staged(
                     file.display()
                 );
                 if std::fs::create_dir_all(&quarantine).is_ok() {
+                    // creation-time privacy: the MCP server process may long
+                    // outlive its startup enforcement pass, so a quarantine/
+                    // first created mid-session must not sit at umask
+                    // defaults until the next startup
+                    use std::os::unix::fs::PermissionsExt;
+                    let _ = std::fs::set_permissions(
+                        &quarantine,
+                        std::fs::Permissions::from_mode(0o700),
+                    );
                     let dest = quarantine.join(file.file_name().unwrap_or_default());
                     match std::fs::rename(&file, dest) {
                         Ok(_) => quarantined += 1,
