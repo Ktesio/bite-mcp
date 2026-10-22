@@ -203,10 +203,11 @@ fn ingest_pending_if_due(index: &bite_index::EntityIndex) {
     let Ok(_writer) = index.lock_writer() else {
         return;
     };
-    let _ = bite_index::ingest_staged(index, &staging()).map_err(|e| {
-        eprintln!("bite auto-ingest error: {e}");
-        record_index_error("auto-ingest", &e.to_string());
-    });
+    let _ = bite_index::ingest_staged(index, &staging(), &read_purge_scopes(&purge_scopes_path()))
+        .map_err(|e| {
+            eprintln!("bite auto-ingest error: {e}");
+            record_index_error("auto-ingest", &e.to_string());
+        });
     let _ = fs2::FileExt::unlock(&lock);
     // writer lock still held here (guard `_writer` lives to fn end), so the
     // optimize serializes against concurrent ingests
@@ -351,17 +352,24 @@ pub fn ingest_pending() -> Result<Value, BiteError> {
             }
             Ok(_guard) => {}
         }
-        let (batches, rows, quarantined) = bite_index::ingest_staged(index, &staging)
-            .map_err(|e| BridgeError::new("index_ingest_failed", e.to_string()))?;
+        let (batches, rows, quarantined, skipped_purged) =
+            bite_index::ingest_staged(index, &staging, &read_purge_scopes(&purge_scopes_path()))
+                .map_err(|e| BridgeError::new("index_ingest_failed", e.to_string()))?;
         if batches > 0 {
             refresh_fts_if_crawl_settled(index);
         }
         crate::jobs::set_pending_batches(pending_batches());
-        Ok(json!({
+        let mut out = json!({
             "batches_ingested": batches,
             "rows": rows,
             "quarantined": quarantined,
-        }))
+        });
+        // only visible when it actually happened — a standing 0 on every
+        // healthy poll is noise an agent has to read past
+        if skipped_purged > 0 {
+            out["skipped_purged"] = json!(skipped_purged);
+        }
+        Ok(out)
     })
 }
 
@@ -426,7 +434,7 @@ pub fn status() -> Result<Value, BiteError> {
         let alive = live_crawler_pid_cached().is_some();
         let jobs = crate::jobs::snapshot();
         let last_errors = LAST_INDEX_ERRORS.lock().unwrap().clone();
-        Ok(status_json(
+        let mut out = status_json(
             &stats,
             staged,
             quarantined,
@@ -434,7 +442,22 @@ pub fn status() -> Result<Value, BiteError> {
             alive,
             jobs,
             &last_errors,
-        ))
+        );
+        // Recorded purge scopes: an agent wondering why a container never
+        // indexes needs to see WHY here — otherwise durable skipping looks
+        // exactly like a broken crawl. Only present when scopes exist.
+        let scopes = read_purge_scopes(&purge_scopes_path());
+        if !scopes.is_empty() {
+            out["purge_scopes"] = json!(scopes
+                .iter()
+                .map(|s| json!({
+                    "app": s.app,
+                    "container": s.container,
+                    "recorded_ms": s.recorded_ms,
+                }))
+                .collect::<Vec<_>>());
+        }
+        Ok(out)
     })
 }
 
@@ -1079,6 +1102,10 @@ pub fn wipe(confirm: bool) -> Result<Value, BiteError> {
         // references the dead run.
         let _ = std::fs::remove_file(bite_core::config::data_dir().join("crawl-state.json"));
         let _ = std::fs::remove_file(bite_core::config::data_dir().join("crawl.pid"));
+        // Purge-scope tombstones go too: wipe is the COMPLETE reset, and a
+        // wiped-then-rebuilt index whose rows never come back (because an old
+        // tombstone still skips them) would look exactly like a broken crawl.
+        let _ = std::fs::remove_file(purge_scopes_path());
         Ok(json!({ "wiped": true }))
     })
 }
@@ -1096,16 +1123,65 @@ fn forget_filter(app: Option<&str>, container: Option<&str>) -> String {
     parts.join(" AND ")
 }
 
+// ── purge-scope tombstones ──────────────────────────────────────────────────
+
+/// Recorded `index_forget` scopes. Consulted at every ingest so rows inside
+/// a purged scope are skipped instead of re-imported by the next full crawl.
+fn purge_scopes_path() -> std::path::PathBuf {
+    bite_core::config::data_dir().join("purge-scopes.json")
+}
+
+/// Read the recorded scopes. Missing file = none recorded. A corrupt file is
+/// treated as none recorded (with a loud stderr line) rather than wedging
+/// every ingest — the store's purge already happened; only the skip-list is
+/// degraded, and `index_forget` re-records it on the next purge.
+fn read_purge_scopes(path: &std::path::Path) -> Vec<bite_index::PurgeScope> {
+    match std::fs::read_to_string(path) {
+        Ok(raw) => serde_json::from_str(&raw).unwrap_or_else(|e| {
+            eprintln!("bite: purge-scopes.json unreadable ({e}) — treating as no scopes recorded");
+            Vec::new()
+        }),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// Append a scope to the tombstone set (deduped on app+container; re-forgetting
+/// a scope never duplicates). 0600 via write_private: the file names
+/// mailboxes/calendars the user deliberately purged — metadata worth keeping
+/// private. `index_wipe` deletes the file (complete reset, tombstones too).
+fn record_purge_scope(
+    path: &std::path::Path,
+    app: Option<&str>,
+    container: Option<&str>,
+) -> std::io::Result<()> {
+    let mut scopes = read_purge_scopes(path);
+    if scopes.iter().any(|s| s.same_scope(app, container)) {
+        return Ok(());
+    }
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .ok();
+    scopes.push(bite_index::PurgeScope {
+        app: app.map(str::to_owned),
+        container: container.map(str::to_owned),
+        recorded_ms: now_ms,
+    });
+    let bytes = serde_json::to_vec_pretty(&scopes)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    bite_core::fsops::write_private(path, &bytes)
+}
+
 /// Scoped purge of index rows (app and/or container) — the LOCAL copy only;
 /// Apple data is never touched. Full reset stays on `index_wipe` (which also
 /// clears the delta watermark): an unscoped forget is refused so a bare
 /// `confirm:true` can't nuke the index without the wipe-shaped response.
 ///
-/// Reset semantics, not retention: the delta watermark survives a scoped
-/// forget, so a delta crawl does NOT resurrect purged rows — but any full
-/// crawl (`index_rebuild full:true`, `index_wipe` + rebuild, or the 365-day
-/// backfill schedule) re-imports them from Apple. Documented as such in the
-/// tool description and PRIVACY.md.
+/// The confirmed scope is RECORDED as a tombstone and every later ingest
+/// skips matching rows, so the purge is durable: a delta crawl, a
+/// `full:true` rebuild, the 365-day backfill and a wipe+re-crawl of a
+/// DIFFERENT index all leave the scope out. `index_wipe` clears the
+/// tombstone set too — it stays the one true complete reset.
 pub fn forget(params: &Value) -> Result<Value, BiteError> {
     // Empty strings count as absent: a JSON `"app": ""` must be refused like
     // a missing one, not become a filter matching nothing-but-still-scanned.
@@ -1174,11 +1250,23 @@ pub fn forget(params: &Value) -> Result<Value, BiteError> {
         index
             .refresh_fts()
             .map_err(|e| BridgeError::new("index_error", e.to_string()))?;
-        Ok(json!({
+        // Record the scope so the purge SURVIVES later full crawls (they
+        // would otherwise re-import the same rows from Apple). Failure is
+        // surfaced, not swallowed: an unrecorded purge is silently undone by
+        // the next `full:true` rebuild — the caller must know that happened.
+        let purge_recorded =
+            record_purge_scope(&purge_scopes_path(), app.as_deref(), container.as_deref()).is_ok();
+        let mut out = json!({
             "deleted": n,
             "scope": scope,
-            "note": "local index only — Apple data untouched; a full re-crawl re-imports these rows (reset, not retention)",
-        }))
+            "note": "local index only — Apple data untouched; the scope is recorded and future crawls skip it (index_wipe clears the record)",
+        });
+        if !purge_recorded {
+            out["warning"] = json!(
+                "could not persist the purge scope — a full re-crawl will re-import these rows"
+            );
+        }
+        Ok(out)
     })
 }
 
@@ -1481,6 +1569,36 @@ mod tests {
         // a scope of empty strings is as good as no scope — refuse too
         let out = forget(&json!({ "app": "", "container": "" })).unwrap();
         assert!(out.get("error").is_some());
+    }
+
+    #[test]
+    fn purge_scope_tombstones_roundtrip_dedupe_and_survive_corruption() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("purge-scopes.json");
+        // no file → no scopes (fresh install)
+        assert!(read_purge_scopes(&path).is_empty());
+        // record two scopes; re-forgetting the first must not duplicate
+        record_purge_scope(&path, Some("mail"), Some("Junk")).unwrap();
+        record_purge_scope(&path, None, Some("Spam")).unwrap();
+        record_purge_scope(&path, Some("mail"), Some("Junk")).unwrap();
+        let scopes = read_purge_scopes(&path);
+        assert_eq!(scopes.len(), 2, "dedup on (app, container)");
+        assert!(scopes[0].same_scope(Some("mail"), Some("Junk")));
+        assert!(scopes[1].same_scope(None, Some("Spam")));
+        assert!(scopes[0].recorded_ms.is_some(), "operator context kept");
+        // the file is privacy metadata (names purged mailboxes) → 0600
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "tombstone file must be 0600");
+        }
+        // a corrupt file degrades to "no scopes" instead of wedging ingest
+        std::fs::write(&path, b"{not json").unwrap();
+        assert!(read_purge_scopes(&path).is_empty());
+        // and recording again over the corrupt file heals it
+        record_purge_scope(&path, Some("mail"), Some("Junk")).unwrap();
+        assert_eq!(read_purge_scopes(&path).len(), 1);
     }
 
     #[test]
