@@ -10,6 +10,11 @@ use std::io;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
+/// Per-call temp-name counter: monotonic within the process, so uniqueness
+/// never depends on clock granularity (CI VM clocks hand identical nanos to
+/// concurrent calls — a timestamp-only temp name collided there).
+static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Create a directory (recursively) and force 0700 on every component we own.
 /// Never trust umask inheritance for private data.
 pub fn ensure_private_dir(path: &Path) -> io::Result<()> {
@@ -35,21 +40,22 @@ pub fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    // One temp file per call (pid + nanos): two concurrent writers to the
-    // same destination (e.g. two `bite config set` invocations) must never
-    // share a temp inode — interleaved write_alls would publish a mix of
-    // both payloads under the surviving rename, and the loser's rename can
-    // fail ENOENT after the winner already moved the shared temp away.
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0u128, |d| d.as_nanos());
+    // One temp file per call (pid + monotonic counter): two concurrent
+    // writers to the same destination (e.g. two `bite config set`
+    // invocations) must never share a temp inode — interleaved write_alls
+    // would publish a mix of both payloads under the surviving rename, and
+    // the loser's rename can fail ENOENT after the winner already moved the
+    // shared temp away. The counter (not the clock) provides uniqueness:
+    // timestamp-only names collided on CI VMs, whose coarse clocks hand
+    // identical nanos to back-to-back calls.
+    let seq = TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let pid = std::process::id();
     let name = path
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("file")
         .to_owned();
-    let tmp = path.with_file_name(format!("{name}.tmp-private-{nanos}-{pid}"));
+    let tmp = path.with_file_name(format!("{name}.tmp-private-{pid}-{seq}"));
     let write = || -> io::Result<()> {
         use std::io::Write as _;
         use std::os::unix::fs::OpenOptionsExt as _;
