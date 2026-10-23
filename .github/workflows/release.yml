@@ -38,6 +38,9 @@ jobs:
       - name: Changelog entry guard
         # A tag may only ship when CHANGELOG.md carries a matching
         # `## [vX.Y.Z]` section (see the convention at the top of the file).
+        # check_changelog.py additionally enforces that [Unreleased] has
+        # actually been folded into it — the v0.5.0 tag shipped while its
+        # hand-written entries still sat under [Unreleased].
         run: |
           set -euo pipefail
           tag="${GITHUB_REF_NAME#v}"
@@ -46,6 +49,7 @@ jobs:
             echo "Add the section (and move [Unreleased] items under it) before pushing the tag." >&2
             exit 1
           fi
+          python3 scripts/check_changelog.py --require-released "v${tag}"
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3

@@ -1,53 +1,13 @@
 # Changelog
 
-## v0.5.0 - 2026-10-22
-
-This release adds scoped, durable index purges (index_forget MCP tool and bite index forget CLI), an opt-in skip of the exact-total count scan, and safer helper-death replay semantics. It also enforces data-dir privacy at startup, resolves kill from absolute paths, dispatches requests concurrently, and updates dependencies including rustls-webpki for RUSTSEC-2026-0382.
-
-Bump: `minor` (product-facing feature commit found in commit history).
-Range: `v0.4.0` -> `v0.5.0`.
-
-### Commits
-- `8385e18` fix(mcp): never blind-replay mutating tools after a helper death
-- `e0d8cc6` Merge pull request #39 from Ktesio/feat/replay-safe-tools
-- `f2f9ac7` perf(index): opt-in skip of the exact-total count scan
-- `1fe8fbf` fix(bridge): split helper_exited_unsent so safe replays are not refused
-- `11176db` Merge pull request #40 from Ktesio/perf/skip-exact-count
-- `972b0e9` Merge pull request #41 from Ktesio/feat/unsent-replay-split
-- `2e248ea` feat(index): scoped purge of local index rows via index_forget
-- `fcb8bc5` perf(index): scope the global index mutex to the lazy open
-- `4bb5956` fix(index): hold the store writer lock across index_forget's delete
-- `3d6f1da` Merge pull request #44 from Ktesio/feat/index-purge
-- `13da74f` chore(deps): bump the lance-arrow-stack group with 3 updates (#42)
-- `30e8ba1` chore(deps): bump the cargo-lockfile-only group with 2 updates (#43)
-- `9435eee` Merge remote-tracking branch 'origin/main' into perf/index-lock-scope
-- `727cc02` security(index): resolve kill from absolute paths, fail safe when no probe runs
-- `d081a10` perf(index): scope the global index mutex to the lazy open (#45)
-- `51428e6` Merge pull request #46 from Ktesio/security/absolute-kill-path
-- `fcc7a5e` feat(index): declare the no_body param on index_rebuild and add the --no-body CLI flag
-- `eb31ac8` chore(deps): bump rustls-webpki to 0.103.16 for RUSTSEC-2026-0382
-- `dd3beb0` feat(cli): add 'bite index forget' subcommand for scoped purges
-- `6189a1e` chore(deps): bump rustls-webpki to 0.103.16 for RUSTSEC-2026-0382
-- `d247723` Merge pull request #47 from Ktesio/feat/index-rebuild-no-body
-- `38caacf` Merge remote-tracking branch 'origin/main' into feat/index-forget-cli
-- `f1220e6` Merge pull request #48 from Ktesio/feat/index-forget-cli
-- `be48caf` security(core): enforce data-dir privacy at every startup, cover batches/quarantine
-- `31dc858` perf(mcp): dispatch requests concurrently, narrow the bridge lock to spawn/clone
-- `5d9db52` Merge pull request #49 from Ktesio/security/data-dir-privacy-enforcement
-- `4a45aa8` Merge pull request #50 from Ktesio/perf/concurrent-request-dispatch
-- `92aa962` feat(index): make index_forget purges durable across re-crawls
-- `7d90504` test(docs): fence docs/protocol.md against tool-registry drift
-- `5676c7d` Merge pull request #51 from Ktesio/feat/durable-purge-scopes
-- `fffa1aa` Merge branch 'main' into docs/protocol-registry-fence
-- `5f2a8a0` Merge pull request #52 from Ktesio/docs/protocol-registry-fence
-
 All notable changes to this project are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 Version headings match release tags: `## [vX.Y.Z] - YYYY-MM-DD`. Pull-request
 numbers (`#N`) link to the change on GitHub. The release workflow enforces that
-a tag has a matching section here before it can ship.
+a tag has a matching section here — with [Unreleased] folded into it — before
+it can ship.
 
 ## [Unreleased]
 
@@ -63,41 +23,9 @@ a tag has a matching section here before it can ship.
   before the old post-hoc chmod), and cleans the temp up on a failed
   write or rename.
 
-### Changed
+## [v0.5.0] - 2026-10-22
 
-- The MCP server now dispatches each request on its own thread: a slow
-  helper round-trip (Apple Events can take the full per-call timeout) no
-  longer stalls unrelated traffic — pings, tools/list and other pipelined
-  requests are answered while a tool call is still in flight (JSON-RPC
-  responses correlate by id). The process-wide bridge handle became
-  interior-mutable for this: request threads hold `Arc` clones and the lock
-  is touched only for the (rare) spawn or clone, never across a
-  round-trip. Helper recycling after a crash/timeout is generation-safe
-  (`reset_if_same`): only the failed bridge generation is killed, so a
-  helper a sibling thread already respawned survives, and in-flight calls
-  on a killed generation surface as the ambiguous `helper_exited`. (#50)
-
-### Security
-
-- Data-dir privacy enforcement now runs at every CLI/MCP startup, not only
-  `bite setup` — a crawl-first lifecycle (the helper materializes
-  `~/Library/Application Support/bite` and `batches/` before setup ever
-  ran) left those directories listable at 0755 until a manual setup. The
-  enforcement pass itself now also tightens the `batches/` directory
-  (previously only its files), the `quarantine/` subdirectory and the
-  quarantined files inside it, and the `index.lance` store directory that
-  `doctor` already expected at 0700. Creation-time privacy closes the
-  mid-session gap for long-running servers: the Swift crawl worker creates
-  its directories with 0700 attributes up front, and the Rust ingest path
-  chmods a freshly created `quarantine/` at creation. (#49)
-- The crawl liveness probe (`pid_alive`) and the crawl-cancel signal now
-  resolve `kill` from absolute locations (`/bin/kill`, `/usr/bin/kill` —
-  first that executes) instead of PATH, closing the same plantable-binary
-  gap the `ps` probes were already hardened from; these were the last
-  bare-name spawns in production code. When no kill binary can be executed
-  at all the liveness probe now fails safe (crawler assumed alive) instead
-  of treating it as dead — the old mapping deleted a live crawler's
-  pidfile and double-spawned a second crawl against Mail. (#46)
+This release adds scoped, durable index purges (index_forget MCP tool and bite index forget CLI), an opt-in skip of the exact-total count scan, and safer helper-death replay semantics. It also enforces data-dir privacy at startup, resolves kill from absolute paths, dispatches requests concurrently, and updates dependencies including rustls-webpki for RUSTSEC-2026-0382.
 
 ### Added
 
@@ -135,9 +63,21 @@ a tag has a matching section here before it can ship.
   by MCP name in the index sections. The method table was previously
   hand-maintained with nothing machine-checking it; the 38-vs-45 as-built
   drift was caught by eye. A registry addition or removal that skips the
-  docs now reds CI instead of drifting.
+  docs now reds CI instead of drifting. (#52)
 
 ### Changed
+
+- The MCP server now dispatches each request on its own thread: a slow
+  helper round-trip (Apple Events can take the full per-call timeout) no
+  longer stalls unrelated traffic — pings, tools/list and other pipelined
+  requests are answered while a tool call is still in flight (JSON-RPC
+  responses correlate by id). The process-wide bridge handle became
+  interior-mutable for this: request threads hold `Arc` clones and the lock
+  is touched only for the (rare) spawn or clone, never across a
+  round-trip. Helper recycling after a crash/timeout is generation-safe
+  (`reset_if_same`): only the failed bridge generation is killed, so a
+  helper a sibling thread already respawned survives, and in-flight calls
+  on a killed generation surface as the ambiguous `helper_exited`. (#50)
 
 - `with_index` no longer holds the process-wide index mutex across
   opportunistic ingest and the post-crawl FTS refresh: the mutex now guards
@@ -149,6 +89,26 @@ a tag has a matching section here before it can ship.
   unchanged for callers; only the queueing is gone. (#45)
 
 ### Security
+
+- Data-dir privacy enforcement now runs at every CLI/MCP startup, not only
+  `bite setup` — a crawl-first lifecycle (the helper materializes
+  `~/Library/Application Support/bite` and `batches/` before setup ever
+  ran) left those directories listable at 0755 until a manual setup. The
+  enforcement pass itself now also tightens the `batches/` directory
+  (previously only its files), the `quarantine/` subdirectory and the
+  quarantined files inside it, and the `index.lance` store directory that
+  `doctor` already expected at 0700. Creation-time privacy closes the
+  mid-session gap for long-running servers: the Swift crawl worker creates
+  its directories with 0700 attributes up front, and the Rust ingest path
+  chmods a freshly created `quarantine/` at creation. (#49)
+- The crawl liveness probe (`pid_alive`) and the crawl-cancel signal now
+  resolve `kill` from absolute locations (`/bin/kill`, `/usr/bin/kill` —
+  first that executes) instead of PATH, closing the same plantable-binary
+  gap the `ps` probes were already hardened from; these were the last
+  bare-name spawns in production code. When no kill binary can be executed
+  at all the liveness probe now fails safe (crawler assumed alive) instead
+  of treating it as dead — the old mapping deleted a live crawler's
+  pidfile and double-spawned a second crawl against Mail. (#46)
 
 - Helper-death retries no longer blind-replay mutating tools: when the native
   helper exits mid-call, read-only/idempotent tools are transparently retried
@@ -175,7 +135,7 @@ a tag has a matching section here before it can ship.
   `None` matches any), `index_status` lists the recorded scopes, ingest
   responses report `skipped_purged` when rows were dropped, and
   `index_wipe` remains the complete reset — it clears the tombstones too,
-  so a wiped-and-rebuilt index starts clean.
+  so a wiped-and-rebuilt index starts clean. (#51)
 
 ## [v0.4.0] - 2026-10-18
 
