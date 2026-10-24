@@ -39,7 +39,70 @@ needs **Full Disk Access** for the terminal/agent app. Without FDA,
   denied.
 - `bite doctor --json` prints the same report as one compact JSON object
   (helper, per-app raw states, storage, clients) for scripts and CI; the
-  exit code (0 clean / 2 problems) is identical to the human form.
+  exit code (0 clean / 2 problems) is identical to the human form. The full
+  key-by-key shape is pinned in [`bite doctor --json` shape](#bite-doctor---json-shape)
+  below.
+
+## `bite doctor --json` shape
+
+Every key is always present — sections that don't apply serialize as `null`
+or `[]` (`apps` is empty when the helper is down, because nothing was
+probed; `dev_target` is `null` for installed copies). The skeleton, exactly
+as emitted:
+
+```json
+{
+  "os": "macOS 15 (major 15)",
+  "toolchain": "/usr/bin/swiftc",
+  "helper": {
+    "ok": true,
+    "path": "/x/bite/bin/bite-helper",
+    "capabilities": ["calendar", "mail"],
+    "error": null
+  },
+  "apps": [
+    { "app": "calendar", "state": "authorized", "ok": true, "note": null }
+  ],
+  "crawler_mail": { "state": "denied", "detail": "not authorized" },
+  "storage": {
+    "data_dir": "/x/bite",
+    "total_bytes": 4096,
+    "index_bytes": 2048,
+    "bin_bytes": 1024,
+    "batches_bytes": 512,
+    "batches_pending": 1,
+    "batches_quarantined": 2,
+    "scratch_removed_count": 1,
+    "scratch_removed_bytes": 700,
+    "scratch_in_progress": 0,
+    "scratch_pending_install_count": 0,
+    "scratch_pending_install_bytes": 0,
+    "tmpdir_bite_entries": 3,
+    "tmpdir_swept_count": 2,
+    "tmpdir_swept_bytes": 900
+  },
+  "dev_target": { "root": "/ws", "target_bytes": 3221225472 },
+  "clients": [
+    { "key": "claude", "display": "Claude Code", "detected": true, "installed": true }
+  ],
+  "problems": 1
+}
+```
+
+| Key | Meaning |
+|-----|---------|
+| `os` | `sw_vers` detail, e.g. `macOS 15 (major 15)`; `null` when not macOS 13+ |
+| `toolchain` | `swiftc` path; `null` = no Swift toolchain (informational — only source-compile installs need it) |
+| `helper` | bridge state: `ok`, installed `path`, `capabilities[]`, rendered `error` when the helper is missing/broken |
+| `apps[]` | per-app TCC probe: `app`, raw `state`, workable `ok`, optional human `note`; empty when the helper is down — check `helper.ok` before reading meaning into it |
+| `crawler_mail` | crawl-worker Mail probe: `state` (`authorized` \| `no_accounts` \| `denied` \| `failed`) + raw `detail`; `null` when `bite-crawl` isn't installed |
+| `storage` | data-dir usage in raw bytes (scripts do their own units): `index`/`bin`/`batches_*` sizes and counts, scratch-sweep results, `$TMPDIR` litter counts |
+| `dev_target` | `null` for installed copies; build-tree `root` + `target_bytes` when the exe runs out of a cargo `target/` |
+| `clients[]` | per-client integration state: `key`, `display`, `detected` (binary or config found), `installed` (MCP server entry written) |
+| `problems` | failed-check count — the human `N issue(s) found` line and the exit code (0 clean / 2 problems) |
+
+The skeleton above is pinned by a test: a report field added, renamed, or
+dropped without updating this page (or the other way around) fails CI.
 
 ## Recovery flows
 

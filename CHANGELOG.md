@@ -13,6 +13,12 @@ it can ship.
 
 ### Added
 
+- `bite doctor --json` key reference: docs/permissions.md now documents the
+  report's full skeleton (every top-level and nested key, with meanings),
+  pinned by a test that serializes the sample report and fails when the
+  documented keys and the emitted JSON drift in either direction — a new
+  check field can no longer ship without the documentation noticing.
+
 - `scripts/check_changelog.py --fold vX.Y.Z [--date YYYY-MM-DD]`: release
   prep no longer hand-assembles the released section. The v0.5.0 prep
   commit prepended a non-conforming block (unbracketed heading, process
