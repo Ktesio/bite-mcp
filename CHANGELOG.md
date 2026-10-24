@@ -32,6 +32,14 @@ it can ship.
   before the old post-hoc chmod), and cleans the temp up on a failed
   write or rename.
 
+### Security
+
+- CI now declares a workflow-level `permissions: contents: read` block in
+  ci.yml. Every job there is read-only (checkout, builds, checks), so the
+  workflow no longer inherits the repo-default token scope — the same
+  least-privilege shape release.yml already carries for its write needs.
+  Closes the `missing-workflow-permissions` code-scanning alerts.
+
 ## [v0.5.0] - 2026-10-22
 
 This release adds scoped, durable index purges (index_forget MCP tool and bite index forget CLI), an opt-in skip of the exact-total count scan, and safer helper-death replay semantics. It also enforces data-dir privacy at startup, resolves kill from absolute paths, dispatches requests concurrently, and updates dependencies including rustls-webpki for RUSTSEC-2026-0382.
