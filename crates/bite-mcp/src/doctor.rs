@@ -1112,6 +1112,67 @@ mod tests {
         assert!(!text.contains("cargo target"), "got: {text}");
     }
 
+    /// docs/permissions.md must carry the full `--json` skeleton, and the
+    /// skeleton must match what serde actually emits — key-for-key at every
+    /// nesting level, in both directions: a report field added or renamed
+    /// without a doc update reds CI, and a documented key the report no
+    /// longer emits reds CI too. Scalar values in the doc are illustrative;
+    /// only the key sets are pinned.
+    #[test]
+    fn json_shape_is_documented_and_in_sync() {
+        let doc = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/permissions.md"),
+        )
+        .expect("read docs/permissions.md");
+        let section = doc
+            .split("\n## ")
+            .find(|s| s.starts_with("`bite doctor --json` shape"))
+            .expect("docs/permissions.md must keep a `## `bite doctor --json` shape` section");
+        let fenced = section
+            .split("```")
+            .nth(1)
+            .expect("the shape section must open with a fenced ```json skeleton");
+        let fenced = fenced.strip_prefix("json").unwrap_or(fenced).trim();
+        let documented = serde_json::from_str::<serde_json::Value>(fenced)
+            .expect("the documented skeleton must be valid JSON");
+        let live = serde_json::to_value(sample_report()).unwrap();
+
+        fn assert_same_keys(path: &str, doc: &serde_json::Value, live: &serde_json::Value) {
+            let (Some(doc_obj), Some(live_obj)) = (doc.as_object(), live.as_object()) else {
+                assert!(
+                    doc.as_object().is_none(),
+                    "{path}: documented as an object but serialization emits {live:?} \
+                     — update docs/permissions.md"
+                );
+                return;
+            };
+            let mut doc_keys: Vec<&String> = doc_obj.keys().collect();
+            let mut live_keys: Vec<&String> = live_obj.keys().collect();
+            doc_keys.sort();
+            live_keys.sort();
+            assert_eq!(
+                doc_keys, live_keys,
+                "docs/permissions.md `--json` skeleton and the serialized report disagree \
+                 at `{path}` — documented {doc_keys:?} vs emitted {live_keys:?} (update \
+                 both sides together)"
+            );
+            for (key, doc_val) in doc_obj {
+                let live_val = &live_obj[key];
+                let child = format!("{path}.{key}");
+                match (doc_val, live_val) {
+                    (serde_json::Value::Array(d), serde_json::Value::Array(l)) => {
+                        if let (Some(first), Some(live_first)) = (d.first(), l.first()) {
+                            assert_same_keys(&child, first, live_first);
+                        }
+                    }
+                    _ => assert_same_keys(&child, doc_val, live_val),
+                }
+            }
+        }
+
+        assert_same_keys("report", &documented, &live);
+    }
+
     #[test]
     fn dev_target_matches_only_real_workspace_checkouts() {
         // …/ws/target/debug/bite — a real dev checkout: detected + sized.
