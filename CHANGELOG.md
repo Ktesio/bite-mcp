@@ -11,6 +11,20 @@ it can ship.
 
 ## [Unreleased]
 
+### Added
+
+- `scripts/check_changelog.py --fold vX.Y.Z [--date YYYY-MM-DD]`: release
+  prep no longer hand-assembles the released section. The v0.5.0 prep
+  commit prepended a non-conforming block (unbracketed heading, process
+  artifacts) while the hand-written entries stayed under [Unreleased];
+  the fold now builds the `## [vX.Y.Z] - YYYY-MM-DD` section by
+  construction — [Unreleased]'s entries move into it verbatim,
+  [Unreleased] resets to empty — and refuses to write when the current
+  file does not conform, when [Unreleased] is empty, when the version
+  already has a section or is not the newest, or when the rewritten file
+  fails the conformance check (the original file is left untouched in
+  every refusal case).
+
 ### Fixed
 
 - `write_private` fsyncs the file's bytes but never the parent directory,
