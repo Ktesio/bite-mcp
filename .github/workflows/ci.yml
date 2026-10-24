@@ -61,6 +61,19 @@ jobs:
       - name: Check licenses, dependency bans and sources (cargo-deny)
         run: cargo +stable deny --workspace check bans licenses sources
 
+  changelog:
+    # Changelog conformance fence: CHANGELOG.md section shape, heading form
+    # and the [Unreleased]-vs-released reference rule, so release prep
+    # cannot leave shipped entries behind (the v0.5.0 tag shipped while its
+    # entries still sat under [Unreleased]).
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Check CHANGELOG.md conventions
+        run: python3 scripts/check_changelog.py
+
   msrv:
     runs-on: ubuntu-latest
     steps:
