@@ -81,6 +81,13 @@ jobs:
       - name: Check CHANGELOG.md conventions
         run: python3 scripts/check_changelog.py
 
+      - name: Changelog fence self-test
+        # The fence itself is fenced: exercise every refusal rule (and the
+        # --fold release-prep mode, when present) in the true CLI shape
+        # against tampered fixtures, so a loosened regex cannot pass
+        # silently. Fold cases self-skip on trees without the mode.
+        run: python3 tests/test_check_changelog.py
+
   msrv:
     runs-on: ubuntu-latest
     steps:
