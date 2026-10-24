@@ -79,6 +79,20 @@ pub fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
         let _ = std::fs::remove_file(&tmp);
         return Err(e);
     }
+    // Crash-durability: fsync the parent directory so the rename itself
+    // reaches the disk. The temp file's content was synced above, but on
+    // crash-consistent-but-not-durable filesystems (APFS included) an
+    // unsynced directory entry can lose the rename on power loss — the
+    // destination reverts to its previous content (or vanishes) even though
+    // the new bytes were written. Best-effort by design, matching the
+    // content sync: opening a directory as a file fails on Windows (where
+    // NTFS journals rename metadata), so `.ok()` degrades to a no-op there
+    // instead of failing every write.
+    if let Some(parent) = path.parent() {
+        if let Ok(dir) = std::fs::File::open(parent) {
+            dir.sync_all().ok();
+        }
+    }
     Ok(())
 }
 

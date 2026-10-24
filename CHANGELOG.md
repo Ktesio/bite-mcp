@@ -13,6 +13,15 @@ it can ship.
 
 ### Fixed
 
+- `write_private` fsyncs the file's bytes but never the parent directory,
+  so the rename itself was not crash-durable: on power loss an unsynced
+  directory entry can lose the rename and revert `config.toml` (or the
+  helper install meta) to its previous content — or drop the file — even
+  though the new bytes were written and synced. The parent directory is
+  now fsynced after the rename (best-effort, like the content sync; a
+  no-op on Windows, where opening a directory as a file fails and NTFS
+  journals rename metadata).
+
 - `write_private` (the 0600 writer behind `config.toml` and the helper
   install meta) used one fixed temp name, so two concurrent writers to the
   same destination — e.g. two `bite config set` invocations — interleaved
