@@ -21,9 +21,18 @@ Default mode (CI, every push/PR):
 plus the `[vX.Y.Z]` section exists and [Unreleased] carries no entries (no
 `### ` subsection, no `(#N)` reference) — a tag may only ship once
 [Unreleased] has been folded into the version section.
+
+--fold vX.Y.Z [--date YYYY-MM-DD] (release prep helper): rewrite the file so
+[Unreleased]'s entries become a new `## [vX.Y.Z] - YYYY-MM-DD` section and
+[Unreleased] is left empty. Prep is conforming by construction — the fold is
+refused (file untouched) when the current file does not conform, when
+[Unreleased] carries no entries, when that version already has a section or
+is not newer than every existing one, or when the rewritten file fails the
+conformance check above.
 """
 from __future__ import annotations
 
+import datetime
 import re
 import sys
 from pathlib import Path
@@ -106,9 +115,81 @@ def check(path: Path, require_released: str | None) -> None:
           + (f", [{require_released}] release-guard clean" if require_released else ""))
 
 
+def fold(path: Path, version: str, date: str) -> None:
+    """Fold [Unreleased] entries into a new `## [vX.Y.Z] - date` section.
+
+    The v0.5.0 miss came from hand-assembling the released section: the
+    prep commit prepended a non-conforming block and left the hand-written
+    entries behind under [Unreleased]. Building the section here makes it
+    conforming by construction, and the rewritten file is re-checked before
+    the write is kept — non-conforming output is refused, file untouched.
+    """
+    v = version.lstrip("v")
+    if not re.fullmatch(r"\d+\.\d+\.\d+", v):
+        fail(f"--fold needs a plain vX.Y.Z version, got {version!r}")
+    try:
+        datetime.date.fromisoformat(date)
+    except ValueError:
+        fail(f"--date needs an ISO YYYY-MM-DD date, got {date!r}")
+
+    # Folding must operate on an already-conforming file: laundering a
+    # broken one through --fold would hide the breakage the check exists
+    # to surface.
+    check(path, None)
+    sections = parse(path)
+
+    new_v = tuple(int(p) for p in v.split("."))
+    for name, _ in sections[1:]:
+        m = VERSION_HEADING.match(name)
+        if not m:  # unreachable after the check() above — keeps readers honest
+            fail(f"heading `## {name}` is not in the documented form")
+        existing = tuple(int(g) for g in m.groups()[:3])
+        if new_v == existing:
+            fail(f"[v{v}] already has a section — a version ships once")
+        if new_v < existing:
+            fail(f"[v{v}] is not newer than existing `## {name}` — "
+                 "version sections run newest-first")
+
+    body = sections[0][1]
+    if not body.strip():
+        fail("[Unreleased] carries no entries — nothing to fold")
+
+    preamble: list[str] = []
+    for line in path.read_text().splitlines():
+        if line.startswith("## "):
+            break
+        preamble.append(line)
+
+    out = ["\n".join(preamble).rstrip(), ""]
+    out.append("## [Unreleased]")
+    out.append("")
+    out.append(f"## [v{v}] - {date}")
+    out.append("")
+    out.append(body.strip())
+    for name, sbody in sections[1:]:
+        out.append("")
+        out.append(f"## {name}")
+        out.append("")
+        out.append(sbody.strip())
+    new_text = "\n".join(out) + "\n"
+
+    original = path.read_text()
+    path.write_text(new_text)
+    try:
+        check(path, None)
+    except SystemExit:
+        path.write_text(original)
+        fail("fold refused: rewritten file would not conform (file unchanged)")
+    print(f"folded [Unreleased] ({body.count('### ')} subsection(s), "
+          f"{len(REF.findall(body))} PR ref(s)) into `## [v{v}] - {date}`; "
+          "[Unreleased] reset to empty")
+
+
 def main() -> None:
     args = sys.argv[1:]
     require_released = None
+    fold_version = None
+    fold_date = datetime.date.today().isoformat()
     paths: list[str] = []
     it = iter(args)
     for arg in it:
@@ -116,10 +197,23 @@ def main() -> None:
             require_released = next(it, None)
             if not require_released:
                 fail("--require-released needs a vX.Y.Z argument")
+        elif arg == "--fold":
+            fold_version = next(it, None)
+            if not fold_version:
+                fail("--fold needs a vX.Y.Z argument")
+        elif arg == "--date":
+            fold_date = next(it, None)
+            if not fold_date:
+                fail("--date needs a YYYY-MM-DD argument")
         else:
             paths.append(arg)
+    if fold_version and require_released:
+        fail("--fold and --require-released are mutually exclusive")
     path = Path(paths[0]) if paths else Path("CHANGELOG.md")
-    check(path, require_released)
+    if fold_version:
+        fold(path, fold_version, fold_date)
+    else:
+        check(path, require_released)
 
 
 if __name__ == "__main__":
