@@ -27,6 +27,13 @@ it can ship.
 
 ### Fixed
 
+- `.gitignore` had no entry for Python bytecode directories while the repo
+  now ships Python that CI and contributors execute (`scripts/check_changelog.py`,
+  and `tests/test_check_changelog.py` from the self-test battery): importing
+  the checker as a module materializes `scripts/__pycache__/`, which sat
+  untracked in the working tree — one `git add -A` away from riding a branch.
+  A bare `__pycache__/` pattern now ignores it at any depth.
+
 - `write_private` fsyncs the file's bytes but never the parent directory,
   so the rename itself was not crash-durable: on power loss an unsynced
   directory entry can lose the rename and revert `config.toml` (or the
