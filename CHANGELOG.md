@@ -54,6 +54,19 @@ it can ship.
   least-privilege shape release.yml already carries for its write needs.
   Closes the `missing-workflow-permissions` code-scanning alerts.
 
+- The vendored BMAD setup scripts' semver pattern (both byte-identical
+  copies of setup.py, under `_bmad/scripts/` and
+  `.agents/skills/bmad/scripts/`) used the official semver.org
+  prerelease shape — nested quantifiers that let a crafted version
+  string drive exponential backtracking (`py/redos`, HIGH, open on the
+  Security tab since 2026-09-30). The prerelease group is now a plain
+  `[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*` with no nested ambiguity, and the
+  one constraint that shape drops — leading zeros in purely numeric
+  prerelease identifiers (`1.2.3-01`) — is re-enforced by a post-match
+  check in `parse_orderable_semver`, keeping accept/reject behavior
+  identical. Closes both open `py/redos` alerts on the default-branch
+  analysis re-run.
+
 ## [v0.5.0] - 2026-10-22
 
 This release adds scoped, durable index purges (index_forget MCP tool and bite index forget CLI), an opt-in skip of the exact-total count scan, and safer helper-death replay semantics. It also enforces data-dir privacy at startup, resolves kill from absolute paths, dispatches requests concurrently, and updates dependencies including rustls-webpki for RUSTSEC-2026-0382.
