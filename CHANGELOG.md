@@ -13,6 +13,13 @@ it can ship.
 
 ### Added
 
+- `docs/configuration.md`: a configuration reference — all five
+  `config.toml` keys (types, defaults, effects), the `BITE_TIMEOUT_SECS`
+  and `BITE_HELPER_BIN` environment hooks, and layer precedence — pinned
+  by a docs↔`Config` conformance test that serializes a populated config
+  and asserts doc-rows == serde-keys in both directions. None of these
+  keys or hooks were documented anywhere before.
+
 - `scripts/check_changelog.py --fold vX.Y.Z [--date YYYY-MM-DD]`: release
   prep no longer hand-assembles the released section. The v0.5.0 prep
   commit prepended a non-conforming block (unbracketed heading, process
