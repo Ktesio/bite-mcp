@@ -13,6 +13,14 @@ it can ship.
 
 ### Added
 
+- `mail_send` accepts an optional client-supplied `idempotency_key`: the
+  server records the first attempt's outcome against the key and a repeated
+  call with the same key replays the recorded outcome instead of dispatching
+  a second send. An attempt that failed ambiguously (helper died mid-call,
+  or the call timed out) pins the key — repeats are refused with
+  `idempotency_unknown` rather than risking a double send. The key is
+  consumed by the Rust control plane and never forwarded to the helper.
+
 - `scripts/check_changelog.py --fold vX.Y.Z [--date YYYY-MM-DD]`: release
   prep no longer hand-assembles the released section. The v0.5.0 prep
   commit prepended a non-conforming block (unbracketed heading, process

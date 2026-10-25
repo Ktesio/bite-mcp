@@ -92,6 +92,19 @@ notes: `folders` · `search {text?, folder?, limit?}` · `get {id}` (HTML + mark
 messages: `send {to, text}` (recipient must exist in Messages) ·
 `chats_recent {limit?}` · `history {chat_id, limit?}` (source: `messages_app` or `chat.db`)
 
+Server-plane note — MCP `mail_send` additionally accepts an optional
+`idempotency_key` string. It is consumed by the Rust control plane (stripped
+before the bridge; the helper contract above is unchanged): the first
+attempt's outcome is recorded against the key for the server process's
+lifetime, and a repeated call with the same key replays that recorded
+outcome verbatim instead of dispatching a second send. If the recorded
+attempt failed ambiguously — the helper died mid-call or the call timed out
+(it may or may not have been sent) — the key is pinned as unknown and
+repeated calls are refused with `idempotency_unknown` instead of risking a
+double send: confirm the original outcome, then use a fresh key. Clean
+failures and provably-unsent calls do not pin the key. At most 128 keys are
+retained (oldest evicted).
+
 ## Result shapes (contract)
 
 Entity dicts are flat and snake_case. Canonical keys: event
