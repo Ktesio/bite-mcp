@@ -66,6 +66,15 @@ it can ship.
   check in `parse_orderable_semver`, keeping accept/reject behavior
   identical. Closes both open `py/redos` alerts on the default-branch
   analysis re-run.
+- Supply-chain advisory wave in the zstd stack (RUSTSEC-2026-0391,
+  -0398, -0403, -0410, all issued 2026-10-26): the lockfile now carries
+  zstd-sys 2.1.2, clearing -0410 (wasm32-only allocator shim). The other
+  three are suppressed in `.cargo/audit.toml` with the reachability
+  analysis inline: their patched versions (zstd ≥0.14.3, zstd-safe
+  ≥8.2.0) sit outside lance-encoding 13.0.0's `zstd ^0.13` pin while
+  lancedb 0.40.0 is the newest published lancedb, so no lockfile-only
+  move can reach them; the entries are to be removed once a lance
+  release can carry the fix (issue #62).
 
 ## [v0.5.0] - 2026-10-22
 
