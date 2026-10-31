@@ -13,6 +13,15 @@ it can ship.
 
 ### Added
 
+- Configuration reference: docs/configuration.md now documents every
+  config.toml key (`default_calendar`, `default_mail_account`,
+  `timeout_secs`, `release_repo`, `auto_refresh_hours`) with defaults, the
+  `bite config` verb's accepted keys, the `BITE_TIMEOUT_SECS`,
+  `BITE_HELPER_BIN` and `BITE_HELPER_BUILT` environment hooks, helper
+  binary resolution order, and env-over-file precedence — none of which
+  appeared anywhere in docs before. Notes two quirks found while writing
+  it: `auto_refresh_hours` is file-only (the `config set` verb rejects it)
+  and `release_repo` is currently write-only config (no code consumes it).
 - `bite doctor --json` key reference: docs/permissions.md now documents the
   report's full skeleton (every top-level and nested key, with meanings),
   pinned by a test that serializes the sample report and fails when the
