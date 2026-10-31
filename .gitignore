@@ -3,3 +3,4 @@ crates/bite-mcp/swift/.build
 .claude-plugin/*.zip
 *.mcpb
 .DS_Store
+__pycache__/
