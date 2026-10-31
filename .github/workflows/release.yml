@@ -16,7 +16,7 @@ permissions:
 
 jobs:
   release:
-    runs-on: macos-14
+    runs-on: macos-15
     steps:
       # Third-party actions are pinned to full commit SHAs (immutable) rather
       # than mutable tags: a hijacked tag would otherwise run attacker code in
