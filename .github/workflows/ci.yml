@@ -56,11 +56,16 @@ jobs:
       - name: Install Rust
         run: rustup toolchain install stable --profile minimal
 
+      # Both tools are pinned: an unpinned `cargo install` resolves the
+      # latest release on every run, so an upstream release could break the
+      # lane overnight or silently change advisory/deny verdicts between
+      # green runs. Bump the pins deliberately (with the release notes in
+      # hand), mirroring the mcp-inspector exact-pin precedent below.
       - name: Install cargo-audit
-        run: cargo +stable install cargo-audit --locked
+        run: cargo +stable install cargo-audit --version 0.22.2 --locked
 
       - name: Install cargo-deny
-        run: cargo +stable install cargo-deny --locked
+        run: cargo +stable install cargo-deny --version 0.20.2 --locked
 
       - name: Scan the lockfile (RustSec advisories)
         run: cargo +stable audit
