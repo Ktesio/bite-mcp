@@ -67,6 +67,28 @@ it can ship.
   least-privilege shape release.yml already carries for its write needs.
   Closes the `missing-workflow-permissions` code-scanning alerts.
 
+- The vendored BMAD setup scripts' semver pattern (both byte-identical
+  copies of setup.py, under `_bmad/scripts/` and
+  `.agents/skills/bmad/scripts/`) used the official semver.org
+  prerelease shape — nested quantifiers that let a crafted version
+  string drive exponential backtracking (`py/redos`, HIGH, open on the
+  Security tab since 2026-09-30). The prerelease group is now a plain
+  `[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*` with no nested ambiguity, and the
+  one constraint that shape drops — leading zeros in purely numeric
+  prerelease identifiers (`1.2.3-01`) — is re-enforced by a post-match
+  check in `parse_orderable_semver`, keeping accept/reject behavior
+  identical. Closes both open `py/redos` alerts on the default-branch
+  analysis re-run.
+- Supply-chain advisory wave in the zstd stack (RUSTSEC-2026-0391,
+  -0398, -0403, -0410, all issued 2026-10-26): the lockfile now carries
+  zstd-sys 2.1.2, clearing -0410 (wasm32-only allocator shim). The other
+  three are suppressed in `.cargo/audit.toml` with the reachability
+  analysis inline: their patched versions (zstd ≥0.14.3, zstd-safe
+  ≥8.2.0) sit outside lance-encoding 13.0.0's `zstd ^0.13` pin while
+  lancedb 0.40.0 is the newest published lancedb, so no lockfile-only
+  move can reach them; the entries are to be removed once a lance
+  release can carry the fix (issue #62).
+
 ## [v0.5.0] - 2026-10-22
 
 This release adds scoped, durable index purges (index_forget MCP tool and bite index forget CLI), an opt-in skip of the exact-total count scan, and safer helper-death replay semantics. It also enforces data-dir privacy at startup, resolves kill from absolute paths, dispatches requests concurrently, and updates dependencies including rustls-webpki for RUSTSEC-2026-0382.

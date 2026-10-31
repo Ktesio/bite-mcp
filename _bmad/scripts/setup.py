@@ -54,8 +54,8 @@ SEMVER = re.compile(
     r"(?P<minor>0|[1-9][0-9]*)\."
     r"(?P<patch>0|[1-9][0-9]*)"
     r"(?:-(?P<prerelease>"
-    r"(?:0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)"
-    r"(?:\.(?:0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*))*"
+    r"[0-9A-Za-z-]+"
+    r"(?:\.[0-9A-Za-z-]+)*"
     r"))?"
     r"(?:\+(?P<build>[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?\Z"
 )
@@ -1897,6 +1897,13 @@ def parse_orderable_semver(
     if match is None or "-dev" in value.casefold():
         return None
     prerelease = match.group("prerelease")
+    if prerelease is not None:
+        # The prerelease pattern above accepts any dot-separated alphanumeric
+        # identifiers; semver additionally forbids leading zeros in purely
+        # numeric identifiers (`1.2.3-01` is invalid) — enforced here.
+        for segment in prerelease.split("."):
+            if segment.isdigit() and re.fullmatch(r"0|[1-9][0-9]*", segment) is None:
+                return None
     return (
         (
             int(match.group("major")),
