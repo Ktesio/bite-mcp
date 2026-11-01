@@ -75,7 +75,23 @@ it can ship.
   before the old post-hoc chmod), and cleans the temp up on a failed
   write or rename.
 
+- `bite --help` listed `calendar`, `reminders`, `mail`, `notes`, `contacts`,
+  `messages`, `index`, `search` and `mail-bulk` as bare names while the
+  other six verbs had descriptions. Each app verb now carries a one-line
+  `about`, so the command table reads complete. Help text only: no
+  behaviour, JSON or MCP output changes.
+
 ### Security
+
+- `messages_chats_recent` and `messages_history` now clamp a client-supplied
+  `limit` to 1..200 at the MCP boundary (the same guard the index search
+  path already carries via `MAX_SEARCH_LIMIT`). Previously the raw value
+  reached the Swift helper and landed directly in the chat.db query
+  (`LIMIT \(limit)`) and the AppleScript pagination loops, so a client
+  asking `limit=10_000_000` pinned the helper in a scan while holding the
+  bridge handle — every other tool call queued behind it. The registry
+  param docs and docs/protocol.md now state the cap; non-numeric or absent
+  limits keep their existing default handling.
 
 - CI now declares a workflow-level `permissions: contents: read` block in
   ci.yml. Every job there is read-only (checkout, builds, checks), so the

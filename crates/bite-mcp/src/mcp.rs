@@ -144,7 +144,8 @@ fn handle_request(state: &ServerState, method: &str, params: &Value) -> Result<V
         }
         "tools/call" => {
             let name = params.get("name").and_then(|n| n.as_str()).unwrap_or("");
-            let args = params.get("arguments").cloned().unwrap_or(json!({}));
+            let args =
+                clamp_messages_limit(name, params.get("arguments").cloned().unwrap_or(json!({})));
             if name == "mail_messages_search" {
                 // fast path: entity index (milliseconds, exact counts).
                 // When the index has no Mail rows yet, degrade to a SHORT
@@ -326,6 +327,29 @@ fn run_tool_idempotent(
     outcome
 }
 
+/// Upper bound for client-supplied `limit` values on the messages read
+/// tools. Chats and history rows travel as full JSON payloads through the
+/// single bridge handle, so an oversized ask pins the helper in a chat.db /
+/// Apple Events scan while every other tool call queues behind it — same
+/// class of guard as the index search cap (`index::MAX_SEARCH_LIMIT`).
+pub(crate) const MAX_MESSAGES_LIMIT: u64 = 200;
+
+/// Clamp `limit` on `messages_chats_recent` / `messages_history` at the MCP
+/// boundary: a u64 limit is clamped into `1..=MAX_MESSAGES_LIMIT`. Any other
+/// argument shape (absent, null, non-number) is passed through untouched —
+/// the helper keeps its existing default handling for those.
+fn clamp_messages_limit(name: &str, args: Value) -> Value {
+    if !matches!(name, "messages_chats_recent" | "messages_history") {
+        return args;
+    }
+    let Some(limit) = args.get("limit").and_then(|v| v.as_u64()) else {
+        return args;
+    };
+    let mut clamped = args;
+    clamped["limit"] = json!(limit.clamp(1, MAX_MESSAGES_LIMIT));
+    clamped
+}
+
 /// Run a tool through the bridge; if the helper exited, respawn once.
 /// The `Arc<Bridge>` clone is held across the round-trip (the bridge client
 /// multiplexes by request id); the handle's lock is touched only inside
@@ -437,4 +461,86 @@ fn prompt_text(name: &str) -> Option<(String, &'static str)> {
         .iter()
         .find(|(n, _, _)| *n == name)
         .map(|(_, description, text)| (text.to_string(), *description))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn messages_limit_clamps_client_supplied_values() {
+        for tool in ["messages_chats_recent", "messages_history"] {
+            assert_eq!(
+                clamp_messages_limit(tool, json!({ "limit": 50 })),
+                json!({ "limit": 50 }),
+                "{tool}: in-range limit untouched"
+            );
+            assert_eq!(
+                clamp_messages_limit(tool, json!({ "limit": 200 })),
+                json!({ "limit": 200 }),
+                "{tool}: boundary limit untouched"
+            );
+            assert_eq!(
+                clamp_messages_limit(tool, json!({ "limit": 10_000_000 })),
+                json!({ "limit": 200 }),
+                "{tool}: oversized limit clamped"
+            );
+            assert_eq!(
+                clamp_messages_limit(tool, json!({ "limit": u64::MAX })),
+                json!({ "limit": 200 }),
+                "{tool}: u64::MAX clamped"
+            );
+            assert_eq!(
+                clamp_messages_limit(tool, json!({ "limit": 0 })),
+                json!({ "limit": 1 }),
+                "{tool}: zero clamped to 1"
+            );
+        }
+    }
+
+    #[test]
+    fn messages_limit_leaves_other_shapes_and_tools_alone() {
+        // absent / null / non-number limits pass through untouched — the
+        // helper keeps its default handling for those
+        assert_eq!(
+            clamp_messages_limit("messages_history", json!({ "chat_id": "x" })),
+            json!({ "chat_id": "x" })
+        );
+        assert_eq!(
+            clamp_messages_limit("messages_chats_recent", json!({ "limit": null })),
+            json!({ "limit": null })
+        );
+        assert_eq!(
+            clamp_messages_limit("messages_chats_recent", json!({ "limit": "50" })),
+            json!({ "limit": "50" })
+        );
+        assert_eq!(
+            clamp_messages_limit("messages_chats_recent", json!({ "limit": -5 })),
+            json!({ "limit": -5 })
+        );
+        // other tools never see a rewrite
+        assert_eq!(
+            clamp_messages_limit("mail_messages_search", json!({ "limit": 10_000_000 })),
+            json!({ "limit": 10_000_000 })
+        );
+    }
+
+    #[test]
+    fn messages_limit_cap_matches_registry_docs() {
+        for tool in ["messages_chats_recent", "messages_history"] {
+            let spec = bite_core::registry::find(tool).expect("tool registered");
+            let limit_param = spec
+                .params
+                .iter()
+                .find(|p| p.name == "limit")
+                .expect("limit param");
+            assert!(
+                limit_param
+                    .desc
+                    .contains(&format!("capped at {MAX_MESSAGES_LIMIT}")),
+                "{tool} registry doc must mirror the boundary cap: {}",
+                limit_param.desc
+            );
+        }
+    }
 }

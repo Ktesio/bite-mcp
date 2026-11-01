@@ -90,7 +90,7 @@ notes: `folders` · `search {text?, folder?, limit?}` · `get {id}` (HTML + mark
 `delete {id, confirm?}`
 
 messages: `send {to, text}` (recipient must exist in Messages) ·
-`chats_recent {limit?}` · `history {chat_id, limit?}` (source: `messages_app` or `chat.db`)
+`chats_recent {limit?}` · `history {chat_id, limit?}` (source: `messages_app` or `chat.db`; client `limit` is clamped to 1..200 at the MCP boundary)
 
 Server-plane note — MCP `mail_send` additionally accepts an optional
 `idempotency_key` string. It is consumed by the Rust control plane (stripped
