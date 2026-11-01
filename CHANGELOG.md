@@ -22,6 +22,13 @@ it can ship.
   appeared anywhere in docs before. Notes two quirks found while writing
   it: `auto_refresh_hours` is file-only (the `config set` verb rejects it)
   and `release_repo` is currently write-only config (no code consumes it).
+- `mail_send` accepts an optional client-supplied `idempotency_key`: the
+  server records the first attempt's outcome against the key and a repeated
+  call with the same key replays the recorded outcome instead of dispatching
+  a second send. An attempt that failed ambiguously (helper died mid-call,
+  or the call timed out) pins the key — repeats are refused with
+  `idempotency_unknown` rather than risking a double send. The key is
+  consumed by the Rust control plane and never forwarded to the helper.
 - `bite doctor --json` key reference: docs/permissions.md now documents the
   report's full skeleton (every top-level and nested key, with meanings),
   pinned by a test that serializes the sample report and fails when the

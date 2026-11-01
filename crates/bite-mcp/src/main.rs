@@ -5,6 +5,7 @@ mod clients;
 mod dispatch;
 mod doctor;
 mod helper;
+mod idempotency;
 mod index;
 mod jobs;
 mod mcp;

@@ -9,6 +9,7 @@ use bite_core::{json_schema, ops, registry, BiteError};
 use serde_json::{json, Value};
 
 use crate::helper::BridgeHandle;
+use crate::idempotency;
 
 const SERVER_NAME: &str = "bite-mcp";
 const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -17,11 +18,15 @@ struct ServerState {
     /// Interior-mutable bridge holder: request threads fetch `Arc` clones
     /// and never hold a lock across a helper round-trip.
     handle: BridgeHandle,
+    /// Outcomes recorded against client-supplied `idempotency_key`s (see
+    /// `idempotency`); only the tools that declare the param consult it.
+    idempotency: std::sync::Mutex<idempotency::Idempotency>,
 }
 
 pub fn serve() -> i32 {
     let state = std::sync::Arc::new(ServerState {
         handle: BridgeHandle::new(),
+        idempotency: std::sync::Mutex::new(idempotency::Idempotency::default()),
     });
     let stdout = std::sync::Arc::new(std::io::stdout());
     let stdin = std::io::stdin();
@@ -208,7 +213,7 @@ fn handle_request(state: &ServerState, method: &str, params: &Value) -> Result<V
                 }));
             }
             let value =
-                run_tool_retrying(state, name, args).map_err(|e| err(-32000, e.render()))?;
+                run_tool_idempotent(state, name, args).map_err(|e| err(-32000, e.render()))?;
             let is_error = is_tool_error(&value);
             Ok(json!({
                 "content": [ { "type": "text", "text": serde_json::to_string_pretty(&value).unwrap_or_default() } ],
@@ -255,6 +260,71 @@ fn handle_request(state: &ServerState, method: &str, params: &Value) -> Result<V
         m if m.starts_with("notifications/") => Ok(json!({})),
         _ => Err(err(-32601, format!("method not found: {method}"))),
     }
+}
+
+/// `run_tool_retrying` wrapped with client-keyed idempotency for the tools
+/// that declare `idempotency_key` (`mail_send` today): a repeated call with
+/// the same key replays the recorded outcome instead of dispatching a
+/// second send, and a key whose attempt failed ambiguously is refused
+/// outright. The key is stripped from the forwarded arguments, so the
+/// helper never sees it. Tools without the param — and calls without a
+/// key — take exactly the `run_tool_retrying` path.
+fn run_tool_idempotent(
+    state: &ServerState,
+    name: &str,
+    mut args: Value,
+) -> Result<Value, BiteError> {
+    let keyed = registry::find(name)
+        .map(|tool| tool.params.iter().any(|p| p.name == idempotency::KEY_PARAM))
+        .unwrap_or(false);
+    if !keyed {
+        return run_tool_retrying(state, name, args);
+    }
+    let key = idempotency::take_key(&mut args).map_err(|message| {
+        let mut e = bite_bridge::BridgeError::new("invalid_params", message);
+        e.fix = Some("pass idempotency_key as a non-empty string (≤128 chars), or omit it".into());
+        BiteError(e)
+    })?;
+    let Some(key) = key else {
+        return run_tool_retrying(state, name, args);
+    };
+    if let Some(recorded) = state.idempotency.lock().unwrap().lookup(&key) {
+        return match recorded {
+            idempotency::Recorded::Done(value) => Ok(value.clone()),
+            idempotency::Recorded::Unknown(code) => {
+                let mut e = bite_bridge::BridgeError::new(
+                    "idempotency_unknown",
+                    format!(
+                        "an earlier {name} with this idempotency_key failed ambiguously \
+                         ({code}) — it may or may not have taken effect, so the repeat \
+                         call was refused instead of risking a second dispatch"
+                    ),
+                );
+                e.fix = Some(
+                    "confirm the original outcome first (search before re-sending), then \
+                     retry with a fresh idempotency_key if it truly did not go out"
+                        .into(),
+                );
+                Err(BiteError(e))
+            }
+        };
+    }
+    let outcome = run_tool_retrying(state, name, args);
+    match &outcome {
+        Ok(value) => state
+            .idempotency
+            .lock()
+            .unwrap()
+            .record(key, idempotency::Recorded::Done(value.clone())),
+        Err(e) if idempotency::ambiguous(e.code()) => state
+            .idempotency
+            .lock()
+            .unwrap()
+            .record(key, idempotency::Recorded::Unknown(e.code().to_string())),
+        // Clean failures provably did not send — the key stays free.
+        _ => {}
+    }
+    outcome
 }
 
 /// Upper bound for client-supplied `limit` values on the messages read
