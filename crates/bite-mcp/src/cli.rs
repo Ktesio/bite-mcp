@@ -62,41 +62,49 @@ pub enum Cmd {
     },
 
     // ── Calendar ──
+    /// List calendars, search, create, update and delete events, check free/busy
     Calendar {
         #[command(subcommand)]
         cmd: CalendarCmd,
     },
     // ── Reminders ──
+    /// List reminder lists, search, create, update/complete and delete reminders
     Reminders {
         #[command(subcommand)]
         cmd: RemindersCmd,
     },
     // ── Mail ──
+    /// Search, read, send, reply, forward, move, mark and delete mail
     Mail {
         #[command(subcommand)]
         cmd: MailCmd,
     },
     // ── Notes ──
+    /// List folders, search, create, update/append and delete notes
     Notes {
         #[command(subcommand)]
         cmd: NotesCmd,
     },
     // ── Contacts ──
+    /// Search, create, update and delete contacts, list groups
     Contacts {
         #[command(subcommand)]
         cmd: ContactsCmd,
     },
     // ── Messages ──
+    /// Send messages, list recent chats, read chat history
     Messages {
         #[command(subcommand)]
         cmd: MessagesCmd,
     },
     // ── Entity index ──
+    /// Local search index: rebuild, status, cancel, forget, wipe
     Index {
         #[command(subcommand)]
         cmd: IndexCmd,
     },
     // ── Unified cross-app search ──
+    /// Cross-app full-text search from the local index (no Apple Events)
     Search {
         query: String,
         #[arg(long)]
@@ -105,6 +113,7 @@ pub enum Cmd {
         limit: Option<i64>,
     },
     // ── Bulk Mail ops ──
+    /// Mark, move or delete mail in bulk by mailbox and filter (asks for --yes)
     MailBulk {
         #[command(subcommand)]
         cmd: MailBulkCmd,
@@ -584,4 +593,37 @@ pub enum MessagesCmd {
         #[arg(long)]
         limit: Option<i64>,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    /// `bite --help` is shown as an unedited product screen (ktesio.dev and
+    /// ktesio.com capture it), so a verb without a description is a visible
+    /// regression. Nested verbs are covered too, and clap's own consistency
+    /// checks run over the whole tree first.
+    #[test]
+    fn every_subcommand_has_an_about() {
+        let cmd = Cli::command();
+        cmd.clone().debug_assert();
+
+        fn collect_missing(cmd: &clap::Command, prefix: &str, missing: &mut Vec<String>) {
+            for sub in cmd.get_subcommands() {
+                let path = format!("{prefix}{}", sub.get_name());
+                if sub.get_about().is_none() {
+                    missing.push(path.clone());
+                }
+                collect_missing(sub, &format!("{path} "), missing);
+            }
+        }
+
+        let mut missing = Vec::new();
+        collect_missing(&cmd, "", &mut missing);
+        assert!(
+            missing.is_empty(),
+            "subcommands without an about (blank rows in `--help`): {missing:?}"
+        );
+    }
 }
