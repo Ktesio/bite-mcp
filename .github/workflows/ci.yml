@@ -14,7 +14,7 @@ permissions:
 
 jobs:
   rust:
-    runs-on: macos-14
+    runs-on: macos-15
     steps:
       # Third-party actions are pinned to full commit SHAs (immutable) rather
       # than mutable tags: a hijacked tag would otherwise run attacker code in
@@ -56,11 +56,16 @@ jobs:
       - name: Install Rust
         run: rustup toolchain install stable --profile minimal
 
+      # Both tools are pinned: an unpinned `cargo install` resolves the
+      # latest release on every run, so an upstream release could break the
+      # lane overnight or silently change advisory/deny verdicts between
+      # green runs. Bump the pins deliberately (with the release notes in
+      # hand), mirroring the mcp-inspector exact-pin precedent below.
       - name: Install cargo-audit
-        run: cargo +stable install cargo-audit --locked
+        run: cargo +stable install cargo-audit --version 0.22.2 --locked
 
       - name: Install cargo-deny
-        run: cargo +stable install cargo-deny --locked
+        run: cargo +stable install cargo-deny --version 0.20.2 --locked
 
       - name: Scan the lockfile (RustSec advisories)
         run: cargo +stable audit
@@ -80,6 +85,13 @@ jobs:
 
       - name: Check CHANGELOG.md conventions
         run: python3 scripts/check_changelog.py
+
+      - name: Changelog fence self-test
+        # The fence itself is fenced: exercise every refusal rule (and the
+        # --fold release-prep mode, when present) in the true CLI shape
+        # against tampered fixtures, so a loosened regex cannot pass
+        # silently. Fold cases self-skip on trees without the mode.
+        run: python3 tests/test_check_changelog.py
 
   msrv:
     runs-on: ubuntu-latest
@@ -101,7 +113,7 @@ jobs:
         run: cargo check --workspace --all-targets
 
   mcp-inspector:
-    runs-on: macos-14
+    runs-on: macos-15
     needs: rust
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

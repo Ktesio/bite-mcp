@@ -1,0 +1,29 @@
+# cargo-audit configuration for the `audit` CI lane (ci.yml runs
+# `cargo +stable audit` from this repo root and reads this file).
+#
+# RUSTSEC-2026-0391 / -0398 / -0403 are ignored because their patched
+# versions are unreachable from this dependency graph:
+#
+#   * zstd >= 0.14.3 (0391) — lance-encoding 13.0.0 requires
+#     `zstd = "^0.13"`; lancedb 0.40.0 is the newest published lancedb
+#     and arrow 58.4.0 the newest datafusion 54.1 accepts, so no
+#     lockfile move reaches the fixed line (verified 2026-10-26:
+#     `cargo update -p zstd --precise 0.14.3` fails on lance-encoding's
+#     requirement).
+#   * zstd-safe >= 8.2.0 (0398, 0403) — zstd 0.13.x pairs with
+#     zstd-safe ^7 only.
+#
+# Exposure: zstd enters the workspace only through the Lance/arrow IPC
+# compression of bite's OWN locally written index files; bite never
+# feeds attacker-controlled data to a zstd decoder (no seekable API, no
+# untrusted archives). RUSTSEC-2026-0410 (zstd-sys, wasm32-only) is NOT
+# ignored — the lockfile moved to zstd-sys 2.1.2 in the same change.
+#
+# REMOVE these entries once a lancedb/lance release allows
+# zstd >= 0.14.3 / zstd-safe >= 8.2.0 (tracked in issue #62).
+[advisories]
+ignore = [
+    "RUSTSEC-2026-0391",
+    "RUSTSEC-2026-0398",
+    "RUSTSEC-2026-0403",
+]
