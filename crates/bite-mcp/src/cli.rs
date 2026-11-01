@@ -62,41 +62,49 @@ pub enum Cmd {
     },
 
     // ── Calendar ──
+    /// List calendars, search, create, update and delete events, check free/busy
     Calendar {
         #[command(subcommand)]
         cmd: CalendarCmd,
     },
     // ── Reminders ──
+    /// List reminder lists, search, create, update/complete and delete reminders
     Reminders {
         #[command(subcommand)]
         cmd: RemindersCmd,
     },
     // ── Mail ──
+    /// Search, read, send, reply, forward, move, mark and delete mail
     Mail {
         #[command(subcommand)]
         cmd: MailCmd,
     },
     // ── Notes ──
+    /// List folders, search, create, update/append and delete notes
     Notes {
         #[command(subcommand)]
         cmd: NotesCmd,
     },
     // ── Contacts ──
+    /// Search, create, update and delete contacts, list groups
     Contacts {
         #[command(subcommand)]
         cmd: ContactsCmd,
     },
     // ── Messages ──
+    /// Send messages, list recent chats, read chat history
     Messages {
         #[command(subcommand)]
         cmd: MessagesCmd,
     },
     // ── Entity index ──
+    /// Local search index: rebuild, status, cancel, forget, wipe
     Index {
         #[command(subcommand)]
         cmd: IndexCmd,
     },
     // ── Unified cross-app search ──
+    /// Cross-app full-text search from the local index (no Apple Events)
     Search {
         query: String,
         #[arg(long)]
@@ -105,6 +113,7 @@ pub enum Cmd {
         limit: Option<i64>,
     },
     // ── Bulk Mail ops ──
+    /// Mark, move or delete mail in bulk by mailbox and filter (asks for --yes)
     MailBulk {
         #[command(subcommand)]
         cmd: MailBulkCmd,

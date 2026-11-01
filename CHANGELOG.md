@@ -68,6 +68,12 @@ it can ship.
   before the old post-hoc chmod), and cleans the temp up on a failed
   write or rename.
 
+- `bite --help` listed `calendar`, `reminders`, `mail`, `notes`, `contacts`,
+  `messages`, `index`, `search` and `mail-bulk` as bare names while the
+  other six verbs had descriptions. Each app verb now carries a one-line
+  `about`, so the command table reads complete. Help text only: no
+  behaviour, JSON or MCP output changes.
+
 ### Security
 
 - CI now declares a workflow-level `permissions: contents: read` block in
