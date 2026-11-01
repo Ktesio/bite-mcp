@@ -505,12 +505,12 @@ pub static TOOLS: &[Tool] = &[
         ]),
     t("messages_chats_recent", App::Messages, "messages.chats_recent",
         "List recent chats with participants and last message.",
-        ps![ParamSpec::opt("limit", ParamKind::Int, "max chats (default 20)")]),
+        ps![ParamSpec::opt("limit", ParamKind::Int, "max chats (default 20, capped at 200)")]),
     t("messages_history", App::Messages, "messages.history",
         "Read a chat's recent history (newest last). Active chats come from Messages; older history needs Full Disk Access and falls back to chat.db.",
         ps![
             ParamSpec::req("chat_id", ParamKind::Str, "chat id from messages_chats_recent"),
-            ParamSpec::opt("limit", ParamKind::Int, "max messages (default 100)"),
+            ParamSpec::opt("limit", ParamKind::Int, "max messages (default 100, capped at 200)"),
         ]),
 ];
 
