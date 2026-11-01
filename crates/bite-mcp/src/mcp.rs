@@ -258,18 +258,29 @@ fn handle_request(state: &ServerState, method: &str, params: &Value) -> Result<V
 }
 
 /// Upper bound for client-supplied `limit` values on the messages read
-/// tools. Chats and history rows travel as full JSON payloads through the
-/// single bridge handle, so an oversized ask pins the helper in a chat.db /
-/// Apple Events scan while every other tool call queues behind it — same
-/// class of guard as the index search cap (`index::MAX_SEARCH_LIMIT`).
+/// tools and `mail_messages_search`. Chats, history and live mail rows all
+/// travel as full JSON payloads through the single bridge handle, so an
+/// oversized ask pins the helper in a chat.db / Apple Events scan while
+/// every other tool call queues behind it — same class of guard as the
+/// index search cap (`index::MAX_SEARCH_LIMIT`).
 pub(crate) const MAX_MESSAGES_LIMIT: u64 = 200;
 
-/// Clamp `limit` on `messages_chats_recent` / `messages_history` at the MCP
-/// boundary: a u64 limit is clamped into `1..=MAX_MESSAGES_LIMIT`. Any other
-/// argument shape (absent, null, non-number) is passed through untouched —
-/// the helper keeps its existing default handling for those.
+/// Clamp `limit` on `messages_chats_recent` / `messages_history` /
+/// `mail_messages_search` at the MCP boundary: a u64 limit is clamped into
+/// `1..=MAX_MESSAGES_LIMIT`. Any other argument shape (absent, null,
+/// non-number) is passed through untouched — the helper keeps its existing
+/// default handling for those.
+///
+/// For `mail_messages_search` this closes the live bypasses: the index fast
+/// path already caps via `index::search_limit`, but the empty-index degrade
+/// (`run_with_timeout`) and a `force_live: true` re-call both forward the
+/// raw client value into a live Mail Apple Events sweep — clamping here
+/// means every path shares one boundary cap.
 fn clamp_messages_limit(name: &str, args: Value) -> Value {
-    if !matches!(name, "messages_chats_recent" | "messages_history") {
+    if !matches!(
+        name,
+        "messages_chats_recent" | "messages_history" | "mail_messages_search"
+    ) {
         return args;
     }
     let Some(limit) = args.get("limit").and_then(|v| v.as_u64()) else {
@@ -399,7 +410,11 @@ mod tests {
 
     #[test]
     fn messages_limit_clamps_client_supplied_values() {
-        for tool in ["messages_chats_recent", "messages_history"] {
+        for tool in [
+            "messages_chats_recent",
+            "messages_history",
+            "mail_messages_search",
+        ] {
             assert_eq!(
                 clamp_messages_limit(tool, json!({ "limit": 50 })),
                 json!({ "limit": 50 }),
@@ -426,6 +441,15 @@ mod tests {
                 "{tool}: zero clamped to 1"
             );
         }
+        // the clamp fires before the index/live split, so a search carrying
+        // other params keeps them verbatim alongside the clamped limit
+        assert_eq!(
+            clamp_messages_limit(
+                "mail_messages_search",
+                json!({ "query": "invoice", "limit": 10_000_000, "force_live": true })
+            ),
+            json!({ "query": "invoice", "limit": 200, "force_live": true })
+        );
     }
 
     #[test]
@@ -450,14 +474,18 @@ mod tests {
         );
         // other tools never see a rewrite
         assert_eq!(
-            clamp_messages_limit("mail_messages_search", json!({ "limit": 10_000_000 })),
+            clamp_messages_limit("calendar_events_search", json!({ "limit": 10_000_000 })),
             json!({ "limit": 10_000_000 })
         );
     }
 
     #[test]
     fn messages_limit_cap_matches_registry_docs() {
-        for tool in ["messages_chats_recent", "messages_history"] {
+        for tool in [
+            "messages_chats_recent",
+            "messages_history",
+            "mail_messages_search",
+        ] {
             let spec = bite_core::registry::find(tool).expect("tool registered");
             let limit_param = spec
                 .params

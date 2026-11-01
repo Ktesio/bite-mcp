@@ -86,6 +86,17 @@ it can ship.
   param docs and docs/protocol.md now state the cap; non-numeric or absent
   limits keep their existing default handling.
 
+- `mail_messages_search` now clamps its client-supplied `limit` to 1..200 at
+  the MCP boundary, closing the two live bypasses the index cap never saw:
+  the empty-index degrade (`run_with_timeout`) and a `force_live: true`
+  re-call both forwarded the raw value into a live Mail Apple Events
+  pagination sweep inside the 45s window, hauling results over the single
+  bridge handle while every other tool queued. The clamp runs before the
+  index/live split, so the index fast path (already capped via
+  `MAX_SEARCH_LIMIT`) and both live paths now share one boundary cap —
+  matching the "capped at 200" the registry param doc already stated.
+  Non-numeric or absent limits keep their existing default handling.
+
 - CI now declares a workflow-level `permissions: contents: read` block in
   ci.yml. Every job there is read-only (checkout, builds, checks), so the
   workflow no longer inherits the repo-default token scope — the same
