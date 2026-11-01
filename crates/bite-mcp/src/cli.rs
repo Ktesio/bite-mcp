@@ -594,3 +594,36 @@ pub enum MessagesCmd {
         limit: Option<i64>,
     },
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    /// `bite --help` is shown as an unedited product screen (ktesio.dev and
+    /// ktesio.com capture it), so a verb without a description is a visible
+    /// regression. Nested verbs are covered too, and clap's own consistency
+    /// checks run over the whole tree first.
+    #[test]
+    fn every_subcommand_has_an_about() {
+        let cmd = Cli::command();
+        cmd.clone().debug_assert();
+
+        fn collect_missing(cmd: &clap::Command, prefix: &str, missing: &mut Vec<String>) {
+            for sub in cmd.get_subcommands() {
+                let path = format!("{prefix}{}", sub.get_name());
+                if sub.get_about().is_none() {
+                    missing.push(path.clone());
+                }
+                collect_missing(sub, &format!("{path} "), missing);
+            }
+        }
+
+        let mut missing = Vec::new();
+        collect_missing(&cmd, "", &mut missing);
+        assert!(
+            missing.is_empty(),
+            "subcommands without an about (blank rows in `--help`): {missing:?}"
+        );
+    }
+}
