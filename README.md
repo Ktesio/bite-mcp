@@ -178,6 +178,8 @@ current size — the number that tells you when `cargo clean` is worth it.
 - [CHANGELOG.md](CHANGELOG.md) — notable changes per release; tags are gated
   on a matching section
 - [docs/setup.md](docs/setup.md) — first-time setup, end to end
+- [docs/configuration.md](docs/configuration.md) — every config key, env
+  hook and precedence rule
 - [docs/PLAN.md](docs/PLAN.md) — the full implementation plan
 - [docs/protocol.md](docs/protocol.md) — the Rust↔Swift helper protocol and
   the crawl batch handoff
