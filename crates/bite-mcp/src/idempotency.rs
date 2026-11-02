@@ -269,15 +269,20 @@ mod tests {
     }
 
     #[test]
-    fn settle_overwrites_in_place_keeping_order_and_map_in_lockstep() {
+    fn settle_keeps_order_and_map_in_lockstep() {
         let mut idem = Idempotency::default();
         assert!(matches!(idem.reserve("k"), Reserved::Fresh));
         idem.settle("k", Settled::Unknown("timeout".into()));
-        // Settling again (an ambiguous call retried under the same key)
-        // must overwrite in place, never add a second order entry.
-        idem.settle("k", Settled::Done(json!({})));
         assert_eq!(idem.order.len(), 1);
         assert_eq!(idem.map.len(), 1);
+        // A stray release after settling must NOT unpin the key: only an
+        // in-flight claim is releasable (production releases exactly the
+        // key it reserved, before any settle).
+        idem.release("k");
+        assert!(
+            matches!(idem.reserve("k"), Reserved::Unknown(_)),
+            "release on a settled key is a no-op"
+        );
     }
 
     #[test]
