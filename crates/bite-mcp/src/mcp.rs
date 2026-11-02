@@ -265,17 +265,32 @@ fn handle_request(state: &ServerState, method: &str, params: &Value) -> Result<V
 /// index search cap (`index::MAX_SEARCH_LIMIT`).
 pub(crate) const MAX_MESSAGES_LIMIT: u64 = 200;
 
+/// Upper bound for client-supplied `max_scan` values on
+/// `mail_messages_search`. The live Apple Events walk length is set by
+/// `max_scan` (helper default 400) — `limit` only ends the walk early
+/// once enough matches are found — so an oversized `max_scan` walks
+/// millions of messages over the single bridge handle while every other
+/// tool queues behind it. `max_scan <= 0` is worse: it reaches the
+/// helper as a Swift `1...maxScan` range trap (crash + respawn loop).
+pub(crate) const MAX_SCAN_LIMIT: u64 = 2000;
+
 /// Clamp `limit` on `messages_chats_recent` / `messages_history` /
-/// `mail_messages_search` at the MCP boundary: a u64 limit is clamped into
-/// `1..=MAX_MESSAGES_LIMIT`. Any other argument shape (absent, null,
-/// non-number) is passed through untouched — the helper keeps its existing
-/// default handling for those.
+/// `mail_messages_search`, and `max_scan` on `mail_messages_search`, at
+/// the MCP boundary: `limit` lands in `1..=MAX_MESSAGES_LIMIT`, `max_scan`
+/// in `1..=MAX_SCAN_LIMIT`. Numbers are read the way the Swift helper
+/// reads them (`J.optInt`: u64 directly, finite floats truncated toward
+/// zero), so a float-valued `limit` or `max_scan` no longer slips the
+/// clamp. Any other shape (absent, null, string, non-finite float) passes
+/// through untouched — the helper keeps its existing default handling for
+/// those.
 ///
-/// For `mail_messages_search` this closes the live bypasses: the index fast
-/// path already caps via `index::search_limit`, but the empty-index degrade
-/// (`run_with_timeout`) and a `force_live: true` re-call both forward the
-/// raw client value into a live Mail Apple Events sweep — clamping here
-/// means every path shares one boundary cap.
+/// For `mail_messages_search` this bounds the live bypasses: the index
+/// fast path already caps rows via `index::search_limit`, but the
+/// empty-index degrade (`run_with_timeout`) and a `force_live: true`
+/// re-call forward the raw client values into a live Mail Apple Events
+/// walk — and that walk is bounded by `max_scan`, not `limit`. Clamping
+/// both here means every path shares one boundary on the rows returned
+/// AND the messages examined.
 fn clamp_messages_limit(name: &str, args: Value) -> Value {
     if !matches!(
         name,
@@ -283,12 +298,28 @@ fn clamp_messages_limit(name: &str, args: Value) -> Value {
     ) {
         return args;
     }
-    let Some(limit) = args.get("limit").and_then(|v| v.as_u64()) else {
-        return args;
-    };
     let mut clamped = args;
-    clamped["limit"] = json!(limit.clamp(1, MAX_MESSAGES_LIMIT));
+    if let Some(n) = clamped.get("limit").and_then(opt_int_u64) {
+        clamped["limit"] = json!(n.clamp(1, MAX_MESSAGES_LIMIT));
+    }
+    if name == "mail_messages_search" {
+        if let Some(n) = clamped.get("max_scan").and_then(opt_int_u64) {
+            clamped["max_scan"] = json!(n.clamp(1, MAX_SCAN_LIMIT));
+        }
+    }
     clamped
+}
+
+/// Read a JSON number the way the helper's `J.optInt` does: u64 directly,
+/// any other finite number truncated toward zero into u64 (the cast
+/// saturates, so an enormous float still clamps instead of overflowing).
+/// Non-numbers and non-finite floats yield `None`.
+fn opt_int_u64(v: &Value) -> Option<u64> {
+    v.as_u64().or_else(|| {
+        v.as_f64()
+            .filter(|f| f.is_finite())
+            .map(|f| f.max(0.0) as u64)
+    })
 }
 
 /// Run a tool through the bridge; if the helper exited, respawn once.
@@ -440,6 +471,21 @@ mod tests {
                 json!({ "limit": 1 }),
                 "{tool}: zero clamped to 1"
             );
+            assert_eq!(
+                clamp_messages_limit(tool, json!({ "limit": 1e7 })),
+                json!({ "limit": 200 }),
+                "{tool}: float-valued oversized limit clamped, not slipped"
+            );
+            assert_eq!(
+                clamp_messages_limit(tool, json!({ "limit": 50.9 })),
+                json!({ "limit": 50 }),
+                "{tool}: float limit truncated toward zero like the helper's optInt"
+            );
+            assert_eq!(
+                clamp_messages_limit(tool, json!({ "limit": -5 })),
+                json!({ "limit": 1 }),
+                "{tool}: negative number clamped to 1 (was passed through raw)"
+            );
         }
         // the clamp fires before the index/live split, so a search carrying
         // other params keeps them verbatim alongside the clamped limit
@@ -449,6 +495,70 @@ mod tests {
                 json!({ "query": "invoice", "limit": 10_000_000, "force_live": true })
             ),
             json!({ "query": "invoice", "limit": 200, "force_live": true })
+        );
+    }
+
+    #[test]
+    fn mail_search_max_scan_clamps_client_supplied_values() {
+        // the live walk length is set by max_scan (Swift `1...maxScan`,
+        // helper default 400), not by limit — clamp it at the same MCP
+        // boundary: an oversized ask walks millions of messages over the
+        // single bridge handle, and max_scan <= 0 is a Swift range trap
+        // that crash-loops the helper
+        assert_eq!(
+            clamp_messages_limit("mail_messages_search", json!({ "max_scan": 400 })),
+            json!({ "max_scan": 400 }),
+            "default-scale max_scan untouched"
+        );
+        assert_eq!(
+            clamp_messages_limit("mail_messages_search", json!({ "max_scan": 10_000_000 })),
+            json!({ "max_scan": 2000 }),
+            "oversized max_scan clamped — the walk itself is bounded"
+        );
+        assert_eq!(
+            clamp_messages_limit("mail_messages_search", json!({ "max_scan": 0 })),
+            json!({ "max_scan": 1 }),
+            "zero clamped to 1 — no Swift 1...0 range trap"
+        );
+        assert_eq!(
+            clamp_messages_limit("mail_messages_search", json!({ "max_scan": -5 })),
+            json!({ "max_scan": 1 }),
+            "negative clamped to 1"
+        );
+        assert_eq!(
+            clamp_messages_limit("mail_messages_search", json!({ "max_scan": 1e7 })),
+            json!({ "max_scan": 2000 }),
+            "float max_scan clamped (optInt would truncate it to 10M)"
+        );
+        // absent / null / non-number shapes pass through (helper default 400)
+        assert_eq!(
+            clamp_messages_limit("mail_messages_search", json!({ "from": "x" })),
+            json!({ "from": "x" })
+        );
+        assert_eq!(
+            clamp_messages_limit("mail_messages_search", json!({ "max_scan": null })),
+            json!({ "max_scan": null })
+        );
+        assert_eq!(
+            clamp_messages_limit("mail_messages_search", json!({ "max_scan": "400" })),
+            json!({ "max_scan": "400" })
+        );
+        // both bounds clamp together, other params verbatim — this is the
+        // exact shape of the review's hazard call
+        assert_eq!(
+            clamp_messages_limit(
+                "mail_messages_search",
+                json!({ "from": "nobody@x", "max_scan": 10_000_000, "force_live": true })
+            ),
+            json!({ "from": "nobody@x", "max_scan": 2000, "force_live": true })
+        );
+        // max_scan clamping is mail-search-only: no other read tool takes it
+        assert_eq!(
+            clamp_messages_limit(
+                "messages_history",
+                json!({ "chat_id": "x", "max_scan": 10_000_000 })
+            ),
+            json!({ "chat_id": "x", "max_scan": 10_000_000 })
         );
     }
 
@@ -467,10 +577,6 @@ mod tests {
         assert_eq!(
             clamp_messages_limit("messages_chats_recent", json!({ "limit": "50" })),
             json!({ "limit": "50" })
-        );
-        assert_eq!(
-            clamp_messages_limit("messages_chats_recent", json!({ "limit": -5 })),
-            json!({ "limit": -5 })
         );
         // other tools never see a rewrite
         assert_eq!(
@@ -499,6 +605,22 @@ mod tests {
                 "{tool} registry doc must mirror the boundary cap: {}",
                 limit_param.desc
             );
+            if tool == "mail_messages_search" {
+                // the walk bound gets the same doc-mirror treatment: the
+                // registry must state the max_scan ceiling clients get
+                let scan_param = spec
+                    .params
+                    .iter()
+                    .find(|p| p.name == "max_scan")
+                    .expect("max_scan param");
+                assert!(
+                    scan_param
+                        .desc
+                        .contains(&format!("capped at {MAX_SCAN_LIMIT}")),
+                    "mail_messages_search registry doc must mirror the scan cap: {}",
+                    scan_param.desc
+                );
+            }
         }
     }
 }

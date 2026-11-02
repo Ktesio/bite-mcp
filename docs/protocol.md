@@ -79,7 +79,7 @@ reminders: `list_lists` · `search {list?/list_id?, text?, completed?, due_withi
 contacts: `search {query, limit?}` · `get {id}` · `create {first?, last?, org?, note?, emails?, phones?, urls?}` ·
 `update {id, …}` · `delete {id, confirm?}` · `groups {}`
 
-mail: `accounts` · `mailboxes {account?}` · `messages_search {mailbox?=INBOX, account?, from?, to?, subject?, body?, unread?, flagged?, since?, until?, limit?=20, max_scan?=400, skip_count?}` (newest-first walk, honest `truncated`; client `limit` is clamped to 1..200 at the MCP boundary on every path — index, empty-index degrade and `force_live` re-call; index-served filter-only searches run an exact-total COUNT scan unless `skip_count` is set — then `count` is null, like full-text pages) ·
+mail: `accounts` · `mailboxes {account?}` · `messages_search {mailbox?=INBOX, account?, from?, to?, subject?, body?, unread?, flagged?, since?, until?, limit?=20, max_scan?=400, skip_count?}` (newest-first walk, honest `truncated`; client `limit` is clamped to 1..200 and `max_scan` — the walk's real bound, helper default 400 — to 1..2000, at the MCP boundary on every path: index, empty-index degrade and `force_live` re-call; numeric floats are truncated first, matching the helper's int read; index-served filter-only searches run an exact-total COUNT scan unless `skip_count` is set — then `count` is null, like full-text pages) ·
 `message_get {id, mailbox?, account?}` · `send {to[], cc?, bcc?, subject, body?, html?, account?, attachments?}` ·
 `reply {id, mailbox?, reply_all?, body?, html?}` · `forward {id, to[], …}` ·
 `move {id, to_mailbox, mailbox?, confirm?}` · `mark {id, read?, flagged?, junk?}` ·
@@ -90,7 +90,7 @@ notes: `folders` · `search {text?, folder?, limit?}` · `get {id}` (HTML + mark
 `delete {id, confirm?}`
 
 messages: `send {to, text}` (recipient must exist in Messages) ·
-`chats_recent {limit?}` · `history {chat_id, limit?}` (source: `messages_app` or `chat.db`; client `limit` is clamped to 1..200 at the MCP boundary)
+`chats_recent {limit?}` · `history {chat_id, limit?}` (source: `messages_app` or `chat.db`; client `limit` is clamped to 1..200 at the MCP boundary — numeric floats truncated first)
 
 ## Result shapes (contract)
 
