@@ -546,7 +546,7 @@ fn idempotency_key_refuses_retry_after_ambiguous_death() {
     // must NOT reach it.
     mcp.rewrite_scenario(json!({
         "echo": true,
-        "responses": { "mail.send": [{ "sent": true, "delivered_by": "should-never-happen" }] }
+        "responses": { "mail.send": [{ "sent": true, "delivered_by": "respawned-helper" }] }
     }));
 
     let retry = mcp.request_raw(
@@ -574,7 +574,7 @@ fn idempotency_key_refuses_retry_after_ambiguous_death() {
     assert_eq!(fresh["isError"], json!(false));
     assert_eq!(
         fresh["structuredContent"]["delivered_by"],
-        json!("should-never-happen")
+        json!("respawned-helper")
     );
 }
 

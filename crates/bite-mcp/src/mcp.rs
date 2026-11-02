@@ -265,10 +265,13 @@ fn handle_request(state: &ServerState, method: &str, params: &Value) -> Result<V
 /// `run_tool_retrying` wrapped with client-keyed idempotency for the tools
 /// that declare `idempotency_key` (`mail_send` today): a repeated call with
 /// the same key replays the recorded outcome instead of dispatching a
-/// second send, and a key whose attempt failed ambiguously is refused
-/// outright. The key is stripped from the forwarded arguments, so the
-/// helper never sees it. Tools without the param — and calls without a
-/// key — take exactly the `run_tool_retrying` path.
+/// second send, a key whose attempt failed ambiguously is refused outright,
+/// and a key whose call is still in flight in another request thread is
+/// refused with `idempotency_in_flight` — the claim and the lookup happen
+/// under one lock, so concurrent same-key calls cannot both dispatch. The
+/// key is stripped from the forwarded arguments, so the helper never sees
+/// it. Tools without the param — and calls without a key — take exactly the
+/// `run_tool_retrying` path.
 fn run_tool_idempotent(
     state: &ServerState,
     name: &str,
@@ -282,32 +285,54 @@ fn run_tool_idempotent(
     }
     let key = idempotency::take_key(&mut args).map_err(|message| {
         let mut e = bite_bridge::BridgeError::new("invalid_params", message);
-        e.fix = Some("pass idempotency_key as a non-empty string (≤128 chars), or omit it".into());
+        e.fix = Some(format!(
+            "pass idempotency_key as a non-empty string (at most {} bytes), \
+             or omit it",
+            idempotency::MAX_KEY_LEN
+        ));
         BiteError(e)
     })?;
     let Some(key) = key else {
         return run_tool_retrying(state, name, args);
     };
-    if let Some(recorded) = state.idempotency.lock().unwrap().lookup(&key) {
-        return match recorded {
-            idempotency::Recorded::Done(value) => Ok(value.clone()),
-            idempotency::Recorded::Unknown(code) => {
-                let mut e = bite_bridge::BridgeError::new(
-                    "idempotency_unknown",
-                    format!(
-                        "an earlier {name} with this idempotency_key failed ambiguously \
-                         ({code}) — it may or may not have taken effect, so the repeat \
-                         call was refused instead of risking a second dispatch"
-                    ),
-                );
-                e.fix = Some(
-                    "confirm the original outcome first (search before re-sending), then \
-                     retry with a fresh idempotency_key if it truly did not go out"
-                        .into(),
-                );
-                Err(BiteError(e))
-            }
-        };
+    // Claim the key and read any prior state in ONE lock hold: requests are
+    // served one thread per call, so a separate lookup and dispatch would
+    // let two concurrent same-key calls both reach the helper.
+    match state.idempotency.lock().unwrap().reserve(&key) {
+        idempotency::Reserved::Done(value) => return Ok(value),
+        idempotency::Reserved::Unknown(code) => {
+            let mut e = bite_bridge::BridgeError::new(
+                "idempotency_unknown",
+                format!(
+                    "an earlier {name} with this idempotency_key failed ambiguously \
+                     ({code}) — it may or may not have taken effect, so the repeat \
+                     call was refused instead of risking a second dispatch"
+                ),
+            );
+            e.fix = Some(
+                "confirm the original outcome first (search before re-sending), then \
+                 retry with a fresh idempotency_key if it truly did not go out"
+                    .into(),
+            );
+            return Err(BiteError(e));
+        }
+        idempotency::Reserved::InFlight => {
+            let mut e = bite_bridge::BridgeError::new(
+                "idempotency_in_flight",
+                format!(
+                    "another {name} with this idempotency_key is still in flight in \
+                     this server process — its outcome has not settled, so this call \
+                     was refused instead of dispatching a second concurrent send"
+                ),
+            );
+            e.fix = Some(
+                "wait for the in-flight call to settle, then replay this exact call \
+                 (a settled outcome replays verbatim), or use a fresh idempotency_key"
+                    .into(),
+            );
+            return Err(BiteError(e));
+        }
+        idempotency::Reserved::Fresh => {}
     }
     let outcome = run_tool_retrying(state, name, args);
     match &outcome {
@@ -315,14 +340,15 @@ fn run_tool_idempotent(
             .idempotency
             .lock()
             .unwrap()
-            .record(key, idempotency::Recorded::Done(value.clone())),
+            .settle(&key, idempotency::Settled::Done(value.clone())),
         Err(e) if idempotency::ambiguous(e.code()) => state
             .idempotency
             .lock()
             .unwrap()
-            .record(key, idempotency::Recorded::Unknown(e.code().to_string())),
-        // Clean failures provably did not send — the key stays free.
-        _ => {}
+            .settle(&key, idempotency::Settled::Unknown(e.code().to_string())),
+        // Clean failures provably did not send — release the claim so the
+        // key stays free for an immediate retry.
+        _ => state.idempotency.lock().unwrap().release(&key),
     }
     outcome
 }

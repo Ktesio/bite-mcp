@@ -298,7 +298,7 @@ pub static TOOLS: &[Tool] = &[
             ParamSpec::opt("account", ParamKind::Str, "sender account"),
             ParamSpec::opt("attachments", ParamKind::StrArray, "absolute file paths to attach"),
             ParamSpec::opt("idempotency_key", ParamKind::Str,
-                "client-chosen dedup key: a repeated call with the same key replays the recorded outcome instead of sending twice (consumed by the server, never forwarded)"),
+                "client-chosen dedup key: a repeated call with the same key replays the recorded outcome instead of sending twice (remembered for this server process only, last 128 keys; consumed by the server, never forwarded)"),
         ]),
     tn("mail_reply", App::Mail, "mail.reply",
         "Reply to a message with a quoted original (reply_all includes cc's).",

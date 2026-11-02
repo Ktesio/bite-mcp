@@ -27,8 +27,13 @@ it can ship.
   call with the same key replays the recorded outcome instead of dispatching
   a second send. An attempt that failed ambiguously (helper died mid-call,
   or the call timed out) pins the key — repeats are refused with
-  `idempotency_unknown` rather than risking a double send. The key is
-  consumed by the Rust control plane and never forwarded to the helper.
+  `idempotency_unknown` rather than risking a double send. Concurrent
+  same-key calls are refused with `idempotency_in_flight` while the first is
+  still running (the key is claimed atomically, so two same-key calls can
+  never both dispatch). Clean failures release the key for an immediate
+  retry. Keys are remembered for the server process only (last 128 keys,
+  completed outcomes evicted before unknown pins) and are never forwarded to
+  the helper.
 - `bite doctor --json` key reference: docs/permissions.md now documents the
   report's full skeleton (every top-level and nested key, with meanings),
   pinned by a test that serializes the sample report and fails when the
