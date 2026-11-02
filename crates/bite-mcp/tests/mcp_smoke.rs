@@ -96,6 +96,36 @@ impl McpProc {
         self.reader.read_line(&mut buf).expect("response line");
         serde_json::from_str(buf.trim()).expect("valid json response")
     }
+
+    /// Write several requests back-to-back WITHOUT waiting for any response
+    /// (JSON-RPC pipelining — the server dispatches each request on its own
+    /// thread), then read exactly one response per request, bucketed by id:
+    /// completion order is free. Returns the full response objects (errors
+    /// included) keyed by the JSON-RPC request id.
+    fn request_pipelined(
+        &mut self,
+        entries: &[(&str, Value)],
+    ) -> std::collections::HashMap<i64, Value> {
+        for (method, params) in entries {
+            self.next_id += 1;
+            let line =
+                json!({ "jsonrpc": "2.0", "id": self.next_id, "method": method, "params": params });
+            writeln!(self.stdin, "{line}").unwrap();
+        }
+        self.stdin.flush().unwrap();
+        let mut out = std::collections::HashMap::new();
+        for _ in entries {
+            let mut buf = String::new();
+            self.reader.read_line(&mut buf).expect("response line");
+            let v: Value = serde_json::from_str(buf.trim()).expect("valid json response");
+            let id = v["id"].as_i64().expect("response id");
+            assert!(
+                out.insert(id, v).is_none(),
+                "duplicate response for the same request id"
+            );
+        }
+        out
+    }
 }
 
 impl Drop for McpProc {
@@ -606,5 +636,165 @@ fn idempotency_key_validates_before_dispatch() {
     assert!(
         msg.contains("idempotency_key") && msg.contains("invalid_params"),
         "empty key must fail validation with a named fix, got: {msg}"
+    );
+}
+
+/// A helper that dies BEFORE its handshake line fails the spawn with the
+/// same `helper_exited` code a mid-call death uses — but provably no
+/// request was ever written, so the key must NOT be pinned unknown: an
+/// immediate retry with the SAME key dispatches once a healthy helper can
+/// spawn. The scripted respawn answer is the discriminator — a pinned key
+/// would refuse the retry with `idempotency_unknown` instead of returning
+/// the marker.
+#[test]
+fn spawn_failure_does_not_pin_idempotency_key() {
+    let mut mcp = McpProc::start_scenario(json!({ "echo": true, "exit_before_hello": true }), &[]);
+
+    let init = mcp.request(
+        "initialize",
+        json!({
+            "protocolVersion": "2025-06-18",
+            "capabilities": {},
+            "clientInfo": { "name": "smoke", "version": "0" }
+        }),
+    );
+    assert_eq!(init["serverInfo"]["name"], json!("bite-mcp"));
+
+    // First attempt: the helper spawn fails at the handshake. The error
+    // reuses the ambiguous `helper_exited` code, but nothing was sent.
+    let died = mcp.request_raw(
+        "tools/call",
+        json!({
+            "name": "mail_send",
+            "arguments": { "to": ["a@b.c"], "subject": "hi", "idempotency_key": "k-spawn" }
+        }),
+    );
+    assert_eq!(died["error"]["code"], json!(-32000));
+    let msg = died["error"]["message"].as_str().expect("error message");
+    assert!(
+        msg.contains("helper"),
+        "a spawn failure must name the helper, got: {msg}"
+    );
+
+    // Only a helper spawned after this point reads the healthy script.
+    mcp.rewrite_scenario(json!({
+        "echo": true,
+        "responses": { "mail.send": [{ "sent": true, "delivered_by": "healthy-respawn" }] }
+    }));
+
+    // SAME key: must dispatch — the spawn failure never wrote a request,
+    // so the key was never pinned. A pin surfaces as idempotency_unknown.
+    let retry = mcp.request(
+        "tools/call",
+        json!({
+            "name": "mail_send",
+            "arguments": { "to": ["a@b.c"], "subject": "hi", "idempotency_key": "k-spawn" }
+        }),
+    );
+    assert_eq!(retry["isError"], json!(false));
+    assert_eq!(
+        retry["structuredContent"]["delivered_by"],
+        json!("healthy-respawn"),
+        "same-key retry after a spawn failure must dispatch to the respawned helper"
+    );
+}
+
+/// Two requests with the SAME idempotency_key, pipelined back-to-back over
+/// one connection while the scripted send is slow: the server serves each
+/// on its own thread, so the second must find the key claimed in flight
+/// and be refused (`idempotency_in_flight`) instead of dispatching a
+/// second concurrent send. Afterwards a same-key call replays the ONE
+/// recorded outcome without another dispatch, and a fresh key proves the
+/// send path is still healthy.
+#[test]
+fn concurrent_same_key_pipelined_requests_single_dispatch() {
+    let mut mcp = McpProc::start_scenario(
+        json!({
+            "echo": true,
+            "sleep_ms_per_call": 1500,
+            "responses": { "mail.send": [
+                { "sent": true, "message_id": "pipelined-first" },
+                { "sent": true, "message_id": "must-not-double-send" }
+            ] }
+        }),
+        &[],
+    );
+
+    let init = mcp.request(
+        "initialize",
+        json!({
+            "protocolVersion": "2025-06-18",
+            "capabilities": {},
+            "clientInfo": { "name": "smoke", "version": "0" }
+        }),
+    );
+    assert_eq!(init["serverInfo"]["name"], json!("bite-mcp"));
+
+    // Both lines are written before either response is read; each request
+    // carries the SAME idempotency key (distinct JSON-RPC ids).
+    let send_args = || {
+        json!({
+            "name": "mail_send",
+            "arguments": { "to": ["a@b.c"], "subject": "hi", "idempotency_key": "k-race" }
+        })
+    };
+    let responses =
+        mcp.request_pipelined(&[("tools/call", send_args()), ("tools/call", send_args())]);
+    assert_eq!(responses.len(), 2, "one response per pipelined request");
+
+    let mut successes = Vec::new();
+    let mut refusals = Vec::new();
+    for resp in responses.values() {
+        if resp.get("error").is_some() {
+            refusals.push(resp.clone());
+        } else {
+            successes.push(resp["result"].clone());
+        }
+    }
+    assert_eq!(
+        successes.len(),
+        1,
+        "exactly one request may reach the helper while the other is in flight"
+    );
+    assert_eq!(
+        refusals.len(),
+        1,
+        "the concurrent same-key call must be refused"
+    );
+    assert_eq!(
+        successes[0]["structuredContent"]["message_id"],
+        json!("pipelined-first")
+    );
+    let msg = refusals[0]["error"]["message"]
+        .as_str()
+        .expect("error message");
+    assert!(
+        msg.contains("idempotency_in_flight"),
+        "the concurrent call must be refused by the in-flight guard, got: {msg}"
+    );
+
+    // Settled: a same-key call replays the recorded outcome verbatim —
+    // no third dispatch (the replay returns immediately, without the
+    // scripted 1.5s per-call sleep).
+    let replay = mcp.request("tools/call", send_args());
+    assert_eq!(replay["isError"], json!(false));
+    assert_eq!(
+        replay["structuredContent"]["message_id"],
+        json!("pipelined-first"),
+        "the settled outcome must replay verbatim"
+    );
+
+    // A fresh key dispatches normally — the send path is still healthy.
+    let fresh = mcp.request(
+        "tools/call",
+        json!({
+            "name": "mail_send",
+            "arguments": { "to": ["a@b.c"], "subject": "hi", "idempotency_key": "k-after" }
+        }),
+    );
+    assert_eq!(fresh["isError"], json!(false));
+    assert_eq!(
+        fresh["structuredContent"]["message_id"],
+        json!("must-not-double-send")
     );
 }
