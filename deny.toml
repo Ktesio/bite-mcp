@@ -41,6 +41,12 @@ allow = [
   "CC0-1.0",
   "MPL-2.0",
   "BSL-1.0",
+  # webpki-root-certs (rustls' web-PKI root store) ships its certificate
+  # data — not code — under CDLA-Permissive-2.0. It entered the graph with
+  # lancedb 0.41 / lance 14 via object-store's rustls TLS path; the bundle
+  # is permissive, attribution-style data licensing, so it joins the
+  # allow-list consciously rather than blocking the stack bump.
+  "CDLA-Permissive-2.0",
 ]
 
 [bans]
