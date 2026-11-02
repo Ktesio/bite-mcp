@@ -83,8 +83,8 @@ it can ship.
   (`LIMIT \(limit)`) and the AppleScript pagination loops, so a client
   asking `limit=10_000_000` pinned the helper in a scan while holding the
   bridge handle — every other tool call queued behind it. The registry
-  param docs and docs/protocol.md now state the cap; non-numeric or absent
-  limits keep their existing default handling.
+  param docs and docs/protocol.md now state the cap; absent, null,
+  string and non-finite limits keep their existing default handling.
 
 - `mail_messages_search` now clamps its client-supplied `limit` to 1..200
   and its `max_scan` to 1..2000 at the MCP boundary, closing the two live
@@ -97,13 +97,19 @@ it can ship.
   enough matches are found — so both bounds are clamped: rows returned
   and messages examined. `max_scan <= 0` previously reached the helper
   as a Swift `1...maxScan` range trap (crash + respawn loop on replay);
-  it now clamps to 1. Numeric arguments are read the way the helper
-  reads them (`J.optInt`: finite floats truncated toward zero), so a
-  float `limit` such as `{"limit": 1e7}` no longer slips the clamp on
-  any of the three read tools (the same gap existed for
-  `messages_chats_recent` / `messages_history` from the previous entry).
-  The registry param docs and docs/protocol.md state both caps;
-  non-numeric or absent values keep their existing default handling.
+  it now clamps to 1, and the helper additionally floors `maxScan` at 1
+  so the trap stays closed for callers that bypass this boundary (the
+  `bite mail search --max-scan 0` CLI path). Numeric arguments are read
+  the way the helper reads them (`J.optInt`: finite floats truncated
+  toward zero, JSON booleans bridged to 0/1 the way NSNumber casts read
+  them), so a float `limit` such as `{"limit": 1e7}` — or a boolean
+  `max_scan` such as `{"max_scan": false}`, which JSONSerialization
+  decodes to an NSNumber subclass the helper reads as 0 — no longer
+  slips the clamp on any of the three read tools (the same gap existed
+  for `messages_chats_recent` / `messages_history` from the previous
+  entry). The registry param docs and docs/protocol.md state both caps;
+  absent, null, string and non-finite values keep their existing
+  default handling.
 
 - CI now declares a workflow-level `permissions: contents: read` block in
   ci.yml. Every job there is read-only (checkout, builds, checks), so the

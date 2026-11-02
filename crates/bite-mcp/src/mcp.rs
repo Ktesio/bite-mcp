@@ -279,7 +279,8 @@ pub(crate) const MAX_SCAN_LIMIT: u64 = 2000;
 /// the MCP boundary: `limit` lands in `1..=MAX_MESSAGES_LIMIT`, `max_scan`
 /// in `1..=MAX_SCAN_LIMIT`. Numbers are read the way the Swift helper
 /// reads them (`J.optInt`: u64 directly, finite floats truncated toward
-/// zero), so a float-valued `limit` or `max_scan` no longer slips the
+/// zero, booleans bridged to 0/1 the way NSNumber casts read them), so a
+/// float- or boolean-valued `limit` or `max_scan` no longer slips the
 /// clamp. Any other shape (absent, null, string, non-finite float) passes
 /// through untouched — the helper keeps its existing default handling for
 /// those.
@@ -310,16 +311,24 @@ fn clamp_messages_limit(name: &str, args: Value) -> Value {
     clamped
 }
 
-/// Read a JSON number the way the helper's `J.optInt` does: u64 directly,
+/// Read a JSON value the way the helper's `J.optInt` does: u64 directly,
 /// any other finite number truncated toward zero into u64 (the cast
 /// saturates, so an enormous float still clamps instead of overflowing).
-/// Non-numbers and non-finite floats yield `None`.
+/// Booleans map to 0/1: JSONSerialization decodes `true`/`false` to
+/// NSCFBoolean — an NSNumber subclass — so the helper's
+/// `(p[key] as? NSNumber)?.intValue` reads them as 1/0, and a raw
+/// `{"max_scan": false}` reached the Swift `1...maxScan` range trap as 0
+/// before this mirror existed (review on #73). Non-numbers (booleans
+/// excepted) and non-finite floats yield `None`.
 fn opt_int_u64(v: &Value) -> Option<u64> {
-    v.as_u64().or_else(|| {
-        v.as_f64()
-            .filter(|f| f.is_finite())
-            .map(|f| f.max(0.0) as u64)
-    })
+    match v {
+        Value::Bool(b) => Some(*b as u64),
+        _ => v.as_u64().or_else(|| {
+            v.as_f64()
+                .filter(|f| f.is_finite())
+                .map(|f| f.max(0.0) as u64)
+        }),
+    }
 }
 
 /// Run a tool through the bridge; if the helper exited, respawn once.
@@ -486,6 +495,16 @@ mod tests {
                 json!({ "limit": 1 }),
                 "{tool}: negative number clamped to 1 (was passed through raw)"
             );
+            assert_eq!(
+                clamp_messages_limit(tool, json!({ "limit": false })),
+                json!({ "limit": 1 }),
+                "{tool}: boolean false bridges to 0 like NSNumber and clamps to 1"
+            );
+            assert_eq!(
+                clamp_messages_limit(tool, json!({ "limit": true })),
+                json!({ "limit": 1 }),
+                "{tool}: boolean true bridges to 1 like NSNumber — in range"
+            );
         }
         // the clamp fires before the index/live split, so a search carrying
         // other params keeps them verbatim alongside the clamped limit
@@ -529,6 +548,23 @@ mod tests {
             clamp_messages_limit("mail_messages_search", json!({ "max_scan": 1e7 })),
             json!({ "max_scan": 2000 }),
             "float max_scan clamped (optInt would truncate it to 10M)"
+        );
+        // JSON booleans decode via JSONSerialization to NSNumber subclasses
+        // (NSCFBoolean), so the helper's optInt reads false as 0 — arming
+        // the 1...maxScan trap — and true as 1; the clamp mirrors that
+        // bridging so both land clamped instead of passing through raw
+        assert_eq!(
+            clamp_messages_limit(
+                "mail_messages_search",
+                json!({ "from": "x", "max_scan": false })
+            ),
+            json!({ "from": "x", "max_scan": 1 }),
+            "boolean max_scan clamps the way the helper reads it — trap closed"
+        );
+        assert_eq!(
+            clamp_messages_limit("mail_messages_search", json!({ "max_scan": true })),
+            json!({ "max_scan": 1 }),
+            "boolean true max_scan reads as 1, in range"
         );
         // absent / null / non-number shapes pass through (helper default 400)
         assert_eq!(
@@ -582,6 +618,23 @@ mod tests {
         assert_eq!(
             clamp_messages_limit("calendar_events_search", json!({ "limit": 10_000_000 })),
             json!({ "limit": 10_000_000 })
+        );
+    }
+
+    #[test]
+    fn mail_search_limit_cap_matches_index_search_cap() {
+        // `mail_messages_search` limits are clamped to MAX_MESSAGES_LIMIT
+        // at this boundary, but the index fast path re-clamps via
+        // `index::search_limit` to `index::MAX_SEARCH_LIMIT` — one boundary
+        // expressed as two consts. If they drift, the index and live paths
+        // disagree on the maximum rows again (index returns the lower cap
+        // while the degrade/force_live paths return the higher one), which
+        // is exactly the disagreement this clamp closed; moving one cap
+        // must move the other, and this pin forces the decision.
+        assert_eq!(
+            MAX_MESSAGES_LIMIT,
+            crate::index::MAX_SEARCH_LIMIT,
+            "MAX_MESSAGES_LIMIT and index::MAX_SEARCH_LIMIT are one boundary — move them together"
         );
     }
 

@@ -245,7 +245,15 @@ enum MailBridge {
                 let since = try D.optDate(req.params, "since")
                 let until = try D.optDate(req.params, "until")
                 let limit = J.optInt(req.params, "limit") ?? 20
-                let maxScan = J.optInt(req.params, "max_scan") ?? 400
+                // Floor maxScan at 1: it drives the `1...maxScan` and
+                // `0..<maxScan` walk loops below, so any value <= 0 is a
+                // Swift range trap that crash-loops the helper (respawn +
+                // replay). The MCP boundary clamps client payloads, but
+                // JSON booleans decode to NSNumber subclasses (optInt
+                // reads `false` as 0) and the `bite mail search
+                // --max-scan 0` CLI path bypasses that clamp entirely —
+                // this guard holds for every caller.
+                let maxScan = max(1, J.optInt(req.params, "max_scan") ?? 400)
 
                 // Element accessor that does NOT touch `count` — counting a
                 // large mailbox is the single slowest Apple Event Mail
