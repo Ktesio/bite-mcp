@@ -104,8 +104,9 @@ repeated calls are refused with `idempotency_unknown` instead of risking a
 double send: confirm the original outcome, then use a fresh key. While a
 call with the key is still in flight, concurrent same-key calls are refused
 with `idempotency_in_flight` — the claim happens atomically, so two
-same-key calls can never both dispatch. Clean failures and
-provably-unsent calls do not pin the key. At most 128 keys are retained per
+same-key calls can never both dispatch. Clean failures, failed helper
+spawns (no request was ever written), and provably-unsent calls do not pin
+the key. At most 128 keys are retained per
 server process (settled outcomes evicted oldest-first, completed sends
 before unknown pins); keys do not survive a server restart.
 

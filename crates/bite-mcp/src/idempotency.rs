@@ -13,8 +13,9 @@
 //! key as unknown: repeated calls are refused with a specific error rather
 //! than risking a double send (the client confirms the original outcome and
 //! uses a fresh key). Clean failures — `helper_exited_unsent` (provably
-//! never reached the helper) and tool-level errors returned by a healthy
-//! helper — do not pin the key: the send provably did not go out, so an
+//! never reached the helper), tool-level errors returned by a healthy
+//! helper, and spawn/handshake failures that never produced a bridge at
+//! all — do not pin the key: the send provably did not go out, so an
 //! immediate retry with the same key stays possible.
 //!
 //! Requests are served one thread per call, so "is this key free?" and "a
@@ -191,8 +192,12 @@ pub(crate) fn take_key(args: &mut Value) -> Result<Option<String>, String> {
     Ok(Some(key))
 }
 
-/// Failure codes whose outcome is genuinely ambiguous — the attempt may
-/// have committed inside the helper, so the key is pinned as unknown.
+/// Failure codes whose outcome is genuinely ambiguous WHEN A REQUEST WAS
+/// WRITTEN — the attempt may have committed inside the helper, so the key
+/// is pinned as unknown. The same codes are reused by a failed
+/// spawn/handshake (no bridge was ever produced), where provably nothing
+/// was written: callers must additionally require the request-written flag
+/// from `run_tool_retrying` (see `ToolRun`) before pinning on these codes.
 /// `helper_exited_unsent` provably never reached the helper and tool-level
 /// errors provably did not send; both leave the key free for a retry.
 pub(crate) fn ambiguous(code: &str) -> bool {

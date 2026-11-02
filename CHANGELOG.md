@@ -30,7 +30,8 @@ it can ship.
   `idempotency_unknown` rather than risking a double send. Concurrent
   same-key calls are refused with `idempotency_in_flight` while the first is
   still running (the key is claimed atomically, so two same-key calls can
-  never both dispatch). Clean failures release the key for an immediate
+  never both dispatch). Clean failures — including failed helper spawns,
+  where no request was ever written — release the key for an immediate
   retry. Keys are remembered for the server process only (last 128 keys,
   completed outcomes evicted before unknown pins) and are never forwarded to
   the helper.
