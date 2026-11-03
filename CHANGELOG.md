@@ -26,8 +26,9 @@ it can ship.
   server records the first attempt's outcome against the key and a repeated
   call with the same key replays the recorded outcome instead of dispatching
   a second send. A repeat is a replay only when its arguments are identical:
-  each key records a canonical fingerprint of the stripped arguments, and a
-  key reused with different arguments is refused with
+  each key records a fixed-size digest of the stripped arguments' canonical
+  form (32 bytes, so retention memory stays bounded regardless of mail body
+  size), and a key reused with different arguments is refused with
   `idempotency_key_reused` (replaying would return the old outcome while
   the new mail is silently never sent). An attempt that failed ambiguously
   (helper died mid-call, or the call timed out) pins the key — repeats are

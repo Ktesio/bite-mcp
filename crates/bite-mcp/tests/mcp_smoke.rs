@@ -688,6 +688,94 @@ fn idempotency_key_refuses_retry_after_ambiguous_death() {
     );
 }
 
+/// A KEYED mail_send whose call TIMED OUT (helper wedged mid-call after the
+/// request was written — it may already have sent the mail) must pin the
+/// key as `idempotency_unknown`: an identical retry is refused instead of
+/// dispatching again. This pins the `request_written` flag on the timeout
+/// arm (mcp.rs) — the double-send case the feature exists to stop: if that
+/// flag were dropped, the timeout would RELEASE the key and the retry
+/// would dispatch a second send while every test still passed.
+#[test]
+fn idempotency_key_pinned_after_timeout_refuses_identical_retry() {
+    let mut mcp = McpProc::start_scenario(
+        json!({
+            "echo": true,
+            "sleep_ms_per_call": 30_000,
+            "responses": { "mail.send": [
+                { "sent": true, "message_id": "first-attempt" },
+                { "sent": true, "message_id": "second-dispatch" }
+            ] }
+        }),
+        &[("BITE_TIMEOUT_SECS", "1")],
+    );
+
+    let init = mcp.request(
+        "initialize",
+        json!({
+            "protocolVersion": "2025-06-18",
+            "capabilities": {},
+            "clientInfo": { "name": "smoke", "version": "0" }
+        }),
+    );
+    assert_eq!(init["serverInfo"]["name"], json!("bite-mcp"));
+
+    // Keyed send wedges past the 1s budget: timeout error that says the
+    // helper was recycled and the call abandoned (request written, outcome
+    // unknown — the key must be pinned, not released).
+    let args = json!({
+        "name": "mail_send",
+        "arguments": { "to": ["a@b.c"], "subject": "hi", "idempotency_key": "k-to" }
+    });
+    let timed_out = mcp.request_raw("tools/call", args.clone());
+    assert_eq!(timed_out["error"]["code"], json!(-32000));
+    let msg = timed_out["error"]["message"]
+        .as_str()
+        .expect("error message");
+    assert!(
+        msg.contains("recycled") && msg.contains("abandoned"),
+        "the wedged keyed send must surface the timeout abandonment, got: {msg}"
+    );
+
+    // Identical retry with the SAME key: refused by the key guard with the
+    // pinned-unknown code — NOT a second dispatch (which would wedge for
+    // another budget window and surface the same recycled/abandoned text).
+    let retry = mcp.request_raw("tools/call", args);
+    assert_eq!(retry["error"]["code"], json!(-32000));
+    let msg = retry["error"]["message"].as_str().expect("error message");
+    assert!(
+        msg.contains("idempotency_unknown") && msg.contains("(timeout)"),
+        "an identical same-key retry after a timeout must hit the pinned-key \
+         refusal naming the ambiguous code, got: {msg}"
+    );
+    assert!(
+        !msg.contains("abandoned"),
+        "the refusal must come from the key guard, not a second timed-out \
+         dispatch: {msg}"
+    );
+
+    // Dispatch proof: rewrite to a healthy scenario; the NEXT real send (a
+    // fresh key) receives the first queued response. If the refused retry
+    // had dispatched, it would have respawned the helper under the sleeping
+    // scenario and wedged again — the refusal above already proves it did
+    // not, and this leg keeps the discriminator observable.
+    mcp.rewrite_scenario(json!({
+        "echo": true,
+        "responses": { "mail.send": [{ "sent": true, "message_id": "second-dispatch" }] }
+    }));
+    let fresh = mcp.request(
+        "tools/call",
+        json!({
+            "name": "mail_send",
+            "arguments": { "to": ["a@b.c"], "subject": "hi", "idempotency_key": "k-after-to" }
+        }),
+    );
+    assert_eq!(fresh["isError"], json!(false));
+    assert_eq!(
+        fresh["structuredContent"]["message_id"],
+        json!("second-dispatch")
+    );
+}
+
 /// Key validation happens before any helper involvement: an empty key is
 /// an `invalid_params` error, not a send.
 #[test]

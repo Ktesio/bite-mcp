@@ -19,10 +19,11 @@
 //! immediate retry with the same key stays possible.
 //!
 //! A replay is only honest when the repeat call would send the SAME mail:
-//! each claim records a canonical fingerprint of the stripped arguments
-//! (see [`fingerprint`]), and a key reused with DIFFERENT arguments is
-//! refused outright (`idempotency_key_reused`) — replaying would return
-//! the first call's outcome while the second mail is silently never sent.
+//! each claim records a fixed-size digest of the canonical form of the
+//! stripped arguments (see [`fingerprint`]), and a key reused with
+//! DIFFERENT arguments is refused outright (`idempotency_key_reused`) —
+//! replaying would return the first call's outcome while the second mail
+//! is silently never sent.
 //!
 //! Requests are served one thread per call, so "is this key free?" and "a
 //! call is dispatching under it" cannot be two separate lock holds: a
@@ -37,12 +38,18 @@
 //! before the call is forwarded, so the Swift helper's contract is
 //! unchanged.
 
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, VecDeque};
 
 use serde_json::Value;
 
 /// The declared registry param name.
 pub(crate) const KEY_PARAM: &str = "idempotency_key";
+
+/// Fixed-size argument fingerprint stored per retained key: SHA-256 over
+/// the canonical argument text, so every entry costs 32 bytes regardless
+/// of mail body size and the MAX_KEYS cap bounds TOTAL retention memory.
+pub(crate) type Fingerprint = [u8; 32];
 
 /// Keys retained per server process. Beyond this the oldest settled key is
 /// evicted, completed outcomes before unknown pins; in-flight keys are
@@ -66,13 +73,14 @@ pub(crate) enum Recorded {
     InFlight,
 }
 
-/// One key's recorded state plus the canonical fingerprint of the stripped
-/// arguments its claim was made with (see [`fingerprint`]). A repeat whose
-/// fingerprint differs is refused as a reuse instead of replayed.
+/// One key's recorded state plus the fixed-size argument fingerprint of
+/// the stripped arguments its claim was made with (see [`fingerprint`]).
+/// A repeat whose fingerprint differs is refused as a reuse instead of
+/// replayed.
 #[derive(Debug)]
 struct Entry {
     state: Recorded,
-    fingerprint: String,
+    fingerprint: Fingerprint,
 }
 
 /// The result of atomically claiming a key via [`Idempotency::reserve`].
@@ -120,9 +128,9 @@ impl Idempotency {
     /// (or in-flight) entry claimed under different arguments yields
     /// [`Reserved::Reused`] — a replay would silently discard this call's
     /// arguments, so it is refused rather than replayed.
-    pub(crate) fn reserve(&mut self, key: &str, fingerprint: &str) -> Reserved {
+    pub(crate) fn reserve(&mut self, key: &str, fingerprint: &Fingerprint) -> Reserved {
         if let Some(entry) = self.map.get(key) {
-            if entry.fingerprint != fingerprint {
+            if entry.fingerprint != *fingerprint {
                 return Reserved::Reused;
             }
             return match &entry.state {
@@ -137,7 +145,7 @@ impl Idempotency {
             key.to_string(),
             Entry {
                 state: Recorded::InFlight,
-                fingerprint: fingerprint.to_string(),
+                fingerprint: *fingerprint,
             },
         );
         Reserved::Fresh
@@ -245,52 +253,57 @@ pub(crate) fn take_key(args: &mut Value) -> Result<Option<String>, String> {
     Ok(Some(key))
 }
 
-/// Canonical fingerprint of the STRIPPED arguments (the key is already
-/// gone) that a keyed call dispatches with: JSON text with every object's
-/// keys sorted. Raw `serde_json::to_string` is NOT canonical in this
-/// workspace — the `preserve_order` feature rides into the graph through
-/// the dependency stack, so the map serializes in insertion order and the
-/// same call serialized twice with different key order would fingerprint
-/// apart. Sorting makes two argument objects that differ only in key
-/// order fingerprint identically, while any difference in the values the
-/// helper would see still fingerprints differently. A key reused under a
-/// different fingerprint is refused instead of replayed.
-pub(crate) fn fingerprint(stripped_args: &Value) -> String {
-    let mut out = String::new();
-    canonical_json(stripped_args, &mut out);
-    out
+/// Fixed-size fingerprint of the STRIPPED arguments (the key is already
+/// gone) that a keyed call dispatches with: SHA-256 over the canonical
+/// text — JSON with every object's keys sorted. Raw `serde_json::to_string`
+/// is NOT canonical in this workspace — the `preserve_order` feature rides
+/// into the graph through the dependency stack, so the map serializes in
+/// insertion order and the same call serialized twice with different key
+/// order would fingerprint apart. Sorting makes two argument objects that
+/// differ only in key order fingerprint identically, while any difference
+/// in the values the helper would see still fingerprints differently; the
+/// canonical text is streamed straight into the hasher (never materialized
+/// as one string), so the stored fingerprint is always 32 bytes regardless
+/// of mail body size and the MAX_KEYS retention cap bounds total memory. A
+/// key reused under a different fingerprint is refused instead of
+/// replayed. (sha2 is already in the dependency graph via bite-index.)
+pub(crate) fn fingerprint(stripped_args: &Value) -> Fingerprint {
+    let mut hasher = Sha256::new();
+    let mut push = |chunk: &str| hasher.update(chunk.as_bytes());
+    canonical_json(stripped_args, &mut push);
+    hasher.finalize().into()
 }
 
-/// Serialize a value to JSON text with object keys sorted (arrays keep
-/// their order — JSON arrays are ordered by definition). Scalars reuse
-/// serde_json's own rendering.
-fn canonical_json(value: &Value, out: &mut String) {
+/// Write the canonical form of a value — JSON text with object keys sorted
+/// (arrays keep their order — JSON arrays are ordered by definition) — into
+/// `push` in chunks. Scalars reuse serde_json's own rendering.
+fn canonical_json(value: &Value, push: &mut impl FnMut(&str)) {
     match value {
         Value::Object(map) => {
             let mut keys: Vec<&str> = map.keys().map(String::as_str).collect();
             keys.sort_unstable();
-            out.push('{');
+            push("{");
             for (i, key) in keys.iter().enumerate() {
                 if i > 0 {
-                    out.push(',');
+                    push(",");
                 }
-                out.push_str(&serde_json::to_string(key).expect("str serializes"));
-                out.push(':');
-                canonical_json(&map[*key], out);
+                push(&serde_json::to_string(key).expect("str serializes"));
+                push(":");
+                canonical_json(&map[*key], push);
             }
-            out.push('}');
+            push("}");
         }
         Value::Array(items) => {
-            out.push('[');
+            push("[");
             for (i, item) in items.iter().enumerate() {
                 if i > 0 {
-                    out.push(',');
+                    push(",");
                 }
-                canonical_json(item, out);
+                canonical_json(item, push);
             }
-            out.push(']');
+            push("]");
         }
-        scalar => out.push_str(&serde_json::to_string(scalar).expect("a Value serializes")),
+        scalar => push(&serde_json::to_string(scalar).expect("a Value serializes")),
     }
 }
 
@@ -310,6 +323,13 @@ pub(crate) fn ambiguous(code: &str) -> bool {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// Test fingerprints: the real `fingerprint()` over a JSON scalar of
+    /// the label — production always digests the stripped-argument object,
+    /// but any stable digest serves the state-machine tests below.
+    fn fp(label: &str) -> Fingerprint {
+        fingerprint(&json!(label))
+    }
 
     #[test]
     fn take_key_strips_and_validates() {
@@ -352,13 +372,13 @@ mod tests {
     #[test]
     fn reserve_claims_fresh_and_refuses_concurrent_same_key() {
         let mut idem = Idempotency::default();
-        assert!(matches!(idem.reserve("k", "args"), Reserved::Fresh));
+        assert!(matches!(idem.reserve("k", &fp("args")), Reserved::Fresh));
         // A second claim while the first is still in flight is refused —
         // this is the check-then-act race the single lock hold closes.
-        assert!(matches!(idem.reserve("k", "args"), Reserved::InFlight));
+        assert!(matches!(idem.reserve("k", &fp("args")), Reserved::InFlight));
         idem.settle("k", Settled::Done(json!({ "sent": true })));
         // Once settled, repeats replay the recorded outcome instead.
-        match idem.reserve("k", "args") {
+        match idem.reserve("k", &fp("args")) {
             Reserved::Done(v) => assert_eq!(v, json!({ "sent": true })),
             other => panic!("expected replay after settle, got {other:?}"),
         }
@@ -367,10 +387,10 @@ mod tests {
     #[test]
     fn release_frees_a_cleanly_failed_key_for_retry() {
         let mut idem = Idempotency::default();
-        assert!(matches!(idem.reserve("k", "args"), Reserved::Fresh));
+        assert!(matches!(idem.reserve("k", &fp("args")), Reserved::Fresh));
         idem.release("k");
         assert!(
-            matches!(idem.reserve("k", "args"), Reserved::Fresh),
+            matches!(idem.reserve("k", &fp("args")), Reserved::Fresh),
             "a clean failure must free the key for an immediate retry"
         );
     }
@@ -378,7 +398,7 @@ mod tests {
     #[test]
     fn settle_keeps_order_and_map_in_lockstep() {
         let mut idem = Idempotency::default();
-        assert!(matches!(idem.reserve("k", "args"), Reserved::Fresh));
+        assert!(matches!(idem.reserve("k", &fp("args")), Reserved::Fresh));
         idem.settle("k", Settled::Unknown("timeout".into()));
         assert_eq!(idem.order.len(), 1);
         assert_eq!(idem.map.len(), 1);
@@ -387,7 +407,7 @@ mod tests {
         // key it reserved, before any settle).
         idem.release("k");
         assert!(
-            matches!(idem.reserve("k", "args"), Reserved::Unknown(_)),
+            matches!(idem.reserve("k", &fp("args")), Reserved::Unknown(_)),
             "release on a settled key is a no-op"
         );
     }
@@ -395,22 +415,22 @@ mod tests {
     #[test]
     fn reused_key_with_different_arguments_is_refused() {
         let mut idem = Idempotency::default();
-        assert!(matches!(idem.reserve("k", "args-a"), Reserved::Fresh));
+        assert!(matches!(idem.reserve("k", &fp("args-a")), Reserved::Fresh));
         idem.settle("k", Settled::Done(json!({ "sent": true })));
         // Identical arguments: the recorded outcome replays.
-        match idem.reserve("k", "args-a") {
+        match idem.reserve("k", &fp("args-a")) {
             Reserved::Done(v) => assert_eq!(v, json!({ "sent": true })),
             other => panic!("an identical repeat must replay, got {other:?}"),
         }
         // Different arguments: refused — a replay would return the old
         // outcome while this call's mail is silently never sent.
         assert!(
-            matches!(idem.reserve("k", "args-b"), Reserved::Reused),
+            matches!(idem.reserve("k", &fp("args-b")), Reserved::Reused),
             "a key reused with different arguments must be refused, not replayed"
         );
         // The refusal leaves the recording untouched: an identical repeat
         // still replays afterwards.
-        match idem.reserve("k", "args-a") {
+        match idem.reserve("k", &fp("args-a")) {
             Reserved::Done(v) => assert_eq!(v, json!({ "sent": true })),
             other => panic!("the recording must survive a refused reuse, got {other:?}"),
         }
@@ -422,25 +442,28 @@ mod tests {
         // Unknown pin claimed under args-a: different arguments are refused
         // as a reuse — WHICH arguments were pinned matters, not just that
         // the key is pinned.
-        idem.reserve("u", "args-a");
+        idem.reserve("u", &fp("args-a"));
         idem.settle("u", Settled::Unknown("timeout".into()));
-        assert!(matches!(idem.reserve("u", "args-b"), Reserved::Reused));
+        assert!(matches!(idem.reserve("u", &fp("args-b")), Reserved::Reused));
         // The pin survives the refused reuse for the original arguments.
-        match idem.reserve("u", "args-a") {
+        match idem.reserve("u", &fp("args-a")) {
             Reserved::Unknown(code) => assert_eq!(code, "timeout"),
             other => panic!("expected the unknown pin to survive, got {other:?}"),
         }
         // In flight: a different-arguments repeat is a reuse refusal (the
         // argument mismatch is the stronger fact); identical repeats still
         // see InFlight.
-        idem.reserve("i", "args-a");
-        assert!(matches!(idem.reserve("i", "args-b"), Reserved::Reused));
-        assert!(matches!(idem.reserve("i", "args-a"), Reserved::InFlight));
+        idem.reserve("i", &fp("args-a"));
+        assert!(matches!(idem.reserve("i", &fp("args-b")), Reserved::Reused));
+        assert!(matches!(
+            idem.reserve("i", &fp("args-a")),
+            Reserved::InFlight
+        ));
         // A cleanly released key is free for ANY arguments — nothing was
         // recorded, so new arguments have nothing to desynchronize.
-        idem.reserve("r", "args-a");
+        idem.reserve("r", &fp("args-a"));
         idem.release("r");
-        assert!(matches!(idem.reserve("r", "args-b"), Reserved::Fresh));
+        assert!(matches!(idem.reserve("r", &fp("args-b")), Reserved::Fresh));
     }
 
     #[test]
@@ -466,39 +489,65 @@ mod tests {
     }
 
     #[test]
+    fn fingerprint_is_fixed_size_regardless_of_payload() {
+        // The retention cap bounds the NUMBER of entries; storing raw
+        // argument text would leave per-entry memory proportional to the
+        // mail body (128 keyed sends with 2 MB bodies would retain ~256 MB
+        // of fingerprint strings in the long-lived server). The digest
+        // bounds each entry at 32 bytes no matter the payload.
+        let small = fingerprint(&json!({ "to": ["a@b.c"], "body": "hi" }));
+        let big = fingerprint(&json!({
+            "to": ["a@b.c"],
+            "body": "x".repeat(2_000_000)
+        }));
+        assert_eq!(small.len(), 32);
+        assert_eq!(big.len(), 32, "digest size must not grow with the body");
+        assert_ne!(small, big, "the digest must still distinguish payloads");
+    }
+
+    #[test]
     fn eviction_prefers_done_before_unknown_and_never_in_flight() {
         let mut idem = Idempotency::default();
         // k0 pinned unknown (ambiguous), k1..=k{MAX_KEYS-1} done, plus one
         // key left in flight.
-        idem.reserve("k0", "args");
+        idem.reserve("k0", &fp("args"));
         idem.settle("k0", Settled::Unknown("helper_exited".into()));
         for i in 1..MAX_KEYS {
             let key = format!("k{i}");
-            idem.reserve(&key, "args");
+            idem.reserve(&key, &fp("args"));
             idem.settle(&key, Settled::Done(json!({ "i": i })));
         }
-        assert!(matches!(idem.reserve("k-live", "args"), Reserved::Fresh));
+        assert!(matches!(
+            idem.reserve("k-live", &fp("args")),
+            Reserved::Fresh
+        ));
 
         // Cap reached: the next reserve evicts the OLDEST Done (k1) — not
         // the older unknown pin (k0), never the in-flight key.
-        assert!(matches!(idem.reserve("k-new", "args"), Reserved::Fresh));
-        match idem.reserve("k0", "args") {
+        assert!(matches!(
+            idem.reserve("k-new", &fp("args")),
+            Reserved::Fresh
+        ));
+        match idem.reserve("k0", &fp("args")) {
             Reserved::Unknown(code) => assert_eq!(code, "helper_exited"),
             other => panic!("unknown pin must outlive settled sends, got {other:?}"),
         }
         assert!(
-            matches!(idem.reserve("k1", "args"), Reserved::Fresh),
+            matches!(idem.reserve("k1", &fp("args")), Reserved::Fresh),
             "the oldest completed outcome is the eviction victim"
         );
         assert!(
-            matches!(idem.reserve("k-live", "args"), Reserved::InFlight),
+            matches!(idem.reserve("k-live", &fp("args")), Reserved::InFlight),
             "in-flight keys are never evicted"
         );
         // The reserved-not-yet-settled key is still in flight; once its
         // owner settles, repeats replay.
-        assert!(matches!(idem.reserve("k-new", "args"), Reserved::InFlight));
+        assert!(matches!(
+            idem.reserve("k-new", &fp("args")),
+            Reserved::InFlight
+        ));
         idem.settle("k-new", Settled::Done(json!({ "n": 1 })));
-        match idem.reserve("k-new", "args") {
+        match idem.reserve("k-new", &fp("args")) {
             Reserved::Done(v) => assert_eq!(v, json!({ "n": 1 })),
             other => panic!("expected replay after settle, got {other:?}"),
         }
