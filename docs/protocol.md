@@ -97,8 +97,13 @@ Server-plane note — MCP `mail_send` additionally accepts an optional
 before the bridge; the helper contract above is unchanged): the first
 attempt's outcome is recorded against the key for the server process's
 lifetime, and a repeated call with the same key replays that recorded
-outcome verbatim instead of dispatching a second send. If the recorded
-attempt failed ambiguously — the helper died mid-call or the call timed out
+outcome verbatim instead of dispatching a second send. A replay requires
+identical arguments: each key records a fingerprint of the stripped
+arguments it was claimed with, and a repeat whose arguments differ is
+refused with `idempotency_key_reused` — the recorded outcome would
+describe a different send, and the new mail would silently never go out.
+If the recorded attempt failed ambiguously — the helper died mid-call or
+the call timed out
 (it may or may not have been sent) — the key is pinned as unknown and
 repeated calls are refused with `idempotency_unknown` instead of risking a
 double send: confirm the original outcome, then use a fresh key. While a

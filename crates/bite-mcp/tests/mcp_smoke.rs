@@ -533,6 +533,86 @@ fn idempotency_key_replays_outcome_without_resending() {
     );
 }
 
+/// A key REUSED with different arguments must be refused
+/// (`idempotency_key_reused`), never replayed: a replay would return the
+/// first call's success while the second mail is silently never sent. The
+/// queued second response staying UNCONSUMED is the proof — a fresh-key
+/// call afterwards receives it, showing the refused call never dispatched.
+#[test]
+fn idempotency_key_reused_with_different_arguments_is_refused() {
+    let mut mcp = McpProc::start_scenario(
+        json!({
+            "echo": true,
+            "responses": { "mail.send": [
+                { "sent": true, "message_id": "first-attempt" },
+                { "sent": true, "message_id": "second-dispatch" }
+            ] }
+        }),
+        &[],
+    );
+
+    let init = mcp.request(
+        "initialize",
+        json!({
+            "protocolVersion": "2025-06-18",
+            "capabilities": {},
+            "clientInfo": { "name": "smoke", "version": "0" }
+        }),
+    );
+    assert_eq!(init["serverInfo"]["name"], json!("bite-mcp"));
+
+    // First call under k-1: dispatches, outcome recorded.
+    let first = mcp.request(
+        "tools/call",
+        json!({
+            "name": "mail_send",
+            "arguments": { "to": ["a@b.c"], "subject": "hi", "idempotency_key": "k-1" }
+        }),
+    );
+    assert_eq!(first["isError"], json!(false));
+    assert_eq!(
+        first["structuredContent"]["message_id"],
+        json!("first-attempt")
+    );
+
+    // Same key, DIFFERENT subject: refused with the reuse error — the
+    // recorded outcome describes a different send.
+    let reused = mcp.request_raw(
+        "tools/call",
+        json!({
+            "name": "mail_send",
+            "arguments": { "to": ["a@b.c"], "subject": "other", "idempotency_key": "k-1" }
+        }),
+    );
+    assert_eq!(reused["error"]["code"], json!(-32000));
+    let msg = reused["error"]["message"].as_str().expect("error message");
+    assert!(
+        msg.contains("idempotency_key_reused"),
+        "a key reused with different arguments must be refused, got: {msg}"
+    );
+    assert!(
+        msg.contains("different arguments"),
+        "the refusal must name the argument mismatch, got: {msg}"
+    );
+
+    // The refused call never dispatched: a fresh key consumes the
+    // still-queued second response.
+    let fresh = mcp.request(
+        "tools/call",
+        json!({
+            "name": "mail_send",
+            "arguments": { "to": ["a@b.c"], "subject": "hi", "idempotency_key": "k-2" }
+        }),
+    );
+    assert_eq!(fresh["isError"], json!(false));
+    assert_eq!(
+        fresh["structuredContent"]["message_id"],
+        json!("second-dispatch"),
+        "the refused reuse must not have dispatched — the queued response \
+         is still here for the next caller"
+    );
+}
+
 /// An idempotency key whose attempt failed AMBIGUOUSLY (helper died
 /// mid-call — it may already have sent the mail) is pinned: a retry with
 /// the same key is refused with `idempotency_unknown` even though a fresh

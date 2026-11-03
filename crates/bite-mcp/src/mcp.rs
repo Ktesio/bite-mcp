@@ -265,14 +265,16 @@ fn handle_request(state: &ServerState, method: &str, params: &Value) -> Result<V
 
 /// `run_tool_retrying` wrapped with client-keyed idempotency for the tools
 /// that declare `idempotency_key` (`mail_send` today): a repeated call with
-/// the same key replays the recorded outcome instead of dispatching a
-/// second send, a key whose attempt failed ambiguously is refused outright,
-/// and a key whose call is still in flight in another request thread is
-/// refused with `idempotency_in_flight` — the claim and the lookup happen
-/// under one lock, so concurrent same-key calls cannot both dispatch. The
-/// key is stripped from the forwarded arguments, so the helper never sees
-/// it. Tools without the param — and calls without a key — take exactly the
-/// `run_tool_retrying` path.
+/// the same key AND identical arguments replays the recorded outcome
+/// instead of dispatching a second send, a key reused with DIFFERENT
+/// arguments is refused with `idempotency_key_reused` (a replay would
+/// silently discard the new arguments), a key whose attempt failed
+/// ambiguously is refused outright, and a key whose call is still in flight
+/// in another request thread is refused with `idempotency_in_flight` — the
+/// claim and the lookup happen under one lock, so concurrent same-key
+/// calls cannot both dispatch. The key is stripped from the forwarded
+/// arguments, so the helper never sees it. Tools without the param — and
+/// calls without a key — take exactly the `run_tool_retrying` path.
 fn run_tool_idempotent(
     state: &ServerState,
     name: &str,
@@ -296,11 +298,39 @@ fn run_tool_idempotent(
     let Some(key) = key else {
         return run_tool_retrying(state, name, args).outcome;
     };
+    // Fingerprint the stripped arguments this call would dispatch with: a
+    // replay must return the recorded outcome for the SAME call, so a key
+    // reused with different arguments is refused outright instead of
+    // silently discarding them.
+    let fingerprint = idempotency::fingerprint(&args);
     // Claim the key and read any prior state in ONE lock hold: requests are
     // served one thread per call, so a separate lookup and dispatch would
     // let two concurrent same-key calls both reach the helper.
-    match state.idempotency.lock().unwrap().reserve(&key) {
+    match state
+        .idempotency
+        .lock()
+        .unwrap()
+        .reserve(&key, &fingerprint)
+    {
         idempotency::Reserved::Done(value) => return Ok(value),
+        idempotency::Reserved::Reused => {
+            let mut e = bite_bridge::BridgeError::new(
+                "idempotency_key_reused",
+                format!(
+                    "this idempotency_key was already used for a {name} call with \
+                     different arguments — a replay would silently discard the \
+                     new arguments and return the earlier outcome, so this call \
+                     was refused"
+                ),
+            );
+            e.fix = Some(
+                "reuse an idempotency_key only to retry the SAME call \
+                 (identical arguments); use a fresh idempotency_key for new \
+                 arguments"
+                    .into(),
+            );
+            return Err(BiteError(e));
+        }
         idempotency::Reserved::Unknown(code) => {
             let mut e = bite_bridge::BridgeError::new(
                 "idempotency_unknown",
