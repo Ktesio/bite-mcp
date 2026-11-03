@@ -39,6 +39,17 @@ it can ship.
   already has a section or is not the newest, or when the rewritten file
   fails the conformance check (the original file is left untouched in
   every refusal case).
+- "Helper death & retry semantics" section in docs/protocol.md: documents
+  the `helper_exited_unsent` (provably never delivered — any tool may be
+  replayed) vs ambiguous `helper_exited` (written but unanswered —
+  replay-safe tools only) split, the narrow unsent guarantee (a failed
+  write leaves at worst an unparseable truncated fragment), the server's
+  respawn-then-maybe-replay behavior with its refusal message and fix
+  hint, the per-tool `replay_safe` registry flag, and the sibling
+  `timeout` arm (wedged helper recycled, call abandoned, never replayed).
+  The error-codes table also gains the previously undocumented
+  `helper_spawn_failed`, `protocol_error`, `helper_exited` and
+  `helper_exited_unsent` rows.
 
 ### Fixed
 

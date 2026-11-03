@@ -59,7 +59,52 @@ mirrored to stderr.
 | `invalid_params` | schema violation | fix the call |
 | `app_not_running` / `app_missing` | target app missing | install/launch the app |
 | `timeout` | Apple Event call exceeded watchdog | retry |
+| `helper_spawn_failed` | helper could not be (re)spawned | run `bite install-helper --force` |
+| `protocol_error` | malformed/unsupported helper traffic | check helper vs server versions |
+| `helper_exited` | helper died mid-call; outcome unknown | see [helper death & retry semantics](#helper-death--retry-semantics) |
+| `helper_exited_unsent` | request provably never reached the helper | any call is safe to retry |
 | `internal` | unexpected failure | see message |
+
+## Helper death & retry semantics
+
+A helper process can die mid-call. Two exit codes split the outcome, and a
+client (or adapter) author must treat them differently:
+
+| code | produced when | did the call run? | who may replay |
+|------|---------------|-------------------|----------------|
+| `helper_exited_unsent` | the request write itself failed, or the transport was already torn down before anything was written for this id | provably not | any tool, mutating included |
+| `helper_exited` | the request was written but the helper exited before responding (mid-call death) | unknown — it may have committed | replay-safe tools only |
+
+The `unsent` guarantee is narrow and deliberate: a failed write/flush means
+at worst a truncated fragment reached the pipe, and the helper cannot parse
+— so cannot execute — a partial line. Everything after a successful write
+is the ambiguous variant, because only the helper knows whether the Apple
+Event fired before it died.
+
+The server applies this split before a client ever sees it
+(`mcp::run_tool_retrying` and the dispatch layer): on either code it
+respawns the helper, then replays the call only when the failure was
+`helper_exited_unsent` or the tool is replay-safe. When it refuses, the
+error message is suffixed "the helper was respawned but the call was not
+replayed — it may or may not have taken effect" with a fix hint to
+re-check state (search before re-sending, list before deleting) before
+re-issuing non-idempotent operations.
+
+Replay safety is a per-tool registry flag (`bite-core` `registry.rs`):
+read-only and idempotent tools are replay-safe; the mutating
+send/create/update class and the destructive preview-gated delete class
+are not — their first attempt may already have committed, and a blind
+replay would double-send mail or duplicate a create. Tests assert every
+mutating tool carries the non-replay-safe flag.
+
+A `timeout` is handled like the ambiguous arm: the wedged helper is
+recycled and the call abandoned — never replayed, even for read-only
+tools — with the message "the wedged helper was recycled and the call was
+abandoned — it may or may not have taken effect". The two outcomes a
+client can actually observe on a mutating tool are therefore the refused
+`helper_exited` and the abandoned `timeout`; both mean the same thing —
+the effect is unknown — and both call for re-checking state (search
+before re-sending, list before deleting) before re-issuing.
 
 ## Method table
 
