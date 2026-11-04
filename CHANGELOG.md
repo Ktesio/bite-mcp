@@ -41,15 +41,21 @@ it can ship.
   every refusal case).
 - "Helper death & retry semantics" section in docs/protocol.md: documents
   the `helper_exited_unsent` (provably never delivered — any tool may be
-  replayed) vs ambiguous `helper_exited` (written but unanswered —
-  replay-safe tools only) split, the narrow unsent guarantee (a failed
-  write leaves at worst an unparseable truncated fragment), the server's
-  respawn-then-maybe-replay behavior with its refusal message and fix
-  hint, the per-tool `replay_safe` registry flag, and the sibling
-  `timeout` arm (wedged helper recycled, call abandoned, never replayed).
-  The error-codes table also gains the previously undocumented
-  `helper_spawn_failed`, `protocol_error`, `helper_exited` and
-  `helper_exited_unsent` rows.
+  replayed) vs ambiguous `helper_exited` split (either the request was
+  written but went unanswered, or the helper died during spawn/handshake
+  before any request was written — the code does not distinguish the two;
+  replay-safe tools only), the narrow unsent guarantee (a failed write
+  leaves at worst an unparseable truncated fragment), the
+  respawn-then-maybe-replay behavior shared by the MCP server and the
+  CLI dispatch layer — with its refusal message and fix hint, and the
+  caveat that errors raised during spawn/handshake reach the caller
+  as-is, with no respawn, replay or suffix — the per-tool `replay_safe`
+  registry flag, and the sibling `timeout` arm (the MCP path recycles
+  the wedged helper and abandons the call, never replaying it; the CLI
+  surfaces the plain `timeout`; a hello-handshake timeout at spawn
+  arrives bare on both paths). The error-codes table also gains the
+  previously undocumented `helper_spawn_failed`, `protocol_error`,
+  `helper_exited` and `helper_exited_unsent` rows.
 
 ### Fixed
 

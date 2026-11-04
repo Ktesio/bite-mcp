@@ -58,7 +58,7 @@ mirrored to stderr.
 | `not_found` | id/mailbox/folder/attachment missing | check earlier search results |
 | `invalid_params` | schema violation | fix the call |
 | `app_not_running` / `app_missing` | target app missing | install/launch the app |
-| `timeout` | Apple Event call exceeded watchdog | effect unknown; re-check state before re-issuing (see [helper death & retry semantics](#helper-death--retry-semantics)) |
+| `timeout` | Apple Event call exceeded watchdog — or the helper's hello handshake timed out at spawn (that one arrives bare; see below) | effect unknown; re-check state before re-issuing (see [helper death & retry semantics](#helper-death--retry-semantics)) |
 | `helper_spawn_failed` | helper could not be (re)spawned | run `bite install-helper --force` |
 | `protocol_error` | malformed/unsupported helper traffic | check helper vs server versions |
 | `helper_exited` | helper died mid-call, or died during spawn/handshake before any request was written; outcome unknown | see [helper death & retry semantics](#helper-death--retry-semantics) |
@@ -93,6 +93,12 @@ replayed — it may or may not have taken effect" with a fix hint to
 re-check state (search before re-sending, list before deleting) before
 re-issuing non-idempotent operations.
 
+One case never reaches that logic on either path: a `helper_exited`, or
+a hello-handshake `timeout`, raised while the helper is being spawned or
+handshaking — before any request is written — is returned to the caller
+as-is, with no respawn, no replay attempt and no suffix. Retrying the
+call simply spawns a fresh helper.
+
 Replay safety is a per-tool registry flag (`bite-core` `registry.rs`):
 read-only and idempotent tools are replay-safe; the mutating
 send/create/update class and the destructive preview-gated
@@ -109,7 +115,12 @@ abandoned — never replayed, even for read-only tools — with the message
 "the wedged helper was recycled and the call was abandoned — it may or
 may not have taken effect". The CLI path (`dispatch::call`) does not
 match `timeout`: it surfaces the plain error unchanged, with no recycle
-and no suffix. Whatever the path, any `helper_exited` or `timeout`
+and no suffix. One `timeout` never reaches that arm on either path: the
+hello handshake itself timing out during spawn ("helper did not send
+hello within 15s") is raised before any request is written, so it
+reaches the caller bare — no recycle, no suffix — and the call provably
+never ran; issuing it again spawns a fresh helper. Whatever the path,
+any `helper_exited` or `timeout`
 observed on a mutating tool — with or without a suffix — means the
 effect is unknown: re-check state (search before re-sending, list
 before deleting) before re-issuing. The replay after a
