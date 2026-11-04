@@ -698,13 +698,12 @@ fn idempotency_key_refuses_retry_after_ambiguous_death() {
 #[test]
 fn idempotency_key_pinned_after_timeout_refuses_identical_retry() {
     let mut mcp = McpProc::start_scenario(
+        // No response entries: the helper sleeps 30s before every response,
+        // so this scenario's queue is never read — the wedged call is killed
+        // at the 1s budget long before any entry would be served.
         json!({
             "echo": true,
-            "sleep_ms_per_call": 30_000,
-            "responses": { "mail.send": [
-                { "sent": true, "message_id": "first-attempt" },
-                { "sent": true, "message_id": "second-dispatch" }
-            ] }
+            "sleep_ms_per_call": 30_000
         }),
         &[("BITE_TIMEOUT_SECS", "1")],
     );
@@ -736,9 +735,22 @@ fn idempotency_key_pinned_after_timeout_refuses_identical_retry() {
         "the wedged keyed send must surface the timeout abandonment, got: {msg}"
     );
 
+    // Rewrite to a healthy two-entry scenario BEFORE the retry: only a
+    // helper (re)spawned after this point reads it, and the wedged one was
+    // already recycled — so every dispatch from here on draws from this
+    // queue, in order.
+    mcp.rewrite_scenario(json!({
+        "echo": true,
+        "responses": { "mail.send": [
+            { "sent": true, "message_id": "dispatch-1" },
+            { "sent": true, "message_id": "dispatch-2" }
+        ] }
+    }));
+
     // Identical retry with the SAME key: refused by the key guard with the
-    // pinned-unknown code — NOT a second dispatch (which would wedge for
-    // another budget window and surface the same recycled/abandoned text).
+    // pinned-unknown code — NOT a dispatch. Under the healthy scenario a
+    // leaked dispatch would answer quickly with a queued entry, so the
+    // error asserts below catch it here as well.
     let retry = mcp.request_raw("tools/call", args);
     assert_eq!(retry["error"]["code"], json!(-32000));
     let msg = retry["error"]["message"].as_str().expect("error message");
@@ -753,15 +765,11 @@ fn idempotency_key_pinned_after_timeout_refuses_identical_retry() {
          dispatch: {msg}"
     );
 
-    // Dispatch proof: rewrite to a healthy scenario; the NEXT real send (a
-    // fresh key) receives the first queued response. If the refused retry
-    // had dispatched, it would have respawned the helper under the sleeping
-    // scenario and wedged again — the refusal above already proves it did
-    // not, and this leg keeps the discriminator observable.
-    mcp.rewrite_scenario(json!({
-        "echo": true,
-        "responses": { "mail.send": [{ "sent": true, "message_id": "second-dispatch" }] }
-    }));
+    // Fresh key: the ONLY legitimate dispatch after the rewrite. It
+    // respawns the helper (loading the two-entry scenario) and must get
+    // the FIRST entry. If the refused retry above had reached a helper,
+    // it would already have consumed "dispatch-1" and this send would
+    // answer "dispatch-2" — failing here.
     let fresh = mcp.request(
         "tools/call",
         json!({
@@ -772,7 +780,7 @@ fn idempotency_key_pinned_after_timeout_refuses_identical_retry() {
     assert_eq!(fresh["isError"], json!(false));
     assert_eq!(
         fresh["structuredContent"]["message_id"],
-        json!("second-dispatch")
+        json!("dispatch-1")
     );
 }
 
