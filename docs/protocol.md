@@ -58,7 +58,7 @@ mirrored to stderr.
 | `not_found` | id/mailbox/folder/attachment missing | check earlier search results |
 | `invalid_params` | schema violation | fix the call |
 | `app_not_running` / `app_missing` | target app missing | install/launch the app |
-| `timeout` | Apple Event call exceeded watchdog — or the helper's hello handshake timed out at spawn (that one arrives bare; see below) | effect unknown; re-check state before re-issuing (see [helper death & retry semantics](#helper-death--retry-semantics)) |
+| `timeout` | Apple Event call exceeded watchdog — or no response arrived within the Rust-side per-call wait (`call_timeout` → `recv_timeout` at the configured or explicit budget) while the helper was still alive (a helper dead at that point surfaces `helper_exited` instead) — or the helper's hello handshake timed out at spawn (that one arrives bare; see below) | effect unknown; re-check state before re-issuing (see [helper death & retry semantics](#helper-death--retry-semantics)) |
 | `helper_spawn_failed` | helper could not be (re)spawned | run `bite install-helper --force` |
 | `protocol_error` | malformed/unsupported helper traffic | check helper vs server versions |
 | `helper_exited` | helper died mid-call, or died during spawn/handshake before any request was written; outcome unknown | see [helper death & retry semantics](#helper-death--retry-semantics) |
