@@ -1255,6 +1255,15 @@ pub fn forget(params: &Value) -> Result<Value, BiteError> {
         index
             .refresh_fts()
             .map_err(|e| BridgeError::new("index_error", e.to_string()))?;
+        // Compaction only writes NEW fragments: the pre-compaction data
+        // files still hold the purged plaintext until the old table
+        // versions referencing them are pruned, and lance's default prune
+        // window is 7 days. Prune eagerly — under the writer lock — so the
+        // reclaim completes before index_forget returns (this also drops
+        // the FTS index fragments the refresh just replaced).
+        index
+            .prune_versions()
+            .map_err(|e| BridgeError::new("index_error", e.to_string()))?;
         // Record the scope so the purge SURVIVES later full crawls (they
         // would otherwise re-import the same rows from Apple). Failure is
         // surfaced, not swallowed: an unrecorded purge is silently undone by

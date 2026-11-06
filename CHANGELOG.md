@@ -18,8 +18,14 @@ it can ship.
   left a sparse purge — one mailbox out of a large index — soft-deleted,
   its rows masked in every query path but still present in the data files
   inside the 0700 data dir. The purge path now runs a forced compaction
-  (deletion-materialize threshold zero) before the FTS refresh, pinned by
-  a test that fails while any soft-deleted row survives a purge, and
+  (deletion-materialize threshold zero) before the FTS refresh, then an
+  eager version prune (`older_than` zero, under the writer lock) so the
+  pre-purge fragments are deleted during the call instead of lingering —
+  readable via time travel — for lance's default 7-day version window.
+  Pinned by tests that fail while any soft-deleted row survives a purge
+  or any pre-purge file (or purged marker byte) remains on disk. Note the
+  forced compaction is table-wide: on a large long-lived index it can
+  rewrite most fragments and hold other writers while it runs.
   PRIVACY.md now states both the immediate reclamation and its limits
   (index files only — not secure erasure; OS and backup copies are out of
   scope).

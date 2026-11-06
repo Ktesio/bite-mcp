@@ -392,6 +392,16 @@ impl EntityIndex {
     /// stays soft-deleted: rows are masked in every query path but remain
     /// physically present in the data files. The `index_forget` path calls
     /// this so a purge reclaims the bytes at ANY deletion ratio.
+    ///
+    /// Scope warning: this is a TABLE-WIDE compaction — lance rewrites every
+    /// fragment that carries a deletion vector, not just fragments the purge
+    /// touched. Routine `merge_insert` re-ingests soft-delete old row
+    /// versions, so on a long-lived index most older fragments carry a few
+    /// deleted rows and one small purge rewrites large parts of the table
+    /// while the caller holds the cross-process writer lock. Follow with
+    /// [`Self::prune_versions`] to drop the pre-compaction files (and the
+    /// replaced FTS index fragments) — compaction alone leaves the old
+    /// versions, and with them the purged plaintext, on disk.
     pub fn compact_deletions(&self) -> Result<(), IndexError> {
         self.rt.block_on(async {
             use lancedb::table::{CompactionOptions, OptimizeAction};
@@ -422,6 +432,37 @@ impl EntityIndex {
             // figure now rides TableStatistics (populated from the
             // dataset-level count on every successful stats call).
             Ok(table.stats().await?.num_deleted_rows.unwrap_or(0))
+        })
+    }
+
+    /// Drop old table versions and delete the files only they reference.
+    ///
+    /// Lance changes are additive: compaction writes new data files and a
+    /// new manifest, but every PRE-compaction version still references the
+    /// old fragments — which still hold the purged rows' plaintext — and
+    /// those files stay on disk until the versions referencing them are
+    /// pruned. The only other prune on the hot path (`refresh_fts`'
+    /// `optimize(All)`) keeps lance's default `older_than` of 7 days, so
+    /// without an eager prune a purge's bytes linger at least a week and
+    /// longer if nothing else optimizes.
+    ///
+    /// `index_forget` calls this AFTER `compact_deletions` and
+    /// `refresh_fts`, so one prune also drops the FTS index fragments the
+    /// rebuild replaced. Safe with `delete_unverified` because the caller
+    /// holds the cross-process writer lock — no other process can be
+    /// mid-transaction on this table.
+    pub fn prune_versions(&self) -> Result<(), IndexError> {
+        self.rt.block_on(async {
+            use lancedb::table::OptimizeAction;
+            let table = self.table().await?;
+            table
+                .optimize(OptimizeAction::Prune {
+                    older_than: Some(chrono::Duration::zero()),
+                    delete_unverified: Some(true),
+                    error_if_tagged_old_versions: Some(false),
+                })
+                .await?;
+            Ok(())
         })
     }
 
@@ -969,6 +1010,85 @@ mod tests {
             0,
             "purge compaction must materialize deletions below the default 10% threshold"
         );
+        assert_eq!(idx.count(None).unwrap(), 50);
+        assert_eq!(idx.count(Some("id = 'purged1'")).unwrap(), 0);
+    }
+
+    #[test]
+    fn purge_prune_reclaims_old_version_files() {
+        // Compaction alone leaves the PRE-compaction data files on disk:
+        // every old table version still references them (time travel), and
+        // lance prunes old versions only after 7 days by default. The
+        // purge path's eager prune must delete those files NOW — the
+        // on-disk bytes are the whole point of index_forget, and
+        // soft_deleted_rows() reads only the LATEST manifest's deletion
+        // vectors, so it passes while the purged plaintext still sits in
+        // old fragments.
+        use std::collections::HashSet;
+        fn walk(root: &std::path::Path) -> HashSet<std::path::PathBuf> {
+            let mut out = HashSet::new();
+            let mut stack = vec![root.to_path_buf()];
+            while let Some(d) = stack.pop() {
+                for e in std::fs::read_dir(&d).unwrap() {
+                    let e = e.unwrap();
+                    if e.file_type().unwrap().is_dir() {
+                        stack.push(e.path());
+                    } else {
+                        out.insert(e.path());
+                    }
+                }
+            }
+            out
+        }
+
+        let dir = temp_dir("purge-prune");
+        let idx = EntityIndex::open(&dir).unwrap();
+
+        let mut rows: Vec<_> = (0..50)
+            .map(|i| {
+                record(
+                    "mail",
+                    &format!("live{i}"),
+                    "Real",
+                    "quarterly report attached",
+                    Some(true),
+                )
+            })
+            .collect();
+        rows.push(record(
+            "mail",
+            "purged1",
+            "Spam",
+            "unique purge marker body",
+            Some(false),
+        ));
+        idx.ingest(&rows).unwrap();
+
+        idx.delete_where("id = 'purged1'").unwrap();
+        idx.compact_deletions().unwrap();
+        idx.refresh_fts().unwrap();
+        assert_eq!(idx.soft_deleted_rows().unwrap(), 0);
+        // Pre-prune state: compaction wrote new fragments, but the files
+        // the old versions reference are all still here.
+        let before = walk(&dir);
+        idx.prune_versions().unwrap();
+        let after = walk(&dir);
+        let gone: Vec<_> = before.difference(&after).collect();
+        assert!(
+            !gone.is_empty(),
+            "eager prune must delete the pre-compaction files — nothing disappeared"
+        );
+        // The purged plaintext is absent from EVERY file still on disk
+        // (data fragments, manifests, FTS index files alike).
+        let marker = b"unique purge marker body";
+        for f in &after {
+            let bytes = std::fs::read(f).unwrap();
+            assert!(
+                !bytes.windows(marker.len()).any(|w| w == marker),
+                "purge marker still on disk in {}",
+                f.display()
+            );
+        }
         assert_eq!(idx.count(None).unwrap(), 50);
         assert_eq!(idx.count(Some("id = 'purged1'")).unwrap(), 0);
     }

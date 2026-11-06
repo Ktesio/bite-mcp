@@ -221,7 +221,13 @@ from the LOCAL index only — Apple data is never touched — scoped by exact
 `app` and/or `container` names. Without `confirm` it returns a
 `would_delete` count; with `confirm` it deletes the scope, then compacts
 the FTS index so purged bodies stop answering queries (dead fragments would
-otherwise hold plaintext until the next optimize). The purge is DURABLE:
+otherwise hold plaintext until the next optimize), then prunes the old
+table versions so the pre-purge data files are actually deleted during
+the call — lance would otherwise keep them (readable via time-travel
+checkouts) for its default 7-day version window. The forced compaction is
+table-wide, so a large long-lived index can make the call take a while;
+the cross-process writer lock is held for the whole reclaim. The purge is
+DURABLE:
 the confirmed scope is recorded (0600 `purge-scopes.json` in the data dir)
 and every later ingest skips rows inside it, so delta crawls, `full: true`
 rebuilds, the full schedule a stale/failed predecessor triggers, and the

@@ -56,10 +56,18 @@ with your data. bite itself adds no network hop; choose agents you trust.
   calendar, list, folder or chat) drops those rows after a
   `would_delete` preview; `bite index wipe` (CLI) removes the entire index
   plus the crawl watermark. Both act on the LOCAL copy only. A confirmed
-  `index_forget` also reclaims during the call: the affected data files are
-  compacted immediately with the deletion threshold pinned to zero, so
-  purged text does not linger behind deletion markers regardless of how
-  sparse the purge is (one mailbox out of a large index included). This is
+  `index_forget` also reclaims during the call, in three steps: the
+  affected rows are deleted (masked in every query path immediately), the
+  data files are compacted with the deletion threshold pinned to zero so
+  the purge reclaims at ANY deletion ratio (one mailbox out of a large
+  index included), and the old table versions that still reference the
+  pre-purge fragments are pruned on the spot — without that eager prune
+  the purged text would stay readable in old data files (and via
+  time-travel checkouts) for lance's default 7-day version window. Two
+  honest caveats: the forced compaction is table-wide (lance rewrites
+  every fragment carrying deletions, not just the purged scope's files),
+  so on a large long-lived index `index_forget` can take a while and
+  other writers wait for it; and this is
   index reclamation, not secure erasure — the operating system may retain
   overwritten disk blocks, and Time Machine or other backups may still hold
   older index files. A scoped `index_forget` is durable: the scope is
