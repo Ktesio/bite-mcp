@@ -400,7 +400,12 @@ impl EntityIndex {
             // for all fragments with deletions."
             options.materialize_deletions_threshold = 0.0;
             let table = self.table().await?;
-            table.optimize(OptimizeAction::Compact { options }).await?;
+            table
+                .optimize(OptimizeAction::Compact {
+                    options,
+                    remap_options: None,
+                })
+                .await?;
             Ok(())
         })
     }
@@ -411,7 +416,10 @@ impl EntityIndex {
     pub fn soft_deleted_rows(&self) -> Result<usize, IndexError> {
         self.rt.block_on(async {
             let table = self.table().await?;
-            Ok(table.count_deleted_rows().await?)
+            // lancedb 0.41 dropped Table::count_deleted_rows; the same
+            // figure now rides TableStatistics (populated from the
+            // dataset-level count on every successful stats call).
+            Ok(table.stats().await?.num_deleted_rows.unwrap_or(0))
         })
     }
 
