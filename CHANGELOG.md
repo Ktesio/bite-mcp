@@ -42,6 +42,17 @@ it can ship.
 
 ### Fixed
 
+- The `msrv` CI lane never tested the declared floor: the rust-toolchain
+  action carried no `toolchain` input and the repo has no
+  `rust-toolchain.toml`, so the lane resolved `stable` — which is how the
+  lancedb 0.41 / lance 14 stack bump (#74) merged green despite declaring
+  `rust-version = 1.94` and being unbuildable on the declared 1.91 floor.
+  The MSRV policy now moves to 1.94 to match the dependency graph: root
+  `rust-version`, the `mise.toml` pin, and an explicit
+  `with: toolchain: 1.94.0` on the msrv job, so the lane tests the floor
+  it claims and a future floor-moving dependency bump reds CI instead of
+  slipping through. Fixes #76.
+
 - `.gitignore` had no entry for Python bytecode directories while the repo
   now ships Python that CI and contributors execute (`scripts/check_changelog.py`,
   and `tests/test_check_changelog.py` from the self-test battery): importing
