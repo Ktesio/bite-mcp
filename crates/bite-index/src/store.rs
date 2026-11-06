@@ -385,6 +385,36 @@ impl EntityIndex {
         })
     }
 
+    /// Force-materialize every deletion vector: compaction with the
+    /// materialize threshold pinned to zero. `refresh_fts`'s
+    /// `optimize(All)` keeps lance's default threshold (10% of a fragment
+    /// deleted), so a sparse purge — one mailbox out of a large index —
+    /// stays soft-deleted: rows are masked in every query path but remain
+    /// physically present in the data files. The `index_forget` path calls
+    /// this so a purge reclaims the bytes at ANY deletion ratio.
+    pub fn compact_deletions(&self) -> Result<(), IndexError> {
+        self.rt.block_on(async {
+            use lancedb::table::{CompactionOptions, OptimizeAction};
+            let mut options = CompactionOptions::default();
+            // Lance: "Setting to zero (or lower) will materialize deletions
+            // for all fragments with deletions."
+            options.materialize_deletions_threshold = 0.0;
+            let table = self.table().await?;
+            table.optimize(OptimizeAction::Compact { options }).await?;
+            Ok(())
+        })
+    }
+
+    /// Rows soft-deleted via deletion vectors but still physically present
+    /// in the data files — zero once compaction materializes them. Test
+    /// surface for the purge-reclamation pin.
+    pub fn soft_deleted_rows(&self) -> Result<usize, IndexError> {
+        self.rt.block_on(async {
+            let table = self.table().await?;
+            Ok(table.count_deleted_rows().await?)
+        })
+    }
+
     pub fn count(&self, filter: Option<&str>) -> Result<usize, IndexError> {
         self.rt.block_on(async {
             let table = self.table().await?;
@@ -879,6 +909,58 @@ mod tests {
         // stats
         let stats = idx.stats().unwrap();
         assert_eq!(stats.total, 2);
+    }
+
+    #[test]
+    fn purge_compaction_materializes_sparse_deletions() {
+        // A sparse purge (1 row in ~50, far below lance's default 10%
+        // materialize threshold) must still leave the data files — the
+        // index_forget retention promise cannot depend on the deletion
+        // ratio. Pins the primitives forget() composes on the purge path:
+        // delete_where -> compact_deletions -> refresh_fts.
+        let dir = temp_dir("purge-sparse-compaction");
+        let idx = EntityIndex::open(&dir).unwrap();
+
+        let mut rows: Vec<_> = (0..50)
+            .map(|i| {
+                record(
+                    "mail",
+                    &format!("live{i}"),
+                    "Real",
+                    "quarterly report attached",
+                    Some(true),
+                )
+            })
+            .collect();
+        rows.push(record(
+            "mail",
+            "purged1",
+            "Spam",
+            "unique purge marker body",
+            Some(false),
+        ));
+        idx.ingest(&rows).unwrap();
+
+        idx.delete_where("id = 'purged1'").unwrap();
+        // Discriminator: a fresh delete is SOFT — the live count already
+        // excludes the row, but the bytes sit in a deletion vector. This
+        // is exactly the state the default threshold would leave behind
+        // indefinitely on a sparse purge.
+        assert_eq!(idx.count(Some("id = 'purged1'")).unwrap(), 0);
+        assert_eq!(idx.soft_deleted_rows().unwrap(), 1);
+
+        // The purge path's forced compaction folds the deletion away at
+        // any ratio; refresh_fts (as in forget()) then rebuilds FTS over
+        // the compacted fragments.
+        idx.compact_deletions().unwrap();
+        idx.refresh_fts().unwrap();
+        assert_eq!(
+            idx.soft_deleted_rows().unwrap(),
+            0,
+            "purge compaction must materialize deletions below the default 10% threshold"
+        );
+        assert_eq!(idx.count(None).unwrap(), 50);
+        assert_eq!(idx.count(Some("id = 'purged1'")).unwrap(), 0);
     }
 
     #[test]

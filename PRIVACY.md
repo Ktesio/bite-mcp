@@ -55,8 +55,15 @@ with your data. bite itself adds no network hop; choose agents you trust.
   `index_forget` (MCP, scoped to one app and/or container — mailbox,
   calendar, list, folder or chat) drops those rows after a
   `would_delete` preview; `bite index wipe` (CLI) removes the entire index
-  plus the crawl watermark. Both act on the LOCAL copy only. A scoped
-  `index_forget` is durable: the scope is recorded and later crawls skip
+  plus the crawl watermark. Both act on the LOCAL copy only. A confirmed
+  `index_forget` also reclaims during the call: the affected data files are
+  compacted immediately with the deletion threshold pinned to zero, so
+  purged text does not linger behind deletion markers regardless of how
+  sparse the purge is (one mailbox out of a large index included). This is
+  index reclamation, not secure erasure — the operating system may retain
+  overwritten disk blocks, and Time Machine or other backups may still hold
+  older index files. A scoped `index_forget` is durable: the scope is
+  recorded and later crawls skip
   it, so a full re-crawl does not re-import what you deliberately purged
   (`index_status` lists the recorded scopes). To re-include a purged
   scope, `bite index wipe` gives a clean slate with no purge records and a

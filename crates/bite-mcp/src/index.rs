@@ -1245,8 +1245,13 @@ pub fn forget(params: &Value) -> Result<Value, BiteError> {
             .delete_where(&filter)
             .map_err(|e| BridgeError::new("index_error", e.to_string()))?;
         // Deleted rows leave dead FTS fragments that still hold plaintext
-        // until compaction — fold them away immediately instead of waiting
-        // for the next crawl-settled optimize.
+        // until compaction — and lance's default compaction threshold (10%
+        // of a fragment deleted) would leave a sparse purge soft-deleted in
+        // the data files indefinitely. Reclaim at ANY ratio, now, instead
+        // of waiting for the next crawl-settled optimize.
+        index
+            .compact_deletions()
+            .map_err(|e| BridgeError::new("index_error", e.to_string()))?;
         index
             .refresh_fts()
             .map_err(|e| BridgeError::new("index_error", e.to_string()))?;

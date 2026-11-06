@@ -11,6 +11,19 @@ it can ship.
 
 ## [Unreleased]
 
+### Fixed
+
+- `index_forget` now reclaims purged rows physically at any deletion
+  ratio: lance's default compaction threshold (10% of a fragment deleted)
+  left a sparse purge — one mailbox out of a large index — soft-deleted,
+  its rows masked in every query path but still present in the data files
+  inside the 0700 data dir. The purge path now runs a forced compaction
+  (deletion-materialize threshold zero) before the FTS refresh, pinned by
+  a test that fails while any soft-deleted row survives a purge, and
+  PRIVACY.md now states both the immediate reclamation and its limits
+  (index files only — not secure erasure; OS and backup copies are out of
+  scope).
+
 ### Added
 
 - Configuration reference: docs/configuration.md now documents every
