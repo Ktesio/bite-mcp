@@ -4,6 +4,7 @@ description = "Domain layer for bite: tool registry, params, config, dates, erro
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+rust-version.workspace = true
 
 [dependencies]
 bite-bridge = { path = "../bite-bridge", version = "0.5.0" }
