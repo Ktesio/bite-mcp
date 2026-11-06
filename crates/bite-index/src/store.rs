@@ -395,10 +395,12 @@ impl EntityIndex {
     pub fn compact_deletions(&self) -> Result<(), IndexError> {
         self.rt.block_on(async {
             use lancedb::table::{CompactionOptions, OptimizeAction};
-            let mut options = CompactionOptions::default();
             // Lance: "Setting to zero (or lower) will materialize deletions
             // for all fragments with deletions."
-            options.materialize_deletions_threshold = 0.0;
+            let options = CompactionOptions {
+                materialize_deletions_threshold: 0.0,
+                ..Default::default()
+            };
             let table = self.table().await?;
             table
                 .optimize(OptimizeAction::Compact {
