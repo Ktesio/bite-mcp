@@ -58,8 +58,77 @@ mirrored to stderr.
 | `not_found` | id/mailbox/folder/attachment missing | check earlier search results |
 | `invalid_params` | schema violation | fix the call |
 | `app_not_running` / `app_missing` | target app missing | install/launch the app |
-| `timeout` | Apple Event call exceeded watchdog | retry |
+| `timeout` | Apple Event call exceeded watchdog — or no response arrived within the Rust-side per-call wait (`call_timeout` → `recv_timeout` at the configured or explicit budget) while the helper was still alive (a helper dead at that point surfaces `helper_exited` instead) — or the helper's hello handshake timed out at spawn (that one arrives bare; see below) | effect unknown; re-check state before re-issuing (see [helper death & retry semantics](#helper-death--retry-semantics)) |
+| `helper_spawn_failed` | helper could not be (re)spawned | run `bite install-helper --force` |
+| `protocol_error` | malformed/unsupported helper traffic | check helper vs server versions |
+| `helper_exited` | helper died mid-call, or died during spawn/handshake before any request was written; outcome unknown | see [helper death & retry semantics](#helper-death--retry-semantics) |
+| `helper_exited_unsent` | request provably never reached the helper | any call is safe to retry |
 | `internal` | unexpected failure | see message |
+
+## Helper death & retry semantics
+
+A helper process can die mid-call — or die during spawn/handshake, before
+any request is written; a first call against a crashing helper produces
+the same ambiguous code. Two exit codes split the outcome, and a
+client (or adapter) author must treat them differently:
+
+| code | produced when | did the call run? | who may replay |
+|------|---------------|-------------------|----------------|
+| `helper_exited_unsent` | the request write itself failed, or the transport was already torn down before anything was written for this id | provably not | any tool, mutating included |
+| `helper_exited` | the request was written but the helper exited before responding (mid-call death), or the helper died during spawn/handshake before this request was written | mid-call death: unknown — it may have committed; spawn/handshake death: provably not, but the code does not distinguish the two | replay-safe tools only |
+
+The `unsent` guarantee is narrow and deliberate: a failed write/flush means
+at worst a truncated fragment reached the pipe, and the helper cannot parse
+— so cannot execute — a partial line. Everything after a successful write
+is the ambiguous variant, because only the helper knows whether the Apple
+Event fired before it died.
+
+Both the MCP server path (`mcp::run_tool_retrying`) and the CLI path
+(`dispatch::call`) apply this split before the caller ever sees it:
+on either code it
+respawns the helper, then replays the call only when the failure was
+`helper_exited_unsent` or the tool is replay-safe. When it refuses, the
+error message is suffixed "the helper was respawned but the call was not
+replayed — it may or may not have taken effect" with a fix hint to
+re-check state (search before re-sending, list before deleting) before
+re-issuing non-idempotent operations.
+
+One case never reaches that logic on either path: a `helper_exited`, or
+a hello-handshake `timeout`, raised while the helper is being spawned or
+handshaking — before any request is written — is returned to the caller
+as-is, with no respawn, no replay attempt and no suffix. Retrying the
+call simply spawns a fresh helper.
+
+Replay safety is a per-tool registry flag (`bite-core` `registry.rs`):
+read-only and idempotent tools are replay-safe; the mutating
+send/create/update class and the destructive preview-gated
+(delete/move/bulk/forget) class are not — their first attempt may
+already have committed, and a blind replay would double-send mail or
+duplicate a create. Tests pin the send/create/update tools and every
+tool whose name carries a mutating verb as non-replay-safe; idempotent
+set-to-state tools (`mail_mark`, `index_crawl_cancel`) are deliberately
+replay-safe.
+
+On the MCP server path (`mcp::run_tool_retrying`) a `timeout` is handled
+like the ambiguous arm: the wedged helper is recycled and the call
+abandoned — never replayed, even for read-only tools — with the message
+"the wedged helper was recycled and the call was abandoned — it may or
+may not have taken effect". The CLI path (`dispatch::call`) does not
+match `timeout`: it surfaces the plain error unchanged, with no recycle
+and no suffix. One `timeout` never reaches that arm on either path: the
+hello handshake itself timing out during spawn ("helper did not send
+hello within 15s") is raised before any request is written, so it
+reaches the caller bare — no recycle, no suffix — and the call provably
+never ran; issuing it again spawns a fresh helper. Whatever the path,
+any `helper_exited` or `timeout`
+observed on a mutating tool — with or without a suffix — means the
+effect is unknown: re-check state (search before re-sending, list
+before deleting) before re-issuing. The replay after a
+`helper_exited_unsent` can itself fail — the fresh helper can die
+mid-call (a bare `helper_exited` with no suffix), time out (a bare
+`timeout`), or die at spawn/handshake again, and a failed respawn
+surfaces `helper_spawn_failed` — the same unknown-effect rule applies
+to all of them.
 
 ## Method table
 
