@@ -51,7 +51,11 @@ it can ship.
   `rust-version`, the `mise.toml` pin, and an explicit
   `with: toolchain: 1.94.0` on the msrv job, so the lane tests the floor
   it claims and a future floor-moving dependency bump reds CI instead of
-  slipping through. Fixes #76.
+  slipping through. All four member crates now inherit
+  `rust-version.workspace = true`, so the published crates declare an
+  MSRV of 1.94 too — `cargo install bite-mcp` on an older toolchain
+  fails up front at the resolver instead of deep in the lance stack.
+  Fixes #76.
 
 - `.gitignore` had no entry for Python bytecode directories while the repo
   now ships Python that CI and contributors execute (`scripts/check_changelog.py`,
