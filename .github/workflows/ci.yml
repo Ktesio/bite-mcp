@@ -101,13 +101,18 @@ jobs:
       - name: Install protoc (required by the Lance stack)
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
 
-      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # 1.91.0
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # toolchain pinned below
+        with:
+          # Explicit input: with no rust-toolchain.toml in this repo, the
+          # action's default resolves `stable` and the lane silently stops
+          # testing the floor (#76).
+          toolchain: 1.94.0
 
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
 
       - name: Check workspace builds on the MSRV
-        # Floor set by the dependency graph: lancedb 0.39 / lance 12 declare
-        # rust-version = 1.91.0 (edition 2024); datafusion 54 declares 1.88.
+        # Floor set by the dependency graph: the lancedb 0.41 / lance 14
+        # stack declares rust-version = 1.94.0; datafusion 54 declares 1.88.
         # --all-targets so dev-dependencies compile on the floor too. Keep in
         # lockstep with rust-version in the root Cargo.toml.
         run: cargo check --workspace --all-targets
