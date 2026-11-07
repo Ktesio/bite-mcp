@@ -249,6 +249,14 @@ fn schema() -> SchemaRef {
     ]))
 }
 
+/// True when an error is the transient not-found of a scan whose pinned
+/// table version was pruned mid-read by an eager `prune_versions`
+/// (`index_forget` reclamation) — retryable on a fresh table handle.
+fn is_pruned_version_gone(e: &IndexError) -> bool {
+    let msg = e.to_string().to_lowercase();
+    msg.contains("not found") || msg.contains("notfound")
+}
+
 /// Single-quote escape for SQL filter literals.
 pub fn sql_str(s: &str) -> String {
     format!("'{}'", s.replace('\'', "''"))
@@ -385,6 +393,100 @@ impl EntityIndex {
         })
     }
 
+    /// Force-materialize every deletion vector: compaction with the
+    /// materialize threshold pinned to zero. `refresh_fts`'s
+    /// `optimize(All)` keeps lance's default threshold (10% of a fragment
+    /// deleted), so a sparse purge — one mailbox out of a large index —
+    /// stays soft-deleted: rows are masked in every query path but remain
+    /// physically present in the data files. The `index_forget` path calls
+    /// this so a purge reclaims the bytes at ANY deletion ratio.
+    ///
+    /// Scope warning: this is a TABLE-WIDE compaction — lance rewrites every
+    /// fragment that carries a deletion vector, not just fragments the purge
+    /// touched. Routine `merge_insert` re-ingests soft-delete old row
+    /// versions, so on a long-lived index most older fragments carry a few
+    /// deleted rows and one small purge rewrites large parts of the table
+    /// while the caller holds the cross-process writer lock. Follow with
+    /// [`Self::prune_versions`] to drop the pre-compaction files (and the
+    /// replaced FTS index fragments) — compaction alone leaves the old
+    /// versions, and with them the purged plaintext, on disk.
+    pub fn compact_deletions(&self) -> Result<(), IndexError> {
+        self.rt.block_on(async {
+            use lancedb::table::{CompactionOptions, OptimizeAction};
+            // Lance: "Setting to zero (or lower) will materialize deletions
+            // for all fragments with deletions."
+            let options = CompactionOptions {
+                materialize_deletions_threshold: 0.0,
+                ..Default::default()
+            };
+            let table = self.table().await?;
+            table
+                .optimize(OptimizeAction::Compact {
+                    options,
+                    remap_options: None,
+                })
+                .await?;
+            Ok(())
+        })
+    }
+
+    /// Rows soft-deleted via deletion vectors but still physically present
+    /// in the data files — zero once compaction materializes them. Test
+    /// surface for the purge-reclamation pin.
+    pub fn soft_deleted_rows(&self) -> Result<usize, IndexError> {
+        self.rt.block_on(async {
+            let table = self.table().await?;
+            // lancedb 0.41 dropped Table::count_deleted_rows; the same
+            // figure now rides TableStatistics (populated from the
+            // dataset-level count on every successful stats call).
+            Ok(table.stats().await?.num_deleted_rows.unwrap_or(0))
+        })
+    }
+
+    /// Drop old table versions and delete the files only they reference.
+    ///
+    /// Lance changes are additive: compaction writes new data files and a
+    /// new manifest, but every PRE-compaction version still references the
+    /// old fragments — which still hold the purged rows' plaintext — and
+    /// those files stay on disk until the versions referencing them are
+    /// pruned. The only other prune on the hot path (`refresh_fts`'
+    /// `optimize(All)`) keeps lance's default `older_than` of 7 days, so
+    /// without an eager prune a purge's bytes linger at least a week and
+    /// longer if nothing else optimizes.
+    ///
+    /// `index_forget` calls this AFTER `compact_deletions` and
+    /// `refresh_fts`, so one prune also drops the FTS index fragments the
+    /// rebuild replaced.
+    ///
+    /// `delete_unverified` stays OFF deliberately. The purged plaintext
+    /// lives in files referenced by PRE-compaction manifests — verified
+    /// files — so the purge reclaims without it. Unverified files are
+    /// exactly an in-flight writer's not-yet-committed fragments, and the
+    /// writer flock does NOT rule them out (`ingest_pending` drops its
+    /// guard before the merge-inserts run, and readers never take it):
+    /// pruning them could delete an uncommitted ingest's files and leave
+    /// the table pointing at missing data. Files a crashed writer leaves
+    /// behind are swept by a later prune once they age past `older_than`.
+    ///
+    /// Concurrent readers: this prune deletes files that older table
+    /// versions reference, so a search already pinned to such a version
+    /// can fail with a transient not-found — [`Self::search`] retries once
+    /// on a fresh table handle to cover that window.
+    pub fn prune_versions(&self) -> Result<(), IndexError> {
+        self.rt.block_on(async {
+            use lancedb::table::OptimizeAction;
+            let table = self.table().await?;
+            table
+                .optimize(OptimizeAction::Prune {
+                    older_than: Some(chrono::Duration::zero()),
+                    delete_unverified: Some(false),
+                    error_if_tagged_old_versions: Some(false),
+                })
+                .await?;
+            Ok(())
+        })
+    }
+
     pub fn count(&self, filter: Option<&str>) -> Result<usize, IndexError> {
         self.rt.block_on(async {
             let table = self.table().await?;
@@ -398,6 +500,18 @@ impl EntityIndex {
     /// filter-only queries unless `skip_exact_count` is set (scan skipped,
     /// `None` returned); always `None` for FTS (page-capped).
     pub fn search(&self, q: &SearchQuery) -> Result<SearchResult, IndexError> {
+        // An `index_forget` in this or another process prunes old table
+        // versions eagerly (see `prune_versions`); a scan pinned to a
+        // pruned version fails with a transient not-found. One retry —
+        // `search_once` re-opens the table, pinning the current version —
+        // covers that window.
+        match self.search_once(q) {
+            Err(e) if is_pruned_version_gone(&e) => self.search_once(q),
+            r => r,
+        }
+    }
+
+    fn search_once(&self, q: &SearchQuery) -> Result<SearchResult, IndexError> {
         self.rt.block_on(async {
             let table = self.table().await?;
             let filter = filter_sql(q);
@@ -879,6 +993,154 @@ mod tests {
         // stats
         let stats = idx.stats().unwrap();
         assert_eq!(stats.total, 2);
+    }
+
+    #[test]
+    fn purge_compaction_materializes_sparse_deletions() {
+        // A sparse purge (1 row in ~50, far below lance's default 10%
+        // materialize threshold) must still leave the data files — the
+        // index_forget retention promise cannot depend on the deletion
+        // ratio. Pins the primitives forget() composes on the purge path:
+        // delete_where -> compact_deletions -> refresh_fts.
+        let dir = temp_dir("purge-sparse-compaction");
+        let idx = EntityIndex::open(&dir).unwrap();
+
+        let mut rows: Vec<_> = (0..50)
+            .map(|i| {
+                record(
+                    "mail",
+                    &format!("live{i}"),
+                    "Real",
+                    "quarterly report attached",
+                    Some(true),
+                )
+            })
+            .collect();
+        rows.push(record(
+            "mail",
+            "purged1",
+            "Spam",
+            "unique purge marker body",
+            Some(false),
+        ));
+        idx.ingest(&rows).unwrap();
+
+        idx.delete_where("id = 'purged1'").unwrap();
+        // Discriminator: a fresh delete is SOFT — the live count already
+        // excludes the row, but the bytes sit in a deletion vector. This
+        // is exactly the state the default threshold would leave behind
+        // indefinitely on a sparse purge.
+        assert_eq!(idx.count(Some("id = 'purged1'")).unwrap(), 0);
+        assert_eq!(idx.soft_deleted_rows().unwrap(), 1);
+
+        // The purge path's forced compaction folds the deletion away at
+        // any ratio; refresh_fts (as in forget()) then rebuilds FTS over
+        // the compacted fragments.
+        idx.compact_deletions().unwrap();
+        idx.refresh_fts().unwrap();
+        assert_eq!(
+            idx.soft_deleted_rows().unwrap(),
+            0,
+            "purge compaction must materialize deletions below the default 10% threshold"
+        );
+        assert_eq!(idx.count(None).unwrap(), 50);
+        assert_eq!(idx.count(Some("id = 'purged1'")).unwrap(), 0);
+    }
+
+    #[test]
+    fn purge_prune_reclaims_old_version_files() {
+        // Compaction alone leaves the PRE-compaction data files on disk:
+        // every old table version still references them (time travel), and
+        // lance prunes old versions only after 7 days by default. The
+        // purge path's eager prune must delete those files NOW — the
+        // on-disk bytes are the whole point of index_forget, and
+        // soft_deleted_rows() reads only the LATEST manifest's deletion
+        // vectors, so it passes while the purged plaintext still sits in
+        // old fragments.
+        use std::collections::HashSet;
+        fn walk(root: &std::path::Path) -> HashSet<std::path::PathBuf> {
+            let mut out = HashSet::new();
+            let mut stack = vec![root.to_path_buf()];
+            while let Some(d) = stack.pop() {
+                for e in std::fs::read_dir(&d).unwrap() {
+                    let e = e.unwrap();
+                    if e.file_type().unwrap().is_dir() {
+                        stack.push(e.path());
+                    } else {
+                        out.insert(e.path());
+                    }
+                }
+            }
+            out
+        }
+
+        let dir = temp_dir("purge-prune");
+        let idx = EntityIndex::open(&dir).unwrap();
+
+        let mut rows: Vec<_> = (0..50)
+            .map(|i| {
+                record(
+                    "mail",
+                    &format!("live{i}"),
+                    "Real",
+                    "quarterly report attached",
+                    Some(true),
+                )
+            })
+            .collect();
+        rows.push(record(
+            "mail",
+            "purged1",
+            "Spam",
+            "zqxpurgemarker",
+            Some(false),
+        ));
+        idx.ingest(&rows).unwrap();
+
+        // Positive control: the marker must be physically on disk BEFORE
+        // the purge, or the absence assert after the prune proves nothing
+        // (an encoding change that never wrote the marker raw would pass
+        // vacuously). A single rare TOKEN, not a phrase: the FTS inverted
+        // index stores tokens, so a phrase marker can vanish from the data
+        // files while its terms linger in a rebuilt index's dictionary —
+        // one token cannot hide that way.
+        let marker = b"zqxpurgemarker";
+        let pre_purge = walk(&dir);
+        let marker_present = pre_purge.iter().any(|f| {
+            let bytes = std::fs::read(f).unwrap();
+            bytes.windows(marker.len()).any(|w| w == marker)
+        });
+        assert!(
+            marker_present,
+            "marker token must be on disk before the purge (positive control)"
+        );
+
+        idx.delete_where("id = 'purged1'").unwrap();
+        idx.compact_deletions().unwrap();
+        idx.refresh_fts().unwrap();
+        assert_eq!(idx.soft_deleted_rows().unwrap(), 0);
+        // Pre-prune state: compaction wrote new fragments, but the files
+        // the old versions reference are all still here.
+        let before = walk(&dir);
+        idx.prune_versions().unwrap();
+        let after = walk(&dir);
+        let gone: Vec<_> = before.difference(&after).collect();
+        assert!(
+            !gone.is_empty(),
+            "eager prune must delete the pre-compaction files — nothing disappeared"
+        );
+        // The purged plaintext is absent from EVERY file still on disk
+        // (data fragments, manifests, FTS index/dictionary files alike).
+        for f in &after {
+            let bytes = std::fs::read(f).unwrap();
+            assert!(
+                !bytes.windows(marker.len()).any(|w| w == marker),
+                "purge marker still on disk in {}",
+                f.display()
+            );
+        }
+        assert_eq!(idx.count(None).unwrap(), 50);
+        assert_eq!(idx.count(Some("id = 'purged1'")).unwrap(), 0);
     }
 
     #[test]

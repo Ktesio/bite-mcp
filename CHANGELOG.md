@@ -83,6 +83,30 @@ it can ship.
   the checker as a module materializes `scripts/__pycache__/`, which sat
   untracked in the working tree — one `git add -A` away from riding a branch.
   A bare `__pycache__/` pattern now ignores it at any depth.
+- `index_forget` now reclaims purged rows physically at any deletion
+  ratio: lance's default compaction threshold (10% of a fragment deleted)
+  left a sparse purge — one mailbox out of a large index — soft-deleted,
+  its rows masked in every query path but still present in the data files
+  inside the 0700 data dir. The purge path now records the scope
+  immediately after the delete, then runs a forced compaction
+  (deletion-materialize threshold zero), the FTS refresh, and an eager
+  version prune (`older_than` zero, under the writer lock, with
+  `delete_unverified` off so an in-flight ingest's uncommitted fragments
+  are never deleted) — the pre-purge fragments are gone during the call
+  instead of lingering, readable via time travel, for lance's default
+  7-day version window. The reclamation steps are best-effort once the
+  scope is recorded: on failure the call still returns the purge with a
+  `reclaim_warning` instead of failing (a hard failure would leave the
+  scope unrecorded and let the next full re-crawl undo the purge). A
+  search concurrent with the reclaim can hit one transient not-found;
+  the index search path now retries once on a fresh table handle. Pinned
+  by tests that fail while any soft-deleted row survives a purge or any
+  pre-purge file (or the purge-marker token, with a positive control on
+  disk before the purge) remains after. Note the forced compaction is
+  table-wide: on a large long-lived index it can rewrite most fragments
+  and hold other writers while it runs. PRIVACY.md now states both the
+  immediate reclamation and its limits (index files only — not secure
+  erasure; OS and backup copies are out of scope).
 
 - `write_private` fsyncs the file's bytes but never the parent directory,
   so the rename itself was not crash-durable: on power loss an unsynced
