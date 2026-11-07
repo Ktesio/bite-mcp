@@ -96,6 +96,36 @@ impl McpProc {
         self.reader.read_line(&mut buf).expect("response line");
         serde_json::from_str(buf.trim()).expect("valid json response")
     }
+
+    /// Write several requests back-to-back WITHOUT waiting for any response
+    /// (JSON-RPC pipelining — the server dispatches each request on its own
+    /// thread), then read exactly one response per request, bucketed by id:
+    /// completion order is free. Returns the full response objects (errors
+    /// included) keyed by the JSON-RPC request id.
+    fn request_pipelined(
+        &mut self,
+        entries: &[(&str, Value)],
+    ) -> std::collections::HashMap<i64, Value> {
+        for (method, params) in entries {
+            self.next_id += 1;
+            let line =
+                json!({ "jsonrpc": "2.0", "id": self.next_id, "method": method, "params": params });
+            writeln!(self.stdin, "{line}").unwrap();
+        }
+        self.stdin.flush().unwrap();
+        let mut out = std::collections::HashMap::new();
+        for _ in entries {
+            let mut buf = String::new();
+            self.reader.read_line(&mut buf).expect("response line");
+            let v: Value = serde_json::from_str(buf.trim()).expect("valid json response");
+            let id = v["id"].as_i64().expect("response id");
+            assert!(
+                out.insert(id, v).is_none(),
+                "duplicate response for the same request id"
+            );
+        }
+        out
+    }
 }
 
 impl Drop for McpProc {
@@ -434,5 +464,513 @@ fn unsent_death_replays_mutating_tools_safely() {
         parsed["delivered_by"],
         json!("safe-replay"),
         "the mutating call must be replayed against the respawned helper"
+    );
+}
+
+/// `mail_send` with a client-supplied `idempotency_key`: the first
+/// completed attempt's outcome is recorded, and a repeated call with the
+/// same key replays it VERBATIM without dispatching a second send. The
+/// scripted queue is the discriminator: it holds two distinct responses, so
+/// an un-deduped second call would consume the second response — asserting
+/// the first response comes back again proves the helper was never asked.
+/// A different key is a fresh send and does consume the next response.
+#[test]
+fn idempotency_key_replays_outcome_without_resending() {
+    let mut mcp = McpProc::start_scenario(
+        json!({
+            "echo": true,
+            "responses": { "mail.send": [
+                { "sent": true, "message_id": "first-attempt" },
+                { "sent": true, "message_id": "second-dispatch" }
+            ] }
+        }),
+        &[],
+    );
+
+    let init = mcp.request(
+        "initialize",
+        json!({
+            "protocolVersion": "2025-06-18",
+            "capabilities": {},
+            "clientInfo": { "name": "smoke", "version": "0" }
+        }),
+    );
+    assert_eq!(init["serverInfo"]["name"], json!("bite-mcp"));
+
+    let args = json!({
+        "name": "mail_send",
+        "arguments": { "to": ["a@b.c"], "subject": "hi", "idempotency_key": "k-1" }
+    });
+    let first = mcp.request("tools/call", args.clone());
+    assert_eq!(first["isError"], json!(false));
+    assert_eq!(
+        first["structuredContent"]["message_id"],
+        json!("first-attempt")
+    );
+
+    // Same key: the recorded outcome, not the queued second dispatch.
+    let repeat = mcp.request("tools/call", args);
+    assert_eq!(repeat["isError"], json!(false));
+    assert_eq!(
+        repeat["structuredContent"]["message_id"],
+        json!("first-attempt"),
+        "a repeated idempotency_key must replay the recorded outcome — \
+         consuming 'second-dispatch' here would prove a second dispatch"
+    );
+
+    // A different key is a fresh send: it consumes the next queued response.
+    let fresh = mcp.request(
+        "tools/call",
+        json!({
+            "name": "mail_send",
+            "arguments": { "to": ["a@b.c"], "subject": "hi", "idempotency_key": "k-2" }
+        }),
+    );
+    assert_eq!(fresh["isError"], json!(false));
+    assert_eq!(
+        fresh["structuredContent"]["message_id"],
+        json!("second-dispatch")
+    );
+}
+
+/// A key REUSED with different arguments must be refused
+/// (`idempotency_key_reused`), never replayed: a replay would return the
+/// first call's success while the second mail is silently never sent. The
+/// queued second response staying UNCONSUMED is the proof — a fresh-key
+/// call afterwards receives it, showing the refused call never dispatched.
+#[test]
+fn idempotency_key_reused_with_different_arguments_is_refused() {
+    let mut mcp = McpProc::start_scenario(
+        json!({
+            "echo": true,
+            "responses": { "mail.send": [
+                { "sent": true, "message_id": "first-attempt" },
+                { "sent": true, "message_id": "second-dispatch" }
+            ] }
+        }),
+        &[],
+    );
+
+    let init = mcp.request(
+        "initialize",
+        json!({
+            "protocolVersion": "2025-06-18",
+            "capabilities": {},
+            "clientInfo": { "name": "smoke", "version": "0" }
+        }),
+    );
+    assert_eq!(init["serverInfo"]["name"], json!("bite-mcp"));
+
+    // First call under k-1: dispatches, outcome recorded.
+    let first = mcp.request(
+        "tools/call",
+        json!({
+            "name": "mail_send",
+            "arguments": { "to": ["a@b.c"], "subject": "hi", "idempotency_key": "k-1" }
+        }),
+    );
+    assert_eq!(first["isError"], json!(false));
+    assert_eq!(
+        first["structuredContent"]["message_id"],
+        json!("first-attempt")
+    );
+
+    // Same key, DIFFERENT subject: refused with the reuse error — the
+    // recorded outcome describes a different send.
+    let reused = mcp.request_raw(
+        "tools/call",
+        json!({
+            "name": "mail_send",
+            "arguments": { "to": ["a@b.c"], "subject": "other", "idempotency_key": "k-1" }
+        }),
+    );
+    assert_eq!(reused["error"]["code"], json!(-32000));
+    let msg = reused["error"]["message"].as_str().expect("error message");
+    assert!(
+        msg.contains("idempotency_key_reused"),
+        "a key reused with different arguments must be refused, got: {msg}"
+    );
+    assert!(
+        msg.contains("different arguments"),
+        "the refusal must name the argument mismatch, got: {msg}"
+    );
+
+    // The refused call never dispatched: a fresh key consumes the
+    // still-queued second response.
+    let fresh = mcp.request(
+        "tools/call",
+        json!({
+            "name": "mail_send",
+            "arguments": { "to": ["a@b.c"], "subject": "hi", "idempotency_key": "k-2" }
+        }),
+    );
+    assert_eq!(fresh["isError"], json!(false));
+    assert_eq!(
+        fresh["structuredContent"]["message_id"],
+        json!("second-dispatch"),
+        "the refused reuse must not have dispatched — the queued response \
+         is still here for the next caller"
+    );
+}
+
+/// An idempotency key whose attempt failed AMBIGUOUSLY (helper died
+/// mid-call — it may already have sent the mail) is pinned: a retry with
+/// the same key is refused with `idempotency_unknown` even though a fresh
+/// helper is available and would happily send again (the rewrite makes the
+/// respawned helper answer with a marker — only a broken guard would
+/// return it). A fresh key then goes through normally.
+#[test]
+fn idempotency_key_refuses_retry_after_ambiguous_death() {
+    let mut mcp = McpProc::start_scenario(
+        json!({ "echo": true, "responses": { "mail.send": [{ "exit": true }] } }),
+        &[],
+    );
+
+    let init = mcp.request(
+        "initialize",
+        json!({
+            "protocolVersion": "2025-06-18",
+            "capabilities": {},
+            "clientInfo": { "name": "smoke", "version": "0" }
+        }),
+    );
+    assert_eq!(init["serverInfo"]["name"], json!("bite-mcp"));
+
+    // First attempt with a key: the helper dies mid-call — ambiguous, the
+    // transport guard refuses the replay AND the key is pinned unknown.
+    let died = mcp.request_raw(
+        "tools/call",
+        json!({
+            "name": "mail_send",
+            "arguments": { "to": ["a@b.c"], "subject": "hi", "idempotency_key": "k-amb" }
+        }),
+    );
+    assert_eq!(died["error"]["code"], json!(-32000));
+    let msg = died["error"]["message"].as_str().expect("error message");
+    assert!(
+        msg.contains("not replayed"),
+        "ambiguous death must keep the transport guard, got: {msg}"
+    );
+
+    // The respawned helper would answer with this marker — a same-key retry
+    // must NOT reach it.
+    mcp.rewrite_scenario(json!({
+        "echo": true,
+        "responses": { "mail.send": [{ "sent": true, "delivered_by": "respawned-helper" }] }
+    }));
+
+    let retry = mcp.request_raw(
+        "tools/call",
+        json!({
+            "name": "mail_send",
+            "arguments": { "to": ["a@b.c"], "subject": "hi", "idempotency_key": "k-amb" }
+        }),
+    );
+    assert_eq!(retry["error"]["code"], json!(-32000));
+    let msg = retry["error"]["message"].as_str().expect("error message");
+    assert!(
+        msg.contains("idempotency_unknown"),
+        "same-key retry after an ambiguous death must be refused by the key guard, got: {msg}"
+    );
+
+    // A fresh key is a new send and does go through the (rewritten) helper.
+    let fresh = mcp.request(
+        "tools/call",
+        json!({
+            "name": "mail_send",
+            "arguments": { "to": ["a@b.c"], "subject": "hi", "idempotency_key": "k-after" }
+        }),
+    );
+    assert_eq!(fresh["isError"], json!(false));
+    assert_eq!(
+        fresh["structuredContent"]["delivered_by"],
+        json!("respawned-helper")
+    );
+}
+
+/// A KEYED mail_send whose call TIMED OUT (helper wedged mid-call after the
+/// request was written — it may already have sent the mail) must pin the
+/// key as `idempotency_unknown`: an identical retry is refused instead of
+/// dispatching again. This pins the `request_written` flag on the timeout
+/// arm (mcp.rs) — the double-send case the feature exists to stop: if that
+/// flag were dropped, the timeout would RELEASE the key and the retry
+/// would dispatch a second send while every test still passed.
+#[test]
+fn idempotency_key_pinned_after_timeout_refuses_identical_retry() {
+    let mut mcp = McpProc::start_scenario(
+        // No response entries: the helper sleeps 30s before every response,
+        // so this scenario's queue is never read — the wedged call is killed
+        // at the 1s budget long before any entry would be served.
+        json!({
+            "echo": true,
+            "sleep_ms_per_call": 30_000
+        }),
+        &[("BITE_TIMEOUT_SECS", "1")],
+    );
+
+    let init = mcp.request(
+        "initialize",
+        json!({
+            "protocolVersion": "2025-06-18",
+            "capabilities": {},
+            "clientInfo": { "name": "smoke", "version": "0" }
+        }),
+    );
+    assert_eq!(init["serverInfo"]["name"], json!("bite-mcp"));
+
+    // Keyed send wedges past the 1s budget: timeout error that says the
+    // helper was recycled and the call abandoned (request written, outcome
+    // unknown — the key must be pinned, not released).
+    let args = json!({
+        "name": "mail_send",
+        "arguments": { "to": ["a@b.c"], "subject": "hi", "idempotency_key": "k-to" }
+    });
+    let timed_out = mcp.request_raw("tools/call", args.clone());
+    assert_eq!(timed_out["error"]["code"], json!(-32000));
+    let msg = timed_out["error"]["message"]
+        .as_str()
+        .expect("error message");
+    assert!(
+        msg.contains("recycled") && msg.contains("abandoned"),
+        "the wedged keyed send must surface the timeout abandonment, got: {msg}"
+    );
+
+    // Rewrite to a healthy two-entry scenario BEFORE the retry: only a
+    // helper (re)spawned after this point reads it, and the wedged one was
+    // already recycled — so every dispatch from here on draws from this
+    // queue, in order.
+    mcp.rewrite_scenario(json!({
+        "echo": true,
+        "responses": { "mail.send": [
+            { "sent": true, "message_id": "dispatch-1" },
+            { "sent": true, "message_id": "dispatch-2" }
+        ] }
+    }));
+
+    // Identical retry with the SAME key: refused by the key guard with the
+    // pinned-unknown code — NOT a dispatch. Under the healthy scenario a
+    // leaked dispatch would answer quickly with a queued entry, so the
+    // error asserts below catch it here as well.
+    let retry = mcp.request_raw("tools/call", args);
+    assert_eq!(retry["error"]["code"], json!(-32000));
+    let msg = retry["error"]["message"].as_str().expect("error message");
+    assert!(
+        msg.contains("idempotency_unknown") && msg.contains("(timeout)"),
+        "an identical same-key retry after a timeout must hit the pinned-key \
+         refusal naming the ambiguous code, got: {msg}"
+    );
+    assert!(
+        !msg.contains("abandoned"),
+        "the refusal must come from the key guard, not a second timed-out \
+         dispatch: {msg}"
+    );
+
+    // Fresh key: the ONLY legitimate dispatch after the rewrite. It
+    // respawns the helper (loading the two-entry scenario) and must get
+    // the FIRST entry. If the refused retry above had reached a helper,
+    // it would already have consumed "dispatch-1" and this send would
+    // answer "dispatch-2" — failing here.
+    let fresh = mcp.request(
+        "tools/call",
+        json!({
+            "name": "mail_send",
+            "arguments": { "to": ["a@b.c"], "subject": "hi", "idempotency_key": "k-after-to" }
+        }),
+    );
+    assert_eq!(fresh["isError"], json!(false));
+    assert_eq!(
+        fresh["structuredContent"]["message_id"],
+        json!("dispatch-1")
+    );
+}
+
+/// Key validation happens before any helper involvement: an empty key is
+/// an `invalid_params` error, not a send.
+#[test]
+fn idempotency_key_validates_before_dispatch() {
+    let mut mcp = McpProc::start_scenario(json!({ "echo": true }), &[]);
+
+    let init = mcp.request(
+        "initialize",
+        json!({
+            "protocolVersion": "2025-06-18",
+            "capabilities": {},
+            "clientInfo": { "name": "smoke", "version": "0" }
+        }),
+    );
+    assert_eq!(init["serverInfo"]["name"], json!("bite-mcp"));
+
+    let resp = mcp.request_raw(
+        "tools/call",
+        json!({
+            "name": "mail_send",
+            "arguments": { "to": ["a@b.c"], "subject": "hi", "idempotency_key": "" }
+        }),
+    );
+    assert_eq!(resp["error"]["code"], json!(-32000));
+    let msg = resp["error"]["message"].as_str().expect("error message");
+    assert!(
+        msg.contains("idempotency_key") && msg.contains("invalid_params"),
+        "empty key must fail validation with a named fix, got: {msg}"
+    );
+}
+
+/// A helper that dies BEFORE its handshake line fails the spawn with the
+/// same `helper_exited` code a mid-call death uses — but provably no
+/// request was ever written, so the key must NOT be pinned unknown: an
+/// immediate retry with the SAME key dispatches once a healthy helper can
+/// spawn. The scripted respawn answer is the discriminator — a pinned key
+/// would refuse the retry with `idempotency_unknown` instead of returning
+/// the marker.
+#[test]
+fn spawn_failure_does_not_pin_idempotency_key() {
+    let mut mcp = McpProc::start_scenario(json!({ "echo": true, "exit_before_hello": true }), &[]);
+
+    let init = mcp.request(
+        "initialize",
+        json!({
+            "protocolVersion": "2025-06-18",
+            "capabilities": {},
+            "clientInfo": { "name": "smoke", "version": "0" }
+        }),
+    );
+    assert_eq!(init["serverInfo"]["name"], json!("bite-mcp"));
+
+    // First attempt: the helper spawn fails at the handshake. The error
+    // reuses the ambiguous `helper_exited` code, but nothing was sent.
+    let died = mcp.request_raw(
+        "tools/call",
+        json!({
+            "name": "mail_send",
+            "arguments": { "to": ["a@b.c"], "subject": "hi", "idempotency_key": "k-spawn" }
+        }),
+    );
+    assert_eq!(died["error"]["code"], json!(-32000));
+    let msg = died["error"]["message"].as_str().expect("error message");
+    assert!(
+        msg.contains("helper"),
+        "a spawn failure must name the helper, got: {msg}"
+    );
+
+    // Only a helper spawned after this point reads the healthy script.
+    mcp.rewrite_scenario(json!({
+        "echo": true,
+        "responses": { "mail.send": [{ "sent": true, "delivered_by": "healthy-respawn" }] }
+    }));
+
+    // SAME key: must dispatch — the spawn failure never wrote a request,
+    // so the key was never pinned. A pin surfaces as idempotency_unknown.
+    let retry = mcp.request(
+        "tools/call",
+        json!({
+            "name": "mail_send",
+            "arguments": { "to": ["a@b.c"], "subject": "hi", "idempotency_key": "k-spawn" }
+        }),
+    );
+    assert_eq!(retry["isError"], json!(false));
+    assert_eq!(
+        retry["structuredContent"]["delivered_by"],
+        json!("healthy-respawn"),
+        "same-key retry after a spawn failure must dispatch to the respawned helper"
+    );
+}
+
+/// Two requests with the SAME idempotency_key, pipelined back-to-back over
+/// one connection while the scripted send is slow: the server serves each
+/// on its own thread, so the second must find the key claimed in flight
+/// and be refused (`idempotency_in_flight`) instead of dispatching a
+/// second concurrent send. Afterwards a same-key call replays the ONE
+/// recorded outcome without another dispatch, and a fresh key proves the
+/// send path is still healthy.
+#[test]
+fn concurrent_same_key_pipelined_requests_single_dispatch() {
+    let mut mcp = McpProc::start_scenario(
+        json!({
+            "echo": true,
+            "sleep_ms_per_call": 1500,
+            "responses": { "mail.send": [
+                { "sent": true, "message_id": "pipelined-first" },
+                { "sent": true, "message_id": "must-not-double-send" }
+            ] }
+        }),
+        &[],
+    );
+
+    let init = mcp.request(
+        "initialize",
+        json!({
+            "protocolVersion": "2025-06-18",
+            "capabilities": {},
+            "clientInfo": { "name": "smoke", "version": "0" }
+        }),
+    );
+    assert_eq!(init["serverInfo"]["name"], json!("bite-mcp"));
+
+    // Both lines are written before either response is read; each request
+    // carries the SAME idempotency key (distinct JSON-RPC ids).
+    let send_args = || {
+        json!({
+            "name": "mail_send",
+            "arguments": { "to": ["a@b.c"], "subject": "hi", "idempotency_key": "k-race" }
+        })
+    };
+    let responses =
+        mcp.request_pipelined(&[("tools/call", send_args()), ("tools/call", send_args())]);
+    assert_eq!(responses.len(), 2, "one response per pipelined request");
+
+    let mut successes = Vec::new();
+    let mut refusals = Vec::new();
+    for resp in responses.values() {
+        if resp.get("error").is_some() {
+            refusals.push(resp.clone());
+        } else {
+            successes.push(resp["result"].clone());
+        }
+    }
+    assert_eq!(
+        successes.len(),
+        1,
+        "exactly one request may reach the helper while the other is in flight"
+    );
+    assert_eq!(
+        refusals.len(),
+        1,
+        "the concurrent same-key call must be refused"
+    );
+    assert_eq!(
+        successes[0]["structuredContent"]["message_id"],
+        json!("pipelined-first")
+    );
+    let msg = refusals[0]["error"]["message"]
+        .as_str()
+        .expect("error message");
+    assert!(
+        msg.contains("idempotency_in_flight"),
+        "the concurrent call must be refused by the in-flight guard, got: {msg}"
+    );
+
+    // Settled: a same-key call replays the recorded outcome verbatim —
+    // no third dispatch (the replay returns immediately, without the
+    // scripted 1.5s per-call sleep).
+    let replay = mcp.request("tools/call", send_args());
+    assert_eq!(replay["isError"], json!(false));
+    assert_eq!(
+        replay["structuredContent"]["message_id"],
+        json!("pipelined-first"),
+        "the settled outcome must replay verbatim"
+    );
+
+    // A fresh key dispatches normally — the send path is still healthy.
+    let fresh = mcp.request(
+        "tools/call",
+        json!({
+            "name": "mail_send",
+            "arguments": { "to": ["a@b.c"], "subject": "hi", "idempotency_key": "k-after" }
+        }),
+    );
+    assert_eq!(fresh["isError"], json!(false));
+    assert_eq!(
+        fresh["structuredContent"]["message_id"],
+        json!("must-not-double-send")
     );
 }
