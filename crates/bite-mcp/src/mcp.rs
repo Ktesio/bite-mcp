@@ -9,6 +9,7 @@ use bite_core::{json_schema, ops, registry, BiteError};
 use serde_json::{json, Value};
 
 use crate::helper::BridgeHandle;
+use crate::idempotency;
 
 const SERVER_NAME: &str = "bite-mcp";
 const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -17,11 +18,15 @@ struct ServerState {
     /// Interior-mutable bridge holder: request threads fetch `Arc` clones
     /// and never hold a lock across a helper round-trip.
     handle: BridgeHandle,
+    /// Outcomes recorded against client-supplied `idempotency_key`s (see
+    /// `idempotency`); only the tools that declare the param consult it.
+    idempotency: std::sync::Mutex<idempotency::Idempotency>,
 }
 
 pub fn serve() -> i32 {
     let state = std::sync::Arc::new(ServerState {
         handle: BridgeHandle::new(),
+        idempotency: std::sync::Mutex::new(idempotency::Idempotency::default()),
     });
     let stdout = std::sync::Arc::new(std::io::stdout());
     let stdin = std::io::stdin();
@@ -208,7 +213,7 @@ fn handle_request(state: &ServerState, method: &str, params: &Value) -> Result<V
                 }));
             }
             let value =
-                run_tool_retrying(state, name, args).map_err(|e| err(-32000, e.render()))?;
+                run_tool_idempotent(state, name, args).map_err(|e| err(-32000, e.render()))?;
             let is_error = is_tool_error(&value);
             Ok(json!({
                 "content": [ { "type": "text", "text": serde_json::to_string_pretty(&value).unwrap_or_default() } ],
@@ -232,8 +237,9 @@ fn handle_request(state: &ServerState, method: &str, params: &Value) -> Result<V
                 .find(|r| r["uri"] == json!(uri))
                 .and_then(|r| r["tool"].as_str())
                 .ok_or_else(|| err(-32002, format!("unknown resource: {uri}")))?;
-            let value =
-                run_tool_retrying(state, tool, json!({})).map_err(|e| err(-32000, e.render()))?;
+            let value = run_tool_retrying(state, tool, json!({}))
+                .outcome
+                .map_err(|e| err(-32000, e.render()))?;
             Ok(json!({
                 "contents": [ {
                     "uri": uri,
@@ -255,6 +261,132 @@ fn handle_request(state: &ServerState, method: &str, params: &Value) -> Result<V
         m if m.starts_with("notifications/") => Ok(json!({})),
         _ => Err(err(-32601, format!("method not found: {method}"))),
     }
+}
+
+/// `run_tool_retrying` wrapped with client-keyed idempotency for the tools
+/// that declare `idempotency_key` (`mail_send` today): a repeated call with
+/// the same key AND identical arguments replays the recorded outcome
+/// instead of dispatching a second send, a key reused with DIFFERENT
+/// arguments is refused with `idempotency_key_reused` (a replay would
+/// silently discard the new arguments), a key whose attempt failed
+/// ambiguously is refused outright, and a key whose call is still in flight
+/// in another request thread is refused with `idempotency_in_flight` — the
+/// claim and the lookup happen under one lock, so concurrent same-key
+/// calls cannot both dispatch. The key is stripped from the forwarded
+/// arguments, so the helper never sees it. Tools without the param — and
+/// calls without a key — take exactly the `run_tool_retrying` path.
+fn run_tool_idempotent(
+    state: &ServerState,
+    name: &str,
+    mut args: Value,
+) -> Result<Value, BiteError> {
+    let keyed = registry::find(name)
+        .map(|tool| tool.params.iter().any(|p| p.name == idempotency::KEY_PARAM))
+        .unwrap_or(false);
+    if !keyed {
+        return run_tool_retrying(state, name, args).outcome;
+    }
+    let key = idempotency::take_key(&mut args).map_err(|message| {
+        let mut e = bite_bridge::BridgeError::new("invalid_params", message);
+        e.fix = Some(format!(
+            "pass idempotency_key as a non-empty string (at most {} bytes), \
+             or omit it",
+            idempotency::MAX_KEY_LEN
+        ));
+        BiteError(e)
+    })?;
+    let Some(key) = key else {
+        return run_tool_retrying(state, name, args).outcome;
+    };
+    // Fingerprint the stripped arguments this call would dispatch with: a
+    // replay must return the recorded outcome for the SAME call, so a key
+    // reused with different arguments is refused outright instead of
+    // silently discarding them.
+    let fingerprint = idempotency::fingerprint(&args);
+    // Claim the key and read any prior state in ONE lock hold: requests are
+    // served one thread per call, so a separate lookup and dispatch would
+    // let two concurrent same-key calls both reach the helper.
+    match state
+        .idempotency
+        .lock()
+        .unwrap()
+        .reserve(&key, &fingerprint)
+    {
+        idempotency::Reserved::Done(value) => return Ok(value),
+        idempotency::Reserved::Reused => {
+            let mut e = bite_bridge::BridgeError::new(
+                "idempotency_key_reused",
+                format!(
+                    "this idempotency_key was already used for a {name} call with \
+                     different arguments — a replay would silently discard the \
+                     new arguments and return the earlier outcome, so this call \
+                     was refused"
+                ),
+            );
+            e.fix = Some(
+                "reuse an idempotency_key only to retry the SAME call \
+                 (identical arguments); use a fresh idempotency_key for new \
+                 arguments"
+                    .into(),
+            );
+            return Err(BiteError(e));
+        }
+        idempotency::Reserved::Unknown(code) => {
+            let mut e = bite_bridge::BridgeError::new(
+                "idempotency_unknown",
+                format!(
+                    "an earlier {name} with this idempotency_key failed ambiguously \
+                     ({code}) — it may or may not have taken effect, so the repeat \
+                     call was refused instead of risking a second dispatch"
+                ),
+            );
+            e.fix = Some(
+                "confirm the original outcome first (search before re-sending), then \
+                 retry with a fresh idempotency_key if it truly did not go out"
+                    .into(),
+            );
+            return Err(BiteError(e));
+        }
+        idempotency::Reserved::InFlight => {
+            let mut e = bite_bridge::BridgeError::new(
+                "idempotency_in_flight",
+                format!(
+                    "another {name} with this idempotency_key is still in flight in \
+                     this server process — its outcome has not settled, so this call \
+                     was refused instead of dispatching a second concurrent send"
+                ),
+            );
+            e.fix = Some(
+                "wait for the in-flight call to settle, then replay this exact call \
+                 (a settled outcome replays verbatim), or use a fresh idempotency_key"
+                    .into(),
+            );
+            return Err(BiteError(e));
+        }
+        idempotency::Reserved::Fresh => {}
+    }
+    let run = run_tool_retrying(state, name, args);
+    match &run.outcome {
+        Ok(value) => state
+            .idempotency
+            .lock()
+            .unwrap()
+            .settle(&key, idempotency::Settled::Done(value.clone())),
+        // Pin only when a request write actually landed: the ambiguous
+        // codes are also produced by a failed spawn/handshake (and by a
+        // failed respawn after an unsent attempt), where provably nothing
+        // was written — those release below so an immediate retry with
+        // the same key stays possible.
+        Err(e) if run.request_written && idempotency::ambiguous(e.code()) => state
+            .idempotency
+            .lock()
+            .unwrap()
+            .settle(&key, idempotency::Settled::Unknown(e.code().to_string())),
+        // Clean failures provably did not send — release the claim so the
+        // key stays free for an immediate retry.
+        _ => state.idempotency.lock().unwrap().release(&key),
+    }
+    run.outcome
 }
 
 /// Upper bound for client-supplied `limit` values on the messages read
@@ -331,32 +463,78 @@ fn opt_int_u64(v: &Value) -> Option<u64> {
     }
 }
 
+/// The transport-level outcome of one tool run, plus whether any request
+/// write actually landed on a helper transport during it. `request_written`
+/// is `false` only when every attempt failed before a request line was
+/// written to ANY helper — the spawn/handshake itself failed (no bridge was
+/// ever produced), or the one attempt was provably unsent and the respawn's
+/// handshake then failed too. The handshake failures reuse the ambiguous
+/// `helper_exited`/`timeout` codes, so the idempotency layer consults this
+/// flag instead of classifying by code alone: an ambiguous code WITH
+/// `request_written == false` provably never sent and must not pin the key.
+struct ToolRun {
+    outcome: Result<Value, BiteError>,
+    request_written: bool,
+}
+
 /// Run a tool through the bridge; if the helper exited, respawn once.
 /// The `Arc<Bridge>` clone is held across the round-trip (the bridge client
 /// multiplexes by request id); the handle's lock is touched only inside
 /// `get`/`reset_if_same`, so concurrent requests never serialize behind
 /// this call or its respawn.
-fn run_tool_retrying(state: &ServerState, name: &str, args: Value) -> Result<Value, BiteError> {
-    let bridge = state.handle.get()?;
-    match ops::run(&bridge, name, args.clone()) {
-        Ok(v) => Ok(v),
+fn run_tool_retrying(state: &ServerState, name: &str, args: Value) -> ToolRun {
+    // A failed spawn/handshake here (helper exits before hello, or never
+    // says it) reuses the ambiguous `helper_exited`/`timeout` codes even
+    // though no request was ever written — hence `request_written: false`.
+    let bridge = match state.handle.get() {
+        Ok(bridge) => bridge,
+        Err(e) => {
+            return ToolRun {
+                outcome: Err(BiteError(e)),
+                request_written: false,
+            }
+        }
+    };
+    let mut request_written = false;
+    let outcome = match ops::run(&bridge, name, args.clone()) {
+        Ok(v) => {
+            request_written = true; // a request landed and was answered
+            Ok(v)
+        }
         Err(mut e) if matches!(e.code.as_str(), "helper_exited" | "helper_exited_unsent") => {
             // Respawn either way so the next call gets a fresh process —
             // recycling only the failed generation: a sibling request thread
             // may already have respawned a helper that must not be killed
             // for an older generation's crash.
-            // helper_exited_unsent means the request provably never reached
-            // the helper (the write itself failed or the transport was
-            // already torn down) — nothing ran, so replaying is safe for
-            // EVERY tool, mutating ones included. Plain helper_exited keeps
-            // the mid-call-death guard: the first attempt may already have
-            // committed inside the helper, and a blind retry could
-            // double-send mail or duplicate a create (same rationale as
-            // the timeout arm).
+            // Plain helper_exited means the request WAS written and the
+            // helper died before responding (it may have committed);
+            // helper_exited_unsent means the write itself failed (the
+            // request provably never reached the helper) — replaying is
+            // safe for EVERY tool, mutating ones included.
+            if e.code == "helper_exited" {
+                request_written = true;
+            }
             state.handle.reset_if_same(&bridge);
             if e.code == "helper_exited_unsent" || registry::replay_safe(name) {
-                let fresh = state.handle.get()?;
-                ops::run(&fresh, name, args).map_err(BiteError)
+                let fresh = match state.handle.get() {
+                    Ok(fresh) => fresh,
+                    // The respawn's own handshake failed: whatever codes it
+                    // reuses, nothing further was written — keep the flag
+                    // as tracked so an unsent first attempt stays unpinned.
+                    Err(e2) => {
+                        return ToolRun {
+                            outcome: Err(BiteError(e2)),
+                            request_written,
+                        }
+                    }
+                };
+                let replay = ops::run(&fresh, name, args);
+                // Only a provably-unsent replay write leaves the flag
+                // untouched; every other outcome landed on the transport.
+                if !matches!(&replay, Err(re) if re.code == "helper_exited_unsent") {
+                    request_written = true;
+                }
+                replay.map_err(BiteError)
             } else {
                 e.message.push_str(
                     "; the helper was respawned but the call was not replayed — \
@@ -376,6 +554,7 @@ fn run_tool_retrying(state: &ServerState, name: &str, args: Value) -> Result<Val
         // replayed — it may already have committed inside the helper, and a
         // blind retry could double-send mail or repeat a delete.
         Err(mut e) if e.code == "timeout" => {
+            request_written = true; // written; the helper wedged on it
             state.handle.reset_if_same(&bridge);
             e.message.push_str(
                 "; the wedged helper was recycled and the call was abandoned — \
@@ -388,7 +567,16 @@ fn run_tool_retrying(state: &ServerState, name: &str, args: Value) -> Result<Val
             );
             Err(BiteError(e))
         }
-        Err(e) => Err(BiteError(e)),
+        // Tool-level or protocol error: the request was written and the
+        // helper answered it — the failure is clean, nothing sent.
+        Err(e) => {
+            request_written = true;
+            Err(BiteError(e))
+        }
+    };
+    ToolRun {
+        outcome,
+        request_written,
     }
 }
 
