@@ -226,7 +226,13 @@ table versions so the pre-purge data files are actually deleted during
 the call — lance would otherwise keep them (readable via time-travel
 checkouts) for its default 7-day version window. The forced compaction is
 table-wide, so a large long-lived index can make the call take a while;
-the cross-process writer lock is held for the whole reclaim. The purge is
+the cross-process writer lock is held for the whole reclaim. The reclaim
+steps are best-effort once the purge scope is recorded: on failure the
+call returns the purge with a `reclaim_warning` (rows already masked
+everywhere) instead of failing. A search concurrent with the reclaim can
+hit one transient not-found (its pinned table version's files were just
+pruned) — the index search path retries it once in-process, and clients
+may retry the same call. The purge is
 DURABLE:
 the confirmed scope is recorded (0600 `purge-scopes.json` in the data dir)
 and every later ingest skips rows inside it, so delta crawls, `full: true`

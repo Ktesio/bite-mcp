@@ -67,7 +67,12 @@ with your data. bite itself adds no network hop; choose agents you trust.
   honest caveats: the forced compaction is table-wide (lance rewrites
   every fragment carrying deletions, not just the purged scope's files),
   so on a large long-lived index `index_forget` can take a while and
-  other writers wait for it; and this is
+  other writers wait for it; a search running concurrently with the
+  reclaim can fail once with a transient not-found and is retried
+  automatically; and if a reclamation step fails (disk full mid-rewrite)
+  the call still returns the purge with a `reclaim_warning` — the rows
+  are masked everywhere, but their bytes linger in old table files until
+  a later optimize. And this is
   index reclamation, not secure erasure — the operating system may retain
   overwritten disk blocks, and Time Machine or other backups may still hold
   older index files. A scoped `index_forget` is durable: the scope is

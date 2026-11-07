@@ -132,9 +132,11 @@ fn shared_index() -> Result<Arc<bite_index::EntityIndex>, BiteError> {
 /// writes serialize on the store's cross-process `.writer.lock` (see
 /// `ingest_pending_if_due` and `EntityIndex::lock_writer`), opportunistic
 /// ingest deduplicates itself on the `.ingest.lock` file lock, and `f` only
-/// ever reads — concurrent LanceDB readers each pin the dataset version they
-/// open, the same way reads already coexist with the detached crawler's
-/// writes in another process.
+/// ever reads — reads open the current dataset version, and an
+/// `index_forget` in flight (here or in another process) prunes old
+/// versions eagerly, so a scan pinned to one can hit a transient
+/// not-found; `EntityIndex::search` covers that window with one retry on
+/// a fresh table handle.
 pub fn with_index<T>(
     f: impl FnOnce(&bite_index::EntityIndex) -> Result<T, BiteError>,
 ) -> Result<T, BiteError> {
@@ -1244,32 +1246,43 @@ pub fn forget(params: &Value) -> Result<Value, BiteError> {
         index
             .delete_where(&filter)
             .map_err(|e| BridgeError::new("index_error", e.to_string()))?;
+        // Record the scope so the purge SURVIVES later full crawls (they
+        // would otherwise re-import the same rows from Apple) — and do it
+        // IMMEDIATELY after the delete, BEFORE the reclamation steps: those
+        // are slow table-wide rewrites that can fail (disk full
+        // mid-rewrite), and a scope left unrecorded by such a failure would
+        // be silently undone by the next `full:true` rebuild — a worse
+        // outcome than bytes lingering on disk. Failure is surfaced, not
+        // swallowed.
+        let purge_recorded =
+            record_purge_scope(&purge_scopes_path(), app.as_deref(), container.as_deref()).is_ok();
+        // Best-effort physical reclamation from here on: each step only
+        // shrinks the on-disk footprint, never the logical purge (rows are
+        // already masked in every query path), so a failure degrades to a
+        // `reclaim_warning` instead of failing the call — a `?` failure
+        // here would have the caller retry into a 0-row delete that hits
+        // the same wall.
+        let mut reclaim_failures: Vec<String> = Vec::new();
         // Deleted rows leave dead FTS fragments that still hold plaintext
         // until compaction — and lance's default compaction threshold (10%
         // of a fragment deleted) would leave a sparse purge soft-deleted in
         // the data files indefinitely. Reclaim at ANY ratio, now, instead
         // of waiting for the next crawl-settled optimize.
-        index
-            .compact_deletions()
-            .map_err(|e| BridgeError::new("index_error", e.to_string()))?;
-        index
-            .refresh_fts()
-            .map_err(|e| BridgeError::new("index_error", e.to_string()))?;
+        if let Err(e) = index.compact_deletions() {
+            reclaim_failures.push(format!("compaction: {e}"));
+        }
+        if let Err(e) = index.refresh_fts() {
+            reclaim_failures.push(format!("fts refresh: {e}"));
+        }
         // Compaction only writes NEW fragments: the pre-compaction data
         // files still hold the purged plaintext until the old table
         // versions referencing them are pruned, and lance's default prune
         // window is 7 days. Prune eagerly — under the writer lock — so the
         // reclaim completes before index_forget returns (this also drops
         // the FTS index fragments the refresh just replaced).
-        index
-            .prune_versions()
-            .map_err(|e| BridgeError::new("index_error", e.to_string()))?;
-        // Record the scope so the purge SURVIVES later full crawls (they
-        // would otherwise re-import the same rows from Apple). Failure is
-        // surfaced, not swallowed: an unrecorded purge is silently undone by
-        // the next `full:true` rebuild — the caller must know that happened.
-        let purge_recorded =
-            record_purge_scope(&purge_scopes_path(), app.as_deref(), container.as_deref()).is_ok();
+        if let Err(e) = index.prune_versions() {
+            reclaim_failures.push(format!("version prune: {e}"));
+        }
         let mut out = json!({
             "deleted": n,
             "scope": scope,
@@ -1279,6 +1292,12 @@ pub fn forget(params: &Value) -> Result<Value, BiteError> {
             out["warning"] = json!(
                 "could not persist the purge scope — a full re-crawl will re-import these rows"
             );
+        }
+        if !reclaim_failures.is_empty() {
+            out["reclaim_warning"] = json!(format!(
+                "purged rows are masked from every query, but their bytes were not fully reclaimed ({}); they linger in old table files until a later index_forget or crawl-settled optimize",
+                reclaim_failures.join("; ")
+            ));
         }
         Ok(out)
     })

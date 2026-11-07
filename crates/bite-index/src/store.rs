@@ -249,6 +249,14 @@ fn schema() -> SchemaRef {
     ]))
 }
 
+/// True when an error is the transient not-found of a scan whose pinned
+/// table version was pruned mid-read by an eager `prune_versions`
+/// (`index_forget` reclamation) — retryable on a fresh table handle.
+fn is_pruned_version_gone(e: &IndexError) -> bool {
+    let msg = e.to_string().to_lowercase();
+    msg.contains("not found") || msg.contains("notfound")
+}
+
 /// Single-quote escape for SQL filter literals.
 pub fn sql_str(s: &str) -> String {
     format!("'{}'", s.replace('\'', "''"))
@@ -448,9 +456,22 @@ impl EntityIndex {
     ///
     /// `index_forget` calls this AFTER `compact_deletions` and
     /// `refresh_fts`, so one prune also drops the FTS index fragments the
-    /// rebuild replaced. Safe with `delete_unverified` because the caller
-    /// holds the cross-process writer lock — no other process can be
-    /// mid-transaction on this table.
+    /// rebuild replaced.
+    ///
+    /// `delete_unverified` stays OFF deliberately. The purged plaintext
+    /// lives in files referenced by PRE-compaction manifests — verified
+    /// files — so the purge reclaims without it. Unverified files are
+    /// exactly an in-flight writer's not-yet-committed fragments, and the
+    /// writer flock does NOT rule them out (`ingest_pending` drops its
+    /// guard before the merge-inserts run, and readers never take it):
+    /// pruning them could delete an uncommitted ingest's files and leave
+    /// the table pointing at missing data. Files a crashed writer leaves
+    /// behind are swept by a later prune once they age past `older_than`.
+    ///
+    /// Concurrent readers: this prune deletes files that older table
+    /// versions reference, so a search already pinned to such a version
+    /// can fail with a transient not-found — [`Self::search`] retries once
+    /// on a fresh table handle to cover that window.
     pub fn prune_versions(&self) -> Result<(), IndexError> {
         self.rt.block_on(async {
             use lancedb::table::OptimizeAction;
@@ -458,7 +479,7 @@ impl EntityIndex {
             table
                 .optimize(OptimizeAction::Prune {
                     older_than: Some(chrono::Duration::zero()),
-                    delete_unverified: Some(true),
+                    delete_unverified: Some(false),
                     error_if_tagged_old_versions: Some(false),
                 })
                 .await?;
@@ -479,6 +500,18 @@ impl EntityIndex {
     /// filter-only queries unless `skip_exact_count` is set (scan skipped,
     /// `None` returned); always `None` for FTS (page-capped).
     pub fn search(&self, q: &SearchQuery) -> Result<SearchResult, IndexError> {
+        // An `index_forget` in this or another process prunes old table
+        // versions eagerly (see `prune_versions`); a scan pinned to a
+        // pruned version fails with a transient not-found. One retry —
+        // `search_once` re-opens the table, pinning the current version —
+        // covers that window.
+        match self.search_once(q) {
+            Err(e) if is_pruned_version_gone(&e) => self.search_once(q),
+            r => r,
+        }
+    }
+
+    fn search_once(&self, q: &SearchQuery) -> Result<SearchResult, IndexError> {
         self.rt.block_on(async {
             let table = self.table().await?;
             let filter = filter_sql(q);
@@ -1059,10 +1092,28 @@ mod tests {
             "mail",
             "purged1",
             "Spam",
-            "unique purge marker body",
+            "zqxpurgemarker",
             Some(false),
         ));
         idx.ingest(&rows).unwrap();
+
+        // Positive control: the marker must be physically on disk BEFORE
+        // the purge, or the absence assert after the prune proves nothing
+        // (an encoding change that never wrote the marker raw would pass
+        // vacuously). A single rare TOKEN, not a phrase: the FTS inverted
+        // index stores tokens, so a phrase marker can vanish from the data
+        // files while its terms linger in a rebuilt index's dictionary —
+        // one token cannot hide that way.
+        let marker = b"zqxpurgemarker";
+        let pre_purge = walk(&dir);
+        let marker_present = pre_purge.iter().any(|f| {
+            let bytes = std::fs::read(f).unwrap();
+            bytes.windows(marker.len()).any(|w| w == marker)
+        });
+        assert!(
+            marker_present,
+            "marker token must be on disk before the purge (positive control)"
+        );
 
         idx.delete_where("id = 'purged1'").unwrap();
         idx.compact_deletions().unwrap();
@@ -1079,8 +1130,7 @@ mod tests {
             "eager prune must delete the pre-compaction files — nothing disappeared"
         );
         // The purged plaintext is absent from EVERY file still on disk
-        // (data fragments, manifests, FTS index files alike).
-        let marker = b"unique purge marker body";
+        // (data fragments, manifests, FTS index/dictionary files alike).
         for f in &after {
             let bytes = std::fs::read(f).unwrap();
             assert!(
