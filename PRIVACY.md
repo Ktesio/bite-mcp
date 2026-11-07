@@ -63,19 +63,22 @@ with your data. bite itself adds no network hop; choose agents you trust.
   index included), and the old table versions that still reference the
   pre-purge fragments are pruned on the spot — without that eager prune
   the purged text would stay readable in old data files (and via
-  time-travel checkouts) for lance's default 7-day version window. Two
-  honest caveats: the forced compaction is table-wide (lance rewrites
-  every fragment carrying deletions, not just the purged scope's files),
-  so on a large long-lived index `index_forget` can take a while and
-  other writers wait for it; a search running concurrently with the
-  reclaim can fail once with a transient not-found and is retried
-  automatically; and if a reclamation step fails (disk full mid-rewrite)
-  the call still returns the purge with a `reclaim_warning` — the rows
-  are masked everywhere, but their bytes linger in old table files until
-  a later optimize. And this is
-  index reclamation, not secure erasure — the operating system may retain
-  overwritten disk blocks, and Time Machine or other backups may still hold
-  older index files. A scoped `index_forget` is durable: the scope is
+  time-travel checkouts) for lance's default 7-day version window.
+  Caveats:
+  - the forced compaction is table-wide (lance rewrites every fragment
+    carrying deletions, not just the purged scope's files), so on a
+    large long-lived index `index_forget` can take a while and other
+    writers wait for it;
+  - a search running concurrently with the reclaim can fail once with a
+    transient not-found and is retried automatically;
+  - if a reclamation step fails (disk full mid-rewrite) the call still
+    returns the purge with a `reclaim_warning` — the rows are masked
+    everywhere, but their bytes linger in old table files until
+    `index_forget` is re-run with the same scope to retry the reclaim;
+  - this is index reclamation, not secure erasure — the operating system
+    may retain overwritten disk blocks, and Time Machine or other
+    backups may still hold older index files.
+  A scoped `index_forget` is durable: the scope is
   recorded and later crawls skip
   it, so a full re-crawl does not re-import what you deliberately purged
   (`index_status` lists the recorded scopes). To re-include a purged

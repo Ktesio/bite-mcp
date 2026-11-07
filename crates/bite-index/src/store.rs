@@ -996,6 +996,56 @@ mod tests {
     }
 
     #[test]
+    fn search_survives_eager_version_prune() {
+        // `index_forget` reclamation prunes old table versions eagerly; a
+        // scan pinned to a pruned version must not surface that as a hard
+        // failure — `search` retries once on a fresh table handle.
+        // Search → prune → search on the SAME EntityIndex pins the
+        // contract end to end.
+        let dir = temp_dir("prune-retry");
+        let idx = EntityIndex::open(&dir).unwrap();
+        idx.ingest(&[record(
+            "mail",
+            "m1",
+            "Hello",
+            "plain greeting body",
+            Some(true),
+        )])
+        .unwrap();
+        let q = SearchQuery {
+            app: Some("mail".into()),
+            limit: 10,
+            ..Default::default()
+        };
+        let res = idx.search(&q).expect("search before prune");
+        assert_eq!(res.hits.len(), 1);
+        idx.prune_versions().expect("eager prune");
+        let res = idx.search(&q).expect("search after eager prune");
+        assert_eq!(res.hits.len(), 1, "the row must still be findable");
+    }
+
+    #[test]
+    fn is_pruned_version_gone_matches_pruned_scan_errors_only() {
+        // object_store's NotFound wording, as surfaced by lance when a
+        // scan pins a version whose files the eager prune deleted
+        let gone = IndexError::Other(
+            "Object at location /idx/_versions/2.manifest not found: No such file or directory (os error 2)"
+                .to_string(),
+        );
+        assert!(
+            is_pruned_version_gone(&gone),
+            "a pruned-version not-found must be retried"
+        );
+        // an unrelated failure must NOT be retried — a retry storm on a
+        // genuinely broken index hides the real error
+        let other = IndexError::Other("arrow schema mismatch: expected Utf8".to_string());
+        assert!(
+            !is_pruned_version_gone(&other),
+            "unrelated errors must not match the pruned-version retry"
+        );
+    }
+
+    #[test]
     fn purge_compaction_materializes_sparse_deletions() {
         // A sparse purge (1 row in ~50, far below lance's default 10%
         // materialize threshold) must still leave the data files — the
