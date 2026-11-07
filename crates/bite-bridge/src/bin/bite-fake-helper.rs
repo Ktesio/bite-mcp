@@ -6,7 +6,8 @@
 //! {
 //!   "responses": { "sys.ping": [{"pong": true}], "calendar.list_calendars": [ ... ] },
 //!   "echo": true,             // respond {"ok":true,"method":<method>} to anything not in responses
-//!   "sleep_ms_per_call": 0    // sleep before every response (timeout tests)
+//!   "sleep_ms_per_call": 0,   // sleep before every response (timeout tests)
+//!   "exit_before_hello": true // die before the handshake line (spawn-failure shape)
 //! }
 //! ```
 //! Each method consumes entries from its queue in order; the last entry repeats.
@@ -58,6 +59,18 @@ fn main() {
         "method": "hello",
         "params": { "protocol": 1, "version": "fake-0.1.0", "capabilities": ["calendar","reminders","contacts","mail","notes","messages"] }
     });
+    if scenario
+        .get("exit_before_hello")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
+        // Spawn-failure shape: die before the handshake line. The host's
+        // Bridge::spawn then fails its hello wait with the handshake-
+        // flavored `helper_exited` even though no request was ever
+        // written — the shape a key guard must not mistake for an
+        // ambiguous in-flight death.
+        exit(1);
+    }
     println!("{hello}");
     let _ = std::io::stdout().flush();
     if scenario
