@@ -4,6 +4,7 @@ description = "Global entity index (LanceDB) for bite: ingest, FTS+scalar search
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+rust-version.workspace = true
 
 [dependencies]
 # `remote` required: upstream (0.39–0.40) references the remote-gated
