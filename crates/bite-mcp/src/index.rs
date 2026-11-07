@@ -1175,10 +1175,11 @@ fn record_purge_scope(
 }
 
 /// One physical-reclamation step of a confirmed `forget`, with the label
-/// its failure is reported under.
-struct ReclaimStep {
+/// its failure is reported under. The lifetime lets steps borrow the
+/// caller's index handle (or test locals) instead of requiring 'static.
+struct ReclaimStep<'a> {
     name: &'static str,
-    run: Box<dyn FnMut() -> Result<(), String>>,
+    run: Box<dyn FnMut() -> Result<(), String> + 'a>,
 }
 
 /// The post-delete tail of a confirmed `index_forget`: record the purge
@@ -1203,7 +1204,7 @@ fn finish_purge(
     container: Option<&str>,
     deleted: usize,
     scope: Value,
-    steps: &mut [ReclaimStep],
+    steps: &mut [ReclaimStep<'_>],
 ) -> Value {
     let purge_recorded = record_purge_scope(scopes_path, app, container).is_ok();
     let mut reclaim_failures: Vec<String> = Vec::new();
@@ -1654,7 +1655,7 @@ mod tests {
         // (a) every reclaim step succeeds → no warnings, scope tombstoned
         let dir = tempfile::tempdir().expect("tempdir");
         let scopes = dir.path().join("purge-scopes.json");
-        let mut ok: Vec<ReclaimStep> = ["compaction", "fts refresh", "version prune"]
+        let mut ok: Vec<ReclaimStep<'_>> = ["compaction", "fts refresh", "version prune"]
             .into_iter()
             .map(|name| ReclaimStep {
                 name,
