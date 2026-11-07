@@ -92,6 +92,29 @@ notes: `folders` · `search {text?, folder?, limit?}` · `get {id}` (HTML + mark
 messages: `send {to, text}` (recipient must exist in Messages) ·
 `chats_recent {limit?}` · `history {chat_id, limit?}` (source: `messages_app` or `chat.db`; client `limit` is clamped to 1..200 at the MCP boundary)
 
+Server-plane note — MCP `mail_send` additionally accepts an optional
+`idempotency_key` string. It is consumed by the Rust control plane (stripped
+before the bridge; the helper contract above is unchanged): the first
+attempt's outcome is recorded against the key for the server process's
+lifetime, and a repeated call with the same key replays that recorded
+outcome verbatim instead of dispatching a second send. A replay requires
+identical arguments: each key records a fingerprint of the stripped
+arguments it was claimed with, and a repeat whose arguments differ is
+refused with `idempotency_key_reused` — the recorded outcome would
+describe a different send, and the new mail would silently never go out.
+If the recorded attempt failed ambiguously — the helper died mid-call or
+the call timed out
+(it may or may not have been sent) — the key is pinned as unknown and
+repeated calls are refused with `idempotency_unknown` instead of risking a
+double send: confirm the original outcome, then use a fresh key. While a
+call with the key is still in flight, concurrent same-key calls are refused
+with `idempotency_in_flight` — the claim happens atomically, so two
+same-key calls can never both dispatch. Clean failures, failed helper
+spawns (no request was ever written), and provably-unsent calls do not pin
+the key. At most 128 keys are retained per
+server process (settled outcomes evicted oldest-first, completed sends
+before unknown pins); keys do not survive a server restart.
+
 ## Result shapes (contract)
 
 Entity dicts are flat and snake_case. Canonical keys: event

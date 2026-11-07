@@ -22,6 +22,24 @@ it can ship.
   appeared anywhere in docs before. Notes two quirks found while writing
   it: `auto_refresh_hours` is file-only (the `config set` verb rejects it)
   and `release_repo` is currently write-only config (no code consumes it).
+- `mail_send` accepts an optional client-supplied `idempotency_key`: the
+  server records the first attempt's outcome against the key and a repeated
+  call with the same key replays the recorded outcome instead of dispatching
+  a second send. A repeat is a replay only when its arguments are identical:
+  each key records a fixed-size digest of the stripped arguments' canonical
+  form (32 bytes, so retention memory stays bounded regardless of mail body
+  size), and a key reused with different arguments is refused with
+  `idempotency_key_reused` (replaying would return the old outcome while
+  the new mail is silently never sent). An attempt that failed ambiguously
+  (helper died mid-call, or the call timed out) pins the key — repeats are
+  refused with `idempotency_unknown` rather than risking a double send.
+  Concurrent same-key calls are refused with `idempotency_in_flight` while
+  the first is still running (the key is claimed atomically, so two
+  same-key calls can never both dispatch). Clean failures — including
+  failed helper spawns, where no request was ever written — release the key
+  for an immediate retry. Keys are remembered for the server process only
+  (last 128 keys, completed outcomes evicted before unknown pins) and are
+  never forwarded to the helper.
 - `bite doctor --json` key reference: docs/permissions.md now documents the
   report's full skeleton (every top-level and nested key, with meanings),
   pinned by a test that serializes the sample report and fails when the
