@@ -283,15 +283,17 @@ fn with_pruned_version_retry<T>(
     }
 }
 
-/// Test-only seam pinning that the public read paths actually route
-/// through [`with_pruned_version_retry`] (see
-/// `read_paths_retry_through_the_wrapper`): when armed, the next read
-/// attempts fail with a synthetic pruned-version not-found BEFORE
-/// touching lancedb, and every read attempt is counted.
+// Test-only seam pinning that the public read paths actually route
+// through `with_pruned_version_retry` (see
+// `read_paths_retry_through_the_wrapper`): when armed, the next read
+// attempts fail with a synthetic pruned-version not-found BEFORE
+// touching lancedb, and every read attempt is counted. (Plain comment:
+// rustdoc does not document macro invocations, so `///` here is an
+// unused-doc-comment error under `-D warnings`.)
 #[cfg(test)]
 thread_local! {
-    static PRUNED_READ_INJECTIONS: std::cell::Cell<u32> = std::cell::Cell::new(0);
-    static READ_ATTEMPTS: std::cell::Cell<u32> = std::cell::Cell::new(0);
+    static PRUNED_READ_INJECTIONS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    static READ_ATTEMPTS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]
