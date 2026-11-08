@@ -252,9 +252,28 @@ fn schema() -> SchemaRef {
 /// True when an error is the transient not-found of a scan whose pinned
 /// table version was pruned mid-read by an eager `prune_versions`
 /// (`index_forget` reclamation) — retryable on a fresh table handle.
+/// The message must name a table-file path (`_versions/` manifest or
+/// `data/` fragment): a bare "not found" is NOT enough — "Table
+/// 'entities' was not found" (post-`index_wipe`) and "column ... not
+/// found" (a bad filter) must fail fast, not retry.
 fn is_pruned_version_gone(e: &IndexError) -> bool {
     let msg = e.to_string().to_lowercase();
-    msg.contains("not found") || msg.contains("notfound")
+    let not_found = msg.contains("not found") || msg.contains("notfound");
+    let names_table_file = msg.contains("_versions/") || msg.contains("data/");
+    not_found && names_table_file
+}
+
+/// Run `op`, retrying exactly once when it fails with the pruned-version
+/// not-found above — the retry's fresh table handle pins the current
+/// version. Any other error surfaces unchanged, and a second
+/// pruned-version failure is returned rather than retried again.
+fn with_pruned_version_retry<T>(
+    mut op: impl FnMut() -> Result<T, IndexError>,
+) -> Result<T, IndexError> {
+    match op() {
+        Err(e) if is_pruned_version_gone(&e) => op(),
+        r => r,
+    }
 }
 
 /// Single-quote escape for SQL filter literals.
@@ -487,7 +506,14 @@ impl EntityIndex {
         })
     }
 
+    /// Row count, optionally filtered. Retries once on the transient
+    /// not-found of a scan whose table version an eager `prune_versions`
+    /// (`index_forget` reclamation) deleted mid-read — see `search`.
     pub fn count(&self, filter: Option<&str>) -> Result<usize, IndexError> {
+        with_pruned_version_retry(|| self.count_once(filter))
+    }
+
+    fn count_once(&self, filter: Option<&str>) -> Result<usize, IndexError> {
         self.rt.block_on(async {
             let table = self.table().await?;
             Ok(table
@@ -504,11 +530,9 @@ impl EntityIndex {
         // versions eagerly (see `prune_versions`); a scan pinned to a
         // pruned version fails with a transient not-found. One retry —
         // `search_once` re-opens the table, pinning the current version —
-        // covers that window.
-        match self.search_once(q) {
-            Err(e) if is_pruned_version_gone(&e) => self.search_once(q),
-            r => r,
-        }
+        // covers that window. `count` and `stats` share the same retry:
+        // every read path that pins a version survives the eager prune.
+        with_pruned_version_retry(|| self.search_once(q))
     }
 
     fn search_once(&self, q: &SearchQuery) -> Result<SearchResult, IndexError> {
@@ -562,7 +586,14 @@ impl EntityIndex {
         })
     }
 
+    /// One-scan stats. Retries once on the transient not-found of a scan
+    /// whose table version an eager `prune_versions` (`index_forget`
+    /// reclamation) deleted mid-read — see `search`.
     pub fn stats(&self) -> Result<IndexStats, IndexError> {
+        with_pruned_version_retry(|| self.stats_once())
+    }
+
+    fn stats_once(&self) -> Result<IndexStats, IndexError> {
         self.rt.block_on(async {
             let table = self.table().await?;
             // One projected scan computes total, per-app counts and the
@@ -1001,7 +1032,9 @@ mod tests {
         // scan pinned to a pruned version must not surface that as a hard
         // failure — `search` retries once on a fresh table handle.
         // Search → prune → search on the SAME EntityIndex pins the
-        // contract end to end.
+        // contract end to end (the second search opens the post-prune
+        // version and succeeds first try — the retry branch itself is
+        // pinned by `with_pruned_version_retry_recovers_exactly_once`).
         let dir = temp_dir("prune-retry");
         let idx = EntityIndex::open(&dir).unwrap();
         idx.ingest(&[record(
@@ -1025,6 +1058,55 @@ mod tests {
     }
 
     #[test]
+    fn with_pruned_version_retry_recovers_exactly_once() {
+        // The retry branch itself. The e2e test above opens the post-prune
+        // version on its second search and succeeds first try, so it can
+        // never prove the retry fires; this injects the pruned-version
+        // error directly into the wrapped operation and pins all three
+        // behaviors `search`/`count`/`stats` rely on: recover on the
+        // second attempt, NO second retry after a repeat failure, and no
+        // retry at all for unrelated errors.
+        let pruned = || {
+            IndexError::Other(
+                "Object at location /idx/_versions/2.manifest not found: No such file or directory (os error 2)"
+                    .to_string(),
+            )
+        };
+        let mut calls = 0;
+        let out = with_pruned_version_retry(|| {
+            calls += 1;
+            if calls == 1 {
+                Err(pruned())
+            } else {
+                Ok(7usize)
+            }
+        })
+        .expect("second attempt succeeds");
+        assert_eq!(out, 7);
+        assert_eq!(calls, 2, "exactly one retry");
+
+        let mut calls = 0;
+        let err = with_pruned_version_retry::<usize>(|| {
+            calls += 1;
+            Err(pruned())
+        })
+        .expect_err("a repeat pruned failure surfaces");
+        assert!(is_pruned_version_gone(&err));
+        assert_eq!(calls, 2, "never a third attempt");
+
+        let mut calls = 0;
+        let err = with_pruned_version_retry::<usize>(|| {
+            calls += 1;
+            Err(IndexError::Other(
+                "arrow schema mismatch: expected Utf8".into(),
+            ))
+        })
+        .expect_err("unrelated errors surface");
+        assert!(!is_pruned_version_gone(&err));
+        assert_eq!(calls, 1, "unrelated errors are not retried");
+    }
+
+    #[test]
     fn is_pruned_version_gone_matches_pruned_scan_errors_only() {
         // object_store's NotFound wording, as surfaced by lance when a
         // scan pins a version whose files the eager prune deleted
@@ -1042,6 +1124,27 @@ mod tests {
         assert!(
             !is_pruned_version_gone(&other),
             "unrelated errors must not match the pruned-version retry"
+        );
+        // not-found wordings that are NOT a pruned version must fail fast
+        // too: a wiped table (retrying re-creates nothing) and a bad
+        // filter column
+        let wiped = IndexError::Other("Table 'entities' was not found".to_string());
+        assert!(
+            !is_pruned_version_gone(&wiped),
+            "a wiped table is not a pruned version"
+        );
+        let bad_filter = IndexError::Other("column bite.unknown not found".to_string());
+        assert!(
+            !is_pruned_version_gone(&bad_filter),
+            "a bad filter column is not a pruned version"
+        );
+        // a pruned data fragment — the other table-file path shape — must
+        // match just like the manifest case above
+        let gone_fragment =
+            IndexError::Other("Object at location /idx/data/9-abc.lance not found".to_string());
+        assert!(
+            is_pruned_version_gone(&gone_fragment),
+            "a pruned fragment file is a pruned version"
         );
     }
 

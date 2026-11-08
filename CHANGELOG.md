@@ -98,8 +98,12 @@ it can ship.
   scope is recorded: on failure the call still returns the purge with a
   `reclaim_warning` instead of failing (a hard failure would leave the
   scope unrecorded and let the next full re-crawl undo the purge). A
-  search concurrent with the reclaim can hit one transient not-found;
-  the index search path now retries once on a fresh table handle. Pinned
+  read concurrent with the reclaim (a search, `index_status`'s stats
+  scan, or the `index_forget` preview count) can hit one transient
+  not-found; every one of those read paths now retries once on a fresh
+  table handle, and the retry matcher is narrowed to errors naming a
+  pruned table file (`_versions/` manifest or `data/` fragment) so a
+  wiped table or a bad filter column still fails fast. Pinned
   by tests that fail while any soft-deleted row survives a purge or any
   pre-purge file (or the purge-marker token, with a positive control on
   disk before the purge) remains after. Note the forced compaction is
