@@ -321,10 +321,11 @@ table-wide, so a large long-lived index can make the call take a while;
 the cross-process writer lock is held for the whole reclaim. The reclaim
 steps are best-effort once the purge scope is recorded: on failure the
 call returns the purge with a `reclaim_warning` (rows already masked
-everywhere) instead of failing. A search concurrent with the reclaim can
+everywhere) instead of failing. A read concurrent with the reclaim — a
+search, `index_status`, or the `index_forget` preview count — can
 hit one transient not-found (its pinned table version's files were just
-pruned) — the index search path retries it once in-process, and clients
-may retry the same call. The purge is
+pruned); each of those index read paths retries it once in-process, and
+clients may retry the same call. The purge is
 DURABLE:
 the confirmed scope is recorded (0600 `purge-scopes.json` in the data dir)
 and every later ingest skips rows inside it, so delta crawls, `full: true`

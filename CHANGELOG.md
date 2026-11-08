@@ -102,7 +102,9 @@ it can ship.
   scan, or the `index_forget` preview count) can hit one transient
   not-found; every one of those read paths now retries once on a fresh
   table handle, and the retry matcher is narrowed to errors naming a
-  pruned table file (`_versions/` manifest or `data/` fragment) so a
+  pruned table file (`_versions/` manifest, `/data/` fragment, FTS
+  `_indices/` fragment, `_deletions/` vector or `_transactions/`
+  journal — `_metadata/` paths still fail fast) so a
   wiped table or a bad filter column still fails fast. Pinned
   by tests that fail while any soft-deleted row survives a purge or any
   pre-purge file (or the purge-marker token, with a positive control on

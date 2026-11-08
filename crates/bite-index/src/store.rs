@@ -252,14 +252,21 @@ fn schema() -> SchemaRef {
 /// True when an error is the transient not-found of a scan whose pinned
 /// table version was pruned mid-read by an eager `prune_versions`
 /// (`index_forget` reclamation) — retryable on a fresh table handle.
-/// The message must name a table-file path (`_versions/` manifest or
-/// `data/` fragment): a bare "not found" is NOT enough — "Table
-/// 'entities' was not found" (post-`index_wipe`) and "column ... not
-/// found" (a bad filter) must fail fast, not retry.
+/// The message must name a table-file path the prune can delete — a
+/// `_versions/` manifest, a `/data/` fragment, an `_indices/` FTS index
+/// fragment, a `_deletions/` deletion vector or a `_transactions/`
+/// journal file: a bare "not found" is NOT enough — "Table 'entities'
+/// was not found" (post-`index_wipe`), "column ... not found" (a bad
+/// filter) and `_metadata/` paths must fail fast, not retry. `/data/`
+/// is anchored so the `data/` inside `_metadata/` cannot match.
 fn is_pruned_version_gone(e: &IndexError) -> bool {
     let msg = e.to_string().to_lowercase();
     let not_found = msg.contains("not found") || msg.contains("notfound");
-    let names_table_file = msg.contains("_versions/") || msg.contains("data/");
+    let names_table_file = msg.contains("_versions/")
+        || msg.contains("/data/")
+        || msg.contains("_indices/")
+        || msg.contains("_deletions/")
+        || msg.contains("_transactions/");
     not_found && names_table_file
 }
 
@@ -274,6 +281,33 @@ fn with_pruned_version_retry<T>(
         Err(e) if is_pruned_version_gone(&e) => op(),
         r => r,
     }
+}
+
+/// Test-only seam pinning that the public read paths actually route
+/// through [`with_pruned_version_retry`] (see
+/// `read_paths_retry_through_the_wrapper`): when armed, the next read
+/// attempts fail with a synthetic pruned-version not-found BEFORE
+/// touching lancedb, and every read attempt is counted.
+#[cfg(test)]
+thread_local! {
+    static PRUNED_READ_INJECTIONS: std::cell::Cell<u32> = std::cell::Cell::new(0);
+    static READ_ATTEMPTS: std::cell::Cell<u32> = std::cell::Cell::new(0);
+}
+
+#[cfg(test)]
+fn note_read_attempt() -> Option<IndexError> {
+    READ_ATTEMPTS.with(|a| a.set(a.get() + 1));
+    PRUNED_READ_INJECTIONS.with(|left| {
+        if left.get() == 0 {
+            None
+        } else {
+            left.set(left.get() - 1);
+            Some(IndexError::Other(
+                "Object at location /idx/entities.lance/_indices/9b2c7ad1-6f24-4f0e-9c0b-6b5a2d8e4f10/index.idx not found: No such file or directory (os error 2)"
+                    .to_string(),
+            ))
+        }
+    })
 }
 
 /// Single-quote escape for SQL filter literals.
@@ -488,8 +522,9 @@ impl EntityIndex {
     /// behind are swept by a later prune once they age past `older_than`.
     ///
     /// Concurrent readers: this prune deletes files that older table
-    /// versions reference, so a search already pinned to such a version
-    /// can fail with a transient not-found — [`Self::search`] retries once
+    /// versions reference, so a read already pinned to such a version
+    /// can fail with a transient not-found — `search`, `count` and
+    /// `stats` each retry once through [`with_pruned_version_retry`]
     /// on a fresh table handle to cover that window.
     pub fn prune_versions(&self) -> Result<(), IndexError> {
         self.rt.block_on(async {
@@ -514,6 +549,10 @@ impl EntityIndex {
     }
 
     fn count_once(&self, filter: Option<&str>) -> Result<usize, IndexError> {
+        #[cfg(test)]
+        if let Some(e) = note_read_attempt() {
+            return Err(e);
+        }
         self.rt.block_on(async {
             let table = self.table().await?;
             Ok(table
@@ -536,6 +575,10 @@ impl EntityIndex {
     }
 
     fn search_once(&self, q: &SearchQuery) -> Result<SearchResult, IndexError> {
+        #[cfg(test)]
+        if let Some(e) = note_read_attempt() {
+            return Err(e);
+        }
         self.rt.block_on(async {
             let table = self.table().await?;
             let filter = filter_sql(q);
@@ -594,6 +637,10 @@ impl EntityIndex {
     }
 
     fn stats_once(&self) -> Result<IndexStats, IndexError> {
+        #[cfg(test)]
+        if let Some(e) = note_read_attempt() {
+            return Err(e);
+        }
         self.rt.block_on(async {
             let table = self.table().await?;
             // One projected scan computes total, per-app counts and the
@@ -1034,7 +1081,9 @@ mod tests {
         // Search → prune → search on the SAME EntityIndex pins the
         // contract end to end (the second search opens the post-prune
         // version and succeeds first try — the retry branch itself is
-        // pinned by `with_pruned_version_retry_recovers_exactly_once`).
+        // pinned by `with_pruned_version_retry_recovers_exactly_once`,
+        // and the read-path wiring through the wrapper by
+        // `read_paths_retry_through_the_wrapper`).
         let dir = temp_dir("prune-retry");
         let idx = EntityIndex::open(&dir).unwrap();
         idx.ingest(&[record(
@@ -1107,6 +1156,64 @@ mod tests {
     }
 
     #[test]
+    fn read_paths_retry_through_the_wrapper() {
+        // Pins the WIRING, which the two tests around it cannot see:
+        // `search_survives_eager_version_prune` opens the post-prune
+        // version on its second search and succeeds first try, and the
+        // helper test never touches a read path — so a read path that
+        // stopped routing through `with_pruned_version_retry` would
+        // still pass every other test. Here the first `_once` attempt
+        // of each public read fails with the pruned-version not-found
+        // BEFORE touching lancedb: the call must still succeed and must
+        // have made exactly two attempts. Remove the wrapper from any
+        // of the three read paths and the injected error surfaces here.
+        let dir = temp_dir("prune-retry-wiring");
+        let idx = EntityIndex::open(&dir).unwrap();
+        idx.ingest(&[record(
+            "mail",
+            "m1",
+            "Hello",
+            "plain greeting body",
+            Some(true),
+        )])
+        .unwrap();
+
+        let arm = |failures: u32| {
+            PRUNED_READ_INJECTIONS.with(|f| f.set(failures));
+            READ_ATTEMPTS.with(|a| a.set(0));
+        };
+        let attempts = || READ_ATTEMPTS.with(|a| a.get());
+
+        arm(1);
+        let res = idx
+            .search(&SearchQuery {
+                app: Some("mail".into()),
+                limit: 10,
+                ..Default::default()
+            })
+            .expect("search must retry through the wrapper");
+        assert_eq!(res.hits.len(), 1);
+        assert_eq!(attempts(), 2, "one failed attempt + one retry");
+
+        arm(1);
+        assert_eq!(
+            idx.count(Some("app = 'mail'"))
+                .expect("count must retry through the wrapper"),
+            1
+        );
+        assert_eq!(attempts(), 2, "one failed attempt + one retry");
+
+        arm(1);
+        assert_eq!(
+            idx.stats()
+                .expect("stats must retry through the wrapper")
+                .total,
+            1
+        );
+        assert_eq!(attempts(), 2, "one failed attempt + one retry");
+    }
+
+    #[test]
     fn is_pruned_version_gone_matches_pruned_scan_errors_only() {
         // object_store's NotFound wording, as surfaced by lance when a
         // scan pins a version whose files the eager prune deleted
@@ -1145,6 +1252,34 @@ mod tests {
         assert!(
             is_pruned_version_gone(&gone_fragment),
             "a pruned fragment file is a pruned version"
+        );
+        // the eager prune also deletes rebuilt-away FTS index fragments
+        // and pre-compaction deletion vectors — a scan pinned to such a
+        // version fails on an `_indices/` or `_deletions/` path and must
+        // retry just like the manifest/fragment cases above
+        let gone_fts = IndexError::Other(
+            "Object at location /idx/entities.lance/_indices/9b2c7ad1-6f24-4f0e-9c0b-6b5a2d8e4f10/index.idx not found"
+                .to_string(),
+        );
+        assert!(
+            is_pruned_version_gone(&gone_fts),
+            "a pruned FTS index fragment is a pruned version"
+        );
+        let gone_deletions = IndexError::Other(
+            "Object at location /idx/entities.lance/_deletions/9-abc.lance not found".to_string(),
+        );
+        assert!(
+            is_pruned_version_gone(&gone_deletions),
+            "a pruned deletion-vector file is a pruned version"
+        );
+        // `metadata/` CONTAINS the substring `data/` but is not a data
+        // path — the `/data/` anchor keeps it from matching
+        let metadata = IndexError::Other(
+            "Object at location /idx/entities.lance/_metadata/stats.json not found".to_string(),
+        );
+        assert!(
+            !is_pruned_version_gone(&metadata),
+            "a metadata path is not a pruned data fragment"
         );
     }
 
