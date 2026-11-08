@@ -160,9 +160,15 @@ it can ship.
   0.41 cfg-gates that path (lancedb/lancedb#4142) — while nothing in the
   workspace contacts a remote LanceDB service at all (zero references to
   the remote API surface; `lancedb::Error` is touched only via `#[from]` +
-  `Display`). The feature pulled an unused arrow-flight/prost/reqwest/
-  oauth2/tonic client stack into every build of the index crate; dropping
-  it trims the compiled and audited dependency surface.
+  `Display`). The feature pulled an unused arrow-flight/oauth2/tonic client
+  stack into every build of the index crate; dropping it trims the compiled
+  and audited dependency surface. `tonic`, `oauth2`, `arrow-flight` and
+  their remote-only extras (rustls-platform-verifier, webpki-root-certs)
+  leave the resolution entirely — deny.toml drops the CDLA-Permissive-2.0
+  license allow with them, since webpki-root-certs was the lockfile's only
+  carrier. `prost` and `reqwest` stay in the graph through lance's own
+  stacks (lance/lance-core's prost types, the
+  lance-namespace-reqwest-client), so they remain compiled and audited.
 
 - Supply-chain advisory wave in the zstd stack (RUSTSEC-2026-0391,
   -0398, -0403, -0410, all issued 2026-10-26): the lockfile now carries
