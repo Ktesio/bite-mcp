@@ -154,6 +154,7 @@ it can ship.
   check in `parse_orderable_semver`, keeping accept/reject behavior
   identical. Closes both open `py/redos` alerts on the default-branch
   analysis re-run.
+
 - bite-index now builds lancedb with default features only, dropping the
   `remote` feature. It was a compile workaround for 0.39–0.40 (which
   referenced the remote-gated `Error::Http` unconditionally), obsolete since
