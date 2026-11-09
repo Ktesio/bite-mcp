@@ -11,8 +11,9 @@ rust-version.workspace = true
 # The `remote` feature existed solely as a compile workaround: 0.39–0.40
 # referenced the remote-gated Error::Http unconditionally in job.rs; 0.41
 # cfg-gates that path (lancedb/lancedb#4142), so the feature now only pulls
-# an unused arrow-flight/oauth2/tonic client stack into the tree (reqwest
-# itself is untouched — lance's object-store stack still needs it).
+# an unused arrow-flight/oauth2/tonic client stack and a second reqwest
+# (0.13) into the tree. The reqwest that remains without it (0.12) is
+# pulled by lance-namespace-reqwest-client, not object-store.
 # Arrow types come from the `lancedb::arrow` re-export — never declare direct
 # arrow-array/arrow-schema deps here; a mismatched direct version splits the
 # crate graph and the store stops compiling (lancedb/lancedb#3575).
