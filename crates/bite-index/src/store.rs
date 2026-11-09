@@ -487,8 +487,10 @@ impl EntityIndex {
 
     /// Rows soft-deleted via deletion vectors but still physically present
     /// in the data files — zero once compaction materializes them. Test
-    /// surface for the purge-reclamation pin.
-    pub fn soft_deleted_rows(&self) -> Result<usize, IndexError> {
+    /// surface for the in-crate purge-reclamation pins — compiled only
+    /// under `cfg(test)`, so it never ships as public API.
+    #[cfg(test)]
+    fn soft_deleted_rows(&self) -> Result<usize, IndexError> {
         self.rt.block_on(async {
             let table = self.table().await?;
             // lancedb 0.41 dropped Table::count_deleted_rows; the same

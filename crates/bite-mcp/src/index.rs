@@ -135,8 +135,9 @@ fn shared_index() -> Result<Arc<bite_index::EntityIndex>, BiteError> {
 /// ever reads — reads open the current dataset version, and an
 /// `index_forget` in flight (here or in another process) prunes old
 /// versions eagerly, so a scan pinned to one can hit a transient
-/// not-found; `EntityIndex::search` covers that window with one retry on
-/// a fresh table handle.
+/// not-found; every read path that pins a version (`EntityIndex::search`,
+/// `count` and `stats`) covers that window with one retry on a fresh
+/// table handle.
 pub fn with_index<T>(
     f: impl FnOnce(&bite_index::EntityIndex) -> Result<T, BiteError>,
 ) -> Result<T, BiteError> {
