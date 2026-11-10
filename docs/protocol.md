@@ -311,13 +311,16 @@ counterpart to `index_forget`'s scoped purge.
 delete, omit it for the preview) drops rows
 from the LOCAL index only — Apple data is never touched — scoped by exact
 `app` and/or `container` names. Without `confirm` it returns a
-`would_delete` count; with `confirm` it deletes the scope, then compacts
-the FTS index so purged bodies stop answering queries (dead fragments would
-otherwise hold plaintext until the next optimize), then prunes the old
-table versions so the pre-purge data files are actually deleted during
-the call — lance would otherwise keep them (readable via time-travel
-checkouts) for its default 7-day version window. The forced compaction is
-table-wide, so a large long-lived index can make the call take a while;
+`would_delete` count; with `confirm` it deletes the scope, force-compacts
+the data files with the deletion-materialize threshold at zero (so a sparse
+purge is reclaimed too, not left soft-deleted under lance's 10% default),
+then refreshes the FTS index so purged bodies stop answering queries (dead
+fragments would otherwise hold plaintext until the next optimize), then
+prunes the old table versions so the pre-purge data files are actually
+deleted during the call — lance would otherwise keep them (readable via
+time-travel checkouts) for its default 7-day version window. The forced
+compaction is table-wide, so a large long-lived index can make the call
+take a while;
 the cross-process writer lock is held for the whole reclaim. The reclaim
 steps are best-effort once the purge scope is recorded: on failure the
 call returns the purge with a `reclaim_warning` (rows already masked
