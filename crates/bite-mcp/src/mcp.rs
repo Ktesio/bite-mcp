@@ -30,12 +30,30 @@ pub fn serve() -> i32 {
     });
     let stdout = std::sync::Arc::new(std::io::stdout());
     let stdin = std::io::stdin();
-    for line in stdin.lock().lines() {
-        let Ok(line) = line else { break };
+    let mut input = stdin.lock();
+    let mut raw = Vec::new();
+    // Unreadable stdin ends the loop (the `while let` arm) the same way the
+    // old `lines()` iterator's read error did: the client is gone.
+    while let Ok(outcome) = read_request_line(&mut input, &mut raw) {
+        match outcome {
+            LineRead::Eof => break,
+            LineRead::Overlong => {
+                // The line was never parsed, so the id is unknown — answer
+                // with the null-id error form and keep serving the stream.
+                write_line(&stdout, &overlong_line_response());
+                continue;
+            }
+            LineRead::Line => {}
+        }
+        // Same contract the `lines()` iterator had: a line that is not
+        // valid UTF-8 ends the loop (it arrived as a read error before).
+        let Ok(line) = std::str::from_utf8(&raw) else {
+            break;
+        };
         if line.trim().is_empty() {
             continue;
         }
-        let request: Value = match serde_json::from_str(&line) {
+        let request: Value = match serde_json::from_str(line) {
             Ok(v) => v,
             Err(e) => {
                 let resp = json!({
@@ -94,6 +112,108 @@ fn write_line(out: &std::io::Stdout, v: &Value) {
     let mut lock = out.lock();
     let _ = writeln!(lock, "{v}");
     let _ = lock.flush();
+}
+
+/// Upper bound on a single newline-delimited JSON-RPC request line, the
+/// trailing newline included. The MCP spec expects servers to cap message
+/// size; 16 MiB is orders of magnitude above any legitimate bite request
+/// (the largest arguments are mail search queries) while keeping a hostile
+/// or buggy client from buffering a line of any size into server memory —
+/// this is a long-lived process holding the LanceDB index and a live
+/// helper. Same class of boundary guard as `MAX_MESSAGES_LIMIT`.
+const MAX_REQUEST_LINE_BYTES: usize = 16 * 1024 * 1024;
+
+/// The outcome of one bounded read from the request stream.
+enum LineRead {
+    /// A complete line (at or under the cap) is in the buffer, its
+    /// trailing newline included.
+    Line,
+    /// The stream ended cleanly and nothing is buffered.
+    Eof,
+    /// The line exceeded `MAX_REQUEST_LINE_BYTES`. Its remainder has been
+    /// drained and the buffer emptied, so the stream is positioned at the
+    /// start of the next line and no cap-sized prefix is retained.
+    Overlong,
+}
+
+/// Read one newline-terminated request line into `buf`, enforcing
+/// `MAX_REQUEST_LINE_BYTES`. Memory stays capped no matter how large the
+/// incoming line is: the line is assembled from the reader's own chunks,
+/// and once the cap is crossed nothing more is buffered — the remainder is
+/// discarded chunk by chunk until its newline arrives (or the stream
+/// ends). A line of exactly `MAX_REQUEST_LINE_BYTES` bytes parses normally.
+fn read_request_line(reader: &mut impl BufRead, buf: &mut Vec<u8>) -> std::io::Result<LineRead> {
+    buf.clear();
+    let mut overlong = false;
+    loop {
+        // `fill_buf` borrows the reader; decide what to consume inside the
+        // block, then release the borrow before `consume` takes it again.
+        let (consume, done) = {
+            let available = match reader.fill_buf() {
+                Ok(chunk) => chunk,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e),
+            };
+            if available.is_empty() {
+                return Ok(if overlong {
+                    // an unterminated flood ended at EOF — still overlong
+                    LineRead::Overlong
+                } else if buf.is_empty() {
+                    LineRead::Eof
+                } else {
+                    // final unterminated line — delivered, like `lines()` does
+                    LineRead::Line
+                });
+            }
+            match available.iter().position(|&b| b == b'\n') {
+                // Newline in this chunk: everything through it is the line.
+                Some(pos) => {
+                    let end = pos + 1;
+                    if overlong || buf.len() + end > MAX_REQUEST_LINE_BYTES {
+                        buf.clear();
+                        (end, Some(LineRead::Overlong))
+                    } else {
+                        buf.extend_from_slice(&available[..end]);
+                        (end, Some(LineRead::Line))
+                    }
+                }
+                // No newline yet: buffer the chunk — or, once past the cap,
+                // drop it and keep draining until the newline shows up.
+                None => {
+                    let n = available.len();
+                    if overlong || buf.len() + n > MAX_REQUEST_LINE_BYTES {
+                        overlong = true;
+                        buf.clear();
+                        (n, None)
+                    } else {
+                        buf.extend_from_slice(available);
+                        (n, None)
+                    }
+                }
+            }
+        };
+        reader.consume(consume);
+        if let Some(outcome) = done {
+            return Ok(outcome);
+        }
+    }
+}
+
+/// The JSON-RPC error answer for an over-cap request line. The line was
+/// never parsed, so the id is unknown (the null-id form the spec requires)
+/// and the rejection is -32600 invalid request rather than -32700 parse
+/// error — the bytes are a message, just not one the server will accept.
+fn overlong_line_response() -> Value {
+    json!({
+        "jsonrpc": "2.0", "id": Value::Null,
+        "error": {
+            "code": -32600,
+            "message": format!(
+                "invalid request: message exceeds the {}-byte maximum line length",
+                MAX_REQUEST_LINE_BYTES
+            )
+        }
+    })
 }
 
 type RpcError = (i32, String);
@@ -635,6 +755,171 @@ fn prompt_text(name: &str) -> Option<(String, &'static str)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A `BufRead` handing out at most `chunk` bytes per `fill_buf` call —
+    /// the incremental shape a piped stdin actually delivers, which
+    /// `Cursor` (one big chunk) never exercises.
+    struct Trickle {
+        data: Vec<u8>,
+        pos: usize,
+        chunk: usize,
+    }
+
+    impl std::io::Read for Trickle {
+        fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+            let end = (self.pos + self.chunk).min(self.data.len());
+            let n = (end - self.pos).min(out.len());
+            out[..n].copy_from_slice(&self.data[self.pos..self.pos + n]);
+            self.pos += n;
+            Ok(n)
+        }
+    }
+
+    impl BufRead for Trickle {
+        fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+            let end = (self.pos + self.chunk).min(self.data.len());
+            Ok(&self.data[self.pos..end])
+        }
+        fn consume(&mut self, n: usize) {
+            self.pos += n;
+        }
+    }
+
+    #[test]
+    fn bounded_reader_returns_complete_lines() {
+        let mut cursor = std::io::Cursor::new(b"one\ntwo\n\nthree".to_vec());
+        let mut buf = Vec::new();
+        assert!(matches!(
+            read_request_line(&mut cursor, &mut buf),
+            Ok(LineRead::Line)
+        ));
+        assert_eq!(buf, b"one\n");
+        assert!(matches!(
+            read_request_line(&mut cursor, &mut buf),
+            Ok(LineRead::Line)
+        ));
+        assert_eq!(buf, b"two\n");
+        // a blank line is delivered too — serve()'s trim() check skips it
+        assert!(matches!(
+            read_request_line(&mut cursor, &mut buf),
+            Ok(LineRead::Line)
+        ));
+        assert_eq!(buf, b"\n");
+        // a final unterminated line still arrives, as `lines()` delivered it
+        assert!(matches!(
+            read_request_line(&mut cursor, &mut buf),
+            Ok(LineRead::Line)
+        ));
+        assert_eq!(buf, b"three");
+        assert!(matches!(
+            read_request_line(&mut cursor, &mut buf),
+            Ok(LineRead::Eof)
+        ));
+        // ... and stays at EOF on further reads
+        assert!(matches!(
+            read_request_line(&mut cursor, &mut buf),
+            Ok(LineRead::Eof)
+        ));
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn bounded_reader_accepts_a_line_at_exactly_the_cap() {
+        // cap bytes including the trailing newline is the largest legal line
+        let mut data = vec![b'a'; MAX_REQUEST_LINE_BYTES - 1];
+        data.push(b'\n');
+        data.extend_from_slice(b"{\"id\":1}\n");
+        let mut cursor = std::io::Cursor::new(data);
+        let mut buf = Vec::new();
+        assert!(matches!(
+            read_request_line(&mut cursor, &mut buf),
+            Ok(LineRead::Line)
+        ));
+        assert_eq!(buf.len(), MAX_REQUEST_LINE_BYTES);
+        // the stream continues cleanly at the next line
+        assert!(matches!(
+            read_request_line(&mut cursor, &mut buf),
+            Ok(LineRead::Line)
+        ));
+        assert_eq!(buf, b"{\"id\":1}\n");
+    }
+
+    #[test]
+    fn bounded_reader_rejects_one_byte_past_the_cap_and_keeps_serving() {
+        let mut over = vec![b'a'; MAX_REQUEST_LINE_BYTES];
+        over.push(b'\n');
+        over.extend_from_slice(b"{\"id\":2}\n");
+        let mut cursor = std::io::Cursor::new(over);
+        let mut buf = Vec::new();
+        assert!(matches!(
+            read_request_line(&mut cursor, &mut buf),
+            Ok(LineRead::Overlong)
+        ));
+        assert!(buf.is_empty(), "no cap-sized prefix is retained");
+        // the over-long line was drained through its newline: the next
+        // request parses normally — the server keeps serving
+        assert!(matches!(
+            read_request_line(&mut cursor, &mut buf),
+            Ok(LineRead::Line)
+        ));
+        assert_eq!(buf, b"{\"id\":2}\n");
+    }
+
+    #[test]
+    fn bounded_reader_caps_memory_when_chunks_trickle_in() {
+        // cap + 1 bytes delivered 7 at a time, then a clean request — the
+        // incremental path a real pipe takes
+        let mut over = vec![b'a'; MAX_REQUEST_LINE_BYTES];
+        over.push(b'\n');
+        over.extend_from_slice(b"next\n");
+        let mut trickle = Trickle {
+            data: over,
+            pos: 0,
+            chunk: 7,
+        };
+        let mut buf = Vec::new();
+        assert!(matches!(
+            read_request_line(&mut trickle, &mut buf),
+            Ok(LineRead::Overlong)
+        ));
+        assert!(buf.is_empty(), "the buffered prefix is dropped at the cap");
+        assert!(matches!(
+            read_request_line(&mut trickle, &mut buf),
+            Ok(LineRead::Line)
+        ));
+        assert_eq!(buf, b"next\n");
+    }
+
+    #[test]
+    fn bounded_reader_flags_an_unterminated_flood_at_eof() {
+        // more than the cap with no newline ever, then the stream ends: the
+        // drain holds no cap-sized buffer and still reports Overlong
+        let flood = vec![b'x'; MAX_REQUEST_LINE_BYTES + 5];
+        let mut trickle = Trickle {
+            data: flood,
+            pos: 0,
+            chunk: 13,
+        };
+        let mut buf = Vec::new();
+        assert!(matches!(
+            read_request_line(&mut trickle, &mut buf),
+            Ok(LineRead::Overlong)
+        ));
+        assert!(buf.is_empty(), "nothing is retained from the flood");
+    }
+
+    #[test]
+    fn overlong_response_is_a_null_id_invalid_request_error() {
+        let resp = overlong_line_response();
+        assert_eq!(resp["jsonrpc"], "2.0");
+        assert_eq!(resp["id"], Value::Null);
+        assert_eq!(resp["error"]["code"], -32600);
+        let message = resp["error"]["message"].as_str().expect("message");
+        assert!(
+            message.contains(&MAX_REQUEST_LINE_BYTES.to_string()),
+            "the message names the byte cap: {message}"
+        );
+    }
 
     #[test]
     fn messages_limit_clamps_client_supplied_values() {

@@ -236,6 +236,22 @@ it can ship.
   move can reach them; the entries are to be removed once a lance
   release can carry the fix (issue #62).
 
+- The MCP stdio server now enforces a maximum request line size
+  (16 MiB, newline included). The request loop previously iterated
+  `stdin.lock().lines()`, which buffers a line of any size into memory
+  before the first byte is parsed — a hostile or runaway client could
+  grow a long-lived server process (one holding the LanceDB index and a
+  live helper) without bound. The replacement reader assembles lines
+  from the stream's own chunks and, past the cap, stops buffering
+  entirely: the remainder of the oversized line is discarded chunk by
+  chunk, the buffer prefix is dropped, and the client receives a
+  `-32600` invalid-request error with a null id (the line was never
+  parsed) while the server keeps serving — the next well-formed request
+  on the same stream parses normally. A line of exactly 16 MiB parses
+  normally, and every prior loop behavior (blank-line skip, invalid
+  UTF-8 ends the session, final unterminated line delivered) is
+  preserved and pinned by tests.
+
 ## [v0.5.0] - 2026-10-22
 
 This release adds scoped, durable index purges (index_forget MCP tool and bite index forget CLI), an opt-in skip of the exact-total count scan, and safer helper-death replay semantics. It also enforces data-dir privacy at startup, resolves kill from absolute paths, dispatches requests concurrently, and updates dependencies including rustls-webpki for RUSTSEC-2026-0382.
