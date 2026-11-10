@@ -32,7 +32,7 @@ toml_edit = "0.25"
 jsonc-parser = { version = "0.34", features = ["cst", "serde"] }
 # Idempotency-key argument fingerprints: fixed-size SHA-256 digest. Already
 # in the dependency graph via bite-index (lancedb), so this adds no crate.
-sha2 = "0.10"
+sha2 = "0.11"
 
 [dev-dependencies]
 # self-cleaning test scratch dirs/files (Drop guard — panics can't leak them)
