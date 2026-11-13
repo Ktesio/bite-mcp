@@ -9,7 +9,8 @@ use serde_json::{json, Value};
 /// The fake helper is a bin of bite-bridge; locate it in the shared target dir.
 fn fake_helper_path() -> std::path::PathBuf {
     let exe = std::env::current_exe().expect("test exe");
-    let debug_dir = exe.ancestors().nth(2).expect("target dir").to_path_buf();
+    let dir = exe.parent().expect("test exe dir");
+    let debug_dir = profile_dir_from(dir);
     let candidate = debug_dir.join("bite-fake-helper");
     assert!(
         candidate.exists(),
@@ -17,6 +18,65 @@ fn fake_helper_path() -> std::path::PathBuf {
         candidate.display()
     );
     candidate
+}
+
+/// `target/<profile>/` from the directory the test binary runs from.
+/// Cargo ≤1.99 runs integration-test binaries from `target/<profile>/deps/`;
+/// Cargo 1.100 runs them from `target/<profile>/build/<package>/<hash>/out/`.
+/// Workspace bins (like `bite-fake-helper`) are uplifted to
+/// `target/<profile>/` under both layouts, so climb back to it from either.
+fn profile_dir_from(dir: &std::path::Path) -> std::path::PathBuf {
+    if dir.ends_with("out") {
+        let mut profile = dir.to_path_buf();
+        profile.pop(); // out
+        profile.pop(); // <hash>
+        profile.pop(); // <package>
+        if profile.ends_with("build") {
+            profile.pop(); // build → .../target/<profile>/
+            return profile;
+        }
+    }
+    dir.ancestors().nth(1).expect("target dir").to_path_buf()
+}
+
+#[cfg(test)]
+mod locator_tests {
+    use super::profile_dir_from;
+    use std::path::PathBuf;
+
+    #[test]
+    fn deps_layout_climbs_one_hop() {
+        // Cargo ≤1.99: the integration-test binary sits in deps/.
+        assert_eq!(
+            profile_dir_from(&PathBuf::from("/t/debug/deps")),
+            PathBuf::from("/t/debug")
+        );
+    }
+
+    #[test]
+    fn cargo_1100_build_dir_layout_climbs_four_hops() {
+        // Cargo 1.100: the test binary runs from build/<package>/<hash>/out/.
+        assert_eq!(
+            profile_dir_from(&PathBuf::from(
+                "/t/debug/build/bite-mcp/1040faffb66f9d83/out"
+            )),
+            PathBuf::from("/t/debug")
+        );
+        assert_eq!(
+            profile_dir_from(&PathBuf::from("/t/release/build/bite-mcp/0123abcd/out")),
+            PathBuf::from("/t/release")
+        );
+    }
+
+    #[test]
+    fn out_dir_outside_build_package_hash_is_left_to_the_default_climb() {
+        // An `out/` that is not under build/<package>/<hash>/ keeps the
+        // one-hop behaviour instead of misreading the layout.
+        assert_eq!(
+            profile_dir_from(&PathBuf::from("/t/debug/x/out")),
+            PathBuf::from("/t/debug/x")
+        );
+    }
 }
 
 struct McpProc {
