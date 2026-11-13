@@ -156,6 +156,17 @@ it can ship.
 
 ### Security
 
+- `Cargo.lock` pinned `quinn-proto` 0.11.18 and `quinn-udp` 0.5.15, both
+  carrying published RustSec advisories (RUSTSEC-2026-0523/0524: a
+  MAX_STREAM_DATA frame can open streams beyond the stream limit and a long
+  Retry token can panic or exhaust memory in a QUIC client;
+  RUSTSEC-2026-0538: the receive loop can spin after a truncated datagram).
+  The quinn stack enters the lock through reqwest's optional `http3`
+  feature, which no workspace crate enables, so no shipped binary links
+  the affected code — but `cargo audit` scans every lock entry, which had
+  turned the audit lane red. The lock now pins quinn-proto 0.11.19 and
+  quinn-udp 0.5.16, the patched releases.
+
 - `messages_chats_recent` and `messages_history` now clamp a client-supplied
   `limit` to 1..200 at the MCP boundary (the same guard the index search
   path already carries via `MAX_SEARCH_LIMIT`). Previously the raw value
@@ -235,6 +246,22 @@ it can ship.
   lancedb 0.40.0 is the newest published lancedb, so no lockfile-only
   move can reach them; the entries are to be removed once a lance
   release can carry the fix (issue #62).
+
+- The MCP stdio server now enforces a maximum request line size
+  (16 MiB, newline included). The request loop previously iterated
+  `stdin.lock().lines()`, which buffers a line of any size into memory
+  before the first byte is parsed — a hostile or runaway client could
+  grow a long-lived server process (one holding the LanceDB index and a
+  live helper) without bound. The replacement reader assembles lines
+  from the stream's own chunks and, past the cap, stops buffering
+  entirely: the remainder of the oversized line is discarded chunk by
+  chunk, the buffer prefix is dropped, and the client receives a
+  `-32600` invalid-request error with a null id (the line was never
+  parsed) while the server keeps serving — the next well-formed request
+  on the same stream parses normally. A line of exactly 16 MiB parses
+  normally, and every prior loop behavior (blank-line skip, invalid
+  UTF-8 ends the session, final unterminated line delivered) is
+  preserved and pinned by tests.
 
 ## [v0.5.0] - 2026-10-22
 
