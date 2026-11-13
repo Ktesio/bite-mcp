@@ -209,6 +209,23 @@ it can ship.
   check in `parse_orderable_semver`, keeping accept/reject behavior
   identical. Closes both open `py/redos` alerts on the default-branch
   analysis re-run.
+
+- bite-index now builds lancedb with default features only, dropping the
+  `remote` feature. It was a compile workaround for 0.39–0.40 (which
+  referenced the remote-gated `Error::Http` unconditionally), obsolete since
+  0.41 cfg-gates that path (lancedb/lancedb#4142) — while nothing in the
+  workspace contacts a remote LanceDB service at all (zero references to
+  the remote API surface; `lancedb::Error` is touched only via `#[from]` +
+  `Display`). The feature pulled an unused arrow-flight/oauth2/tonic client
+  stack into every build of the index crate; dropping it trims the compiled
+  and audited dependency surface. `tonic`, `oauth2`, `arrow-flight` and
+  their remote-only extras (rustls-platform-verifier, webpki-root-certs)
+  leave the resolution entirely — deny.toml drops the CDLA-Permissive-2.0
+  license allow with them, since webpki-root-certs was the lockfile's only
+  carrier. `prost` and `reqwest` stay in the graph through lance's own
+  stacks (lance/lance-core's prost types, the
+  lance-namespace-reqwest-client), so they remain compiled and audited.
+
 - Supply-chain advisory wave in the zstd stack (RUSTSEC-2026-0391,
   -0398, -0403, -0410, all issued 2026-10-26): the lockfile now carries
   zstd-sys 2.1.2, clearing -0410 (wasm32-only allocator shim). The other
