@@ -132,9 +132,12 @@ fn shared_index() -> Result<Arc<bite_index::EntityIndex>, BiteError> {
 /// writes serialize on the store's cross-process `.writer.lock` (see
 /// `ingest_pending_if_due` and `EntityIndex::lock_writer`), opportunistic
 /// ingest deduplicates itself on the `.ingest.lock` file lock, and `f` only
-/// ever reads — concurrent LanceDB readers each pin the dataset version they
-/// open, the same way reads already coexist with the detached crawler's
-/// writes in another process.
+/// ever reads — reads open the current dataset version, and an
+/// `index_forget` in flight (here or in another process) prunes old
+/// versions eagerly, so a scan pinned to one can hit a transient
+/// not-found; every read path that pins a version (`EntityIndex::search`,
+/// `count` and `stats`) covers that window with one retry on a fresh
+/// table handle.
 pub fn with_index<T>(
     f: impl FnOnce(&bite_index::EntityIndex) -> Result<T, BiteError>,
 ) -> Result<T, BiteError> {
@@ -1172,6 +1175,68 @@ fn record_purge_scope(
     bite_core::fsops::write_private(path, &bytes)
 }
 
+/// One physical-reclamation step of a confirmed `forget`, with the label
+/// its failure is reported under. The lifetime lets steps borrow the
+/// caller's index handle (or test locals) instead of requiring 'static.
+struct ReclaimStep<'a> {
+    name: &'static str,
+    run: Box<dyn FnMut() -> Result<(), String> + 'a>,
+}
+
+/// The post-delete tail of a confirmed `index_forget`: record the purge
+/// scope FIRST, then run each reclamation step best-effort, and always
+/// return the purge result.
+///
+/// The ordering is load-bearing: the reclaim steps are slow table-wide
+/// rewrites that can fail (disk full mid-rewrite), and a scope left
+/// unrecorded by such a failure would be silently undone by the next
+/// `full:true` rebuild — a worse outcome than bytes lingering on disk.
+/// Reclamation is best-effort for the same reason: each step only shrinks
+/// the on-disk footprint, never the logical purge (rows are already
+/// masked in every query path), so a failure degrades to a
+/// `reclaim_warning` instead of failing the call — a `?` failure here
+/// would have the caller retry into a 0-row delete that hits the same
+/// wall. Split out with injectable steps so tests pin the ordering and
+/// the best-effort degradation without standing up the process-global
+/// index.
+fn finish_purge(
+    scopes_path: &std::path::Path,
+    app: Option<&str>,
+    container: Option<&str>,
+    deleted: usize,
+    scope: Value,
+    steps: &mut [ReclaimStep<'_>],
+) -> Value {
+    let purge_recorded = record_purge_scope(scopes_path, app, container).is_ok();
+    let mut reclaim_failures: Vec<String> = Vec::new();
+    for step in steps.iter_mut() {
+        if let Err(e) = (step.run)() {
+            reclaim_failures.push(format!("{}: {e}", step.name));
+        }
+    }
+    let mut out = json!({
+        "deleted": deleted,
+        "scope": scope,
+        "note": "local index only — Apple data untouched; the scope is recorded and future crawls skip it (index_wipe clears the record)",
+    });
+    if !purge_recorded {
+        out["warning"] =
+            json!("could not persist the purge scope — a full re-crawl will re-import these rows");
+    }
+    if !reclaim_failures.is_empty() {
+        // The only real retry is another `index_forget` with the same
+        // scope: it deletes 0 rows but still runs the reclaim steps
+        // unconditionally. The crawl-settled optimize does NOT qualify —
+        // it keeps lance's 10% deletion threshold, which leaves a sparse
+        // purge soft-deleted indefinitely.
+        out["reclaim_warning"] = json!(format!(
+            "purged rows are masked from every query, but their bytes were not fully reclaimed ({}); re-run index_forget with the same scope (confirm:true) to retry the reclaim",
+            reclaim_failures.join("; ")
+        ));
+    }
+    out
+}
+
 /// Scoped purge of index rows (app and/or container) — the LOCAL copy only;
 /// Apple data is never touched. Full reset stays on `index_wipe` (which also
 /// clears the delta watermark): an unscoped forget is refused so a bare
@@ -1244,29 +1309,44 @@ pub fn forget(params: &Value) -> Result<Value, BiteError> {
         index
             .delete_where(&filter)
             .map_err(|e| BridgeError::new("index_error", e.to_string()))?;
-        // Deleted rows leave dead FTS fragments that still hold plaintext
-        // until compaction — fold them away immediately instead of waiting
-        // for the next crawl-settled optimize.
-        index
-            .refresh_fts()
-            .map_err(|e| BridgeError::new("index_error", e.to_string()))?;
-        // Record the scope so the purge SURVIVES later full crawls (they
-        // would otherwise re-import the same rows from Apple). Failure is
-        // surfaced, not swallowed: an unrecorded purge is silently undone by
-        // the next `full:true` rebuild — the caller must know that happened.
-        let purge_recorded =
-            record_purge_scope(&purge_scopes_path(), app.as_deref(), container.as_deref()).is_ok();
-        let mut out = json!({
-            "deleted": n,
-            "scope": scope,
-            "note": "local index only — Apple data untouched; the scope is recorded and future crawls skip it (index_wipe clears the record)",
-        });
-        if !purge_recorded {
-            out["warning"] = json!(
-                "could not persist the purge scope — a full re-crawl will re-import these rows"
-            );
-        }
-        Ok(out)
+        // Post-delete tail — scope recorded FIRST, reclamation best-effort
+        // — lives in `finish_purge` (split out so its ordering and
+        // degradation are pinned by tests without the process-global
+        // index).
+        Ok(finish_purge(
+            &purge_scopes_path(),
+            app.as_deref(),
+            container.as_deref(),
+            n,
+            scope,
+            &mut [
+                // Deleted rows leave dead FTS fragments that still hold
+                // plaintext until compaction — and lance's default
+                // compaction threshold (10% of a fragment deleted) would
+                // leave a sparse purge soft-deleted in the data files
+                // indefinitely. Reclaim at ANY ratio, now, instead of
+                // waiting for the next crawl-settled optimize.
+                ReclaimStep {
+                    name: "compaction",
+                    run: Box::new(|| index.compact_deletions().map_err(|e| e.to_string())),
+                },
+                ReclaimStep {
+                    name: "fts refresh",
+                    run: Box::new(|| index.refresh_fts().map_err(|e| e.to_string())),
+                },
+                // Compaction only writes NEW fragments: the pre-compaction
+                // data files still hold the purged plaintext until the old
+                // table versions referencing them are pruned, and lance's
+                // default prune window is 7 days. Prune eagerly — under
+                // the writer lock — so the reclaim completes before
+                // index_forget returns (this also drops the FTS index
+                // fragments the refresh just replaced).
+                ReclaimStep {
+                    name: "version prune",
+                    run: Box::new(|| index.prune_versions().map_err(|e| e.to_string())),
+                },
+            ],
+        ))
     })
 }
 
@@ -1569,6 +1649,104 @@ mod tests {
         // a scope of empty strings is as good as no scope — refuse too
         let out = forget(&json!({ "app": "", "container": "" })).unwrap();
         assert!(out.get("error").is_some());
+    }
+
+    #[test]
+    fn finish_purge_records_scope_before_reclaim_and_degrades_best_effort() {
+        // (a) every reclaim step succeeds → no warnings, scope tombstoned
+        let dir = tempfile::tempdir().expect("tempdir");
+        let scopes = dir.path().join("purge-scopes.json");
+        let mut ok: Vec<ReclaimStep<'_>> = ["compaction", "fts refresh", "version prune"]
+            .into_iter()
+            .map(|name| ReclaimStep {
+                name,
+                run: Box::new(|| Ok(())),
+            })
+            .collect();
+        let out = finish_purge(
+            &scopes,
+            Some("mail"),
+            Some("Junk"),
+            7,
+            json!({ "app": "mail", "container": "Junk" }),
+            &mut ok,
+        );
+        assert!(out.get("warning").is_none(), "clean run must not warn");
+        assert!(out.get("reclaim_warning").is_none());
+        assert_eq!(out["deleted"], json!(7));
+        assert_eq!(out["scope"]["container"], json!("Junk"));
+        assert!(
+            read_purge_scopes(&scopes)
+                .iter()
+                .any(|s| s.same_scope(Some("mail"), Some("Junk"))),
+            "scope must be tombstoned on a clean run"
+        );
+
+        // (b) the FIRST reclaim step fails → the purge still returns,
+        // the scope is STILL recorded, the warning names the step and
+        // points at the real retry path. The ordering is pinned from
+        // inside the failing step: it asserts the tombstone is already
+        // on disk when it runs, so a refactor that moves the record
+        // after the steps (or puts a `?` back on them) fails HERE.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let scopes = dir.path().join("purge-scopes.json");
+        let marker_path = scopes.clone();
+        let failing = ReclaimStep {
+            name: "compaction",
+            run: Box::new(move || {
+                assert!(
+                    read_purge_scopes(&marker_path)
+                        .iter()
+                        .any(|s| s.same_scope(Some("mail"), Some("Junk"))),
+                    "purge scope must be recorded BEFORE the first reclaim step"
+                );
+                Err("disk full mid-rewrite".to_string())
+            }),
+        };
+        // a later step must still run after an earlier one fails —
+        // best-effort, not fail-fast
+        let ran_second = std::cell::Cell::new(false);
+        let second = ReclaimStep {
+            name: "fts refresh",
+            run: Box::new(|| {
+                ran_second.set(true);
+                Ok(())
+            }),
+        };
+        let out = finish_purge(
+            &scopes,
+            Some("mail"),
+            Some("Junk"),
+            3,
+            json!({ "app": "mail", "container": "Junk" }),
+            &mut [failing, second],
+        );
+        assert!(
+            ran_second.get(),
+            "a failed reclaim step must not skip the rest"
+        );
+        let warn = out["reclaim_warning"]
+            .as_str()
+            .expect("failed step must surface a reclaim_warning");
+        assert!(
+            warn.contains("compaction"),
+            "warning must name the failed step"
+        );
+        assert!(
+            warn.contains("re-run index_forget"),
+            "warning must point at the real retry path"
+        );
+        assert_eq!(
+            out["deleted"],
+            json!(3),
+            "deleted count survives a failed reclaim step"
+        );
+        assert!(
+            read_purge_scopes(&scopes)
+                .iter()
+                .any(|s| s.same_scope(Some("mail"), Some("Junk"))),
+            "scope stays recorded even when a reclaim step fails"
+        );
     }
 
     #[test]

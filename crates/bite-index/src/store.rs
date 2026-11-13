@@ -249,6 +249,69 @@ fn schema() -> SchemaRef {
     ]))
 }
 
+/// True when an error is the transient not-found of a scan whose pinned
+/// table version was pruned mid-read by an eager `prune_versions`
+/// (`index_forget` reclamation) — retryable on a fresh table handle.
+/// The message must name a table-file path the prune can delete — a
+/// `_versions/` manifest, a `/data/` fragment, an `_indices/` FTS index
+/// fragment, a `_deletions/` deletion vector or a `_transactions/`
+/// journal file: a bare "not found" is NOT enough — "Table 'entities'
+/// was not found" (post-`index_wipe`), "column ... not found" (a bad
+/// filter) and `_metadata/` paths must fail fast, not retry. `/data/`
+/// is anchored so the `data/` inside `_metadata/` cannot match.
+fn is_pruned_version_gone(e: &IndexError) -> bool {
+    let msg = e.to_string().to_lowercase();
+    let not_found = msg.contains("not found") || msg.contains("notfound");
+    let names_table_file = msg.contains("_versions/")
+        || msg.contains("/data/")
+        || msg.contains("_indices/")
+        || msg.contains("_deletions/")
+        || msg.contains("_transactions/");
+    not_found && names_table_file
+}
+
+/// Run `op`, retrying exactly once when it fails with the pruned-version
+/// not-found above — the retry's fresh table handle pins the current
+/// version. Any other error surfaces unchanged, and a second
+/// pruned-version failure is returned rather than retried again.
+fn with_pruned_version_retry<T>(
+    mut op: impl FnMut() -> Result<T, IndexError>,
+) -> Result<T, IndexError> {
+    match op() {
+        Err(e) if is_pruned_version_gone(&e) => op(),
+        r => r,
+    }
+}
+
+// Test-only seam pinning that the public read paths actually route
+// through `with_pruned_version_retry` (see
+// `read_paths_retry_through_the_wrapper`): when armed, the next read
+// attempts fail with a synthetic pruned-version not-found BEFORE
+// touching lancedb, and every read attempt is counted. (Plain comment:
+// rustdoc does not document macro invocations, so `///` here is an
+// unused-doc-comment error under `-D warnings`.)
+#[cfg(test)]
+thread_local! {
+    static PRUNED_READ_INJECTIONS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    static READ_ATTEMPTS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn note_read_attempt() -> Option<IndexError> {
+    READ_ATTEMPTS.with(|a| a.set(a.get() + 1));
+    PRUNED_READ_INJECTIONS.with(|left| {
+        if left.get() == 0 {
+            None
+        } else {
+            left.set(left.get() - 1);
+            Some(IndexError::Other(
+                "Object at location /idx/entities.lance/_indices/9b2c7ad1-6f24-4f0e-9c0b-6b5a2d8e4f10/index.idx not found: No such file or directory (os error 2)"
+                    .to_string(),
+            ))
+        }
+    })
+}
+
 /// Single-quote escape for SQL filter literals.
 pub fn sql_str(s: &str) -> String {
     format!("'{}'", s.replace('\'', "''"))
@@ -385,7 +448,115 @@ impl EntityIndex {
         })
     }
 
+    /// Force-materialize every deletion vector: compaction with the
+    /// materialize threshold pinned to zero. `refresh_fts`'s
+    /// `optimize(All)` keeps lance's default threshold (10% of a fragment
+    /// deleted), so a sparse purge — one mailbox out of a large index —
+    /// stays soft-deleted: rows are masked in every query path but remain
+    /// physically present in the data files. The `index_forget` path calls
+    /// this so a purge reclaims the bytes at ANY deletion ratio.
+    ///
+    /// Scope warning: this is a TABLE-WIDE compaction — lance rewrites every
+    /// fragment that carries a deletion vector, not just fragments the purge
+    /// touched. Routine `merge_insert` re-ingests soft-delete old row
+    /// versions, so on a long-lived index most older fragments carry a few
+    /// deleted rows and one small purge rewrites large parts of the table
+    /// while the caller holds the cross-process writer lock. Follow with
+    /// [`Self::prune_versions`] to drop the pre-compaction files (and the
+    /// replaced FTS index fragments) — compaction alone leaves the old
+    /// versions, and with them the purged plaintext, on disk.
+    pub fn compact_deletions(&self) -> Result<(), IndexError> {
+        self.rt.block_on(async {
+            use lancedb::table::{CompactionOptions, OptimizeAction};
+            // Lance: "Setting to zero (or lower) will materialize deletions
+            // for all fragments with deletions."
+            let options = CompactionOptions {
+                materialize_deletions_threshold: 0.0,
+                ..Default::default()
+            };
+            let table = self.table().await?;
+            table
+                .optimize(OptimizeAction::Compact {
+                    options,
+                    remap_options: None,
+                })
+                .await?;
+            Ok(())
+        })
+    }
+
+    /// Rows soft-deleted via deletion vectors but still physically present
+    /// in the data files — zero once compaction materializes them. Test
+    /// surface for the in-crate purge-reclamation pins — compiled only
+    /// under `cfg(test)`, so it never ships as public API.
+    #[cfg(test)]
+    fn soft_deleted_rows(&self) -> Result<usize, IndexError> {
+        self.rt.block_on(async {
+            let table = self.table().await?;
+            // lancedb 0.41 dropped Table::count_deleted_rows; the same
+            // figure now rides TableStatistics (populated from the
+            // dataset-level count on every successful stats call).
+            Ok(table.stats().await?.num_deleted_rows.unwrap_or(0))
+        })
+    }
+
+    /// Drop old table versions and delete the files only they reference.
+    ///
+    /// Lance changes are additive: compaction writes new data files and a
+    /// new manifest, but every PRE-compaction version still references the
+    /// old fragments — which still hold the purged rows' plaintext — and
+    /// those files stay on disk until the versions referencing them are
+    /// pruned. The only other prune on the hot path (`refresh_fts`'
+    /// `optimize(All)`) keeps lance's default `older_than` of 7 days, so
+    /// without an eager prune a purge's bytes linger at least a week and
+    /// longer if nothing else optimizes.
+    ///
+    /// `index_forget` calls this AFTER `compact_deletions` and
+    /// `refresh_fts`, so one prune also drops the FTS index fragments the
+    /// rebuild replaced.
+    ///
+    /// `delete_unverified` stays OFF deliberately. The purged plaintext
+    /// lives in files referenced by PRE-compaction manifests — verified
+    /// files — so the purge reclaims without it. Unverified files are
+    /// exactly an in-flight writer's not-yet-committed fragments, and the
+    /// writer flock does NOT rule them out (`ingest_pending` drops its
+    /// guard before the merge-inserts run, and readers never take it):
+    /// pruning them could delete an uncommitted ingest's files and leave
+    /// the table pointing at missing data. Files a crashed writer leaves
+    /// behind are swept by a later prune once they age past `older_than`.
+    ///
+    /// Concurrent readers: this prune deletes files that older table
+    /// versions reference, so a read already pinned to such a version
+    /// can fail with a transient not-found — `search`, `count` and
+    /// `stats` each retry once through [`with_pruned_version_retry`]
+    /// on a fresh table handle to cover that window.
+    pub fn prune_versions(&self) -> Result<(), IndexError> {
+        self.rt.block_on(async {
+            use lancedb::table::OptimizeAction;
+            let table = self.table().await?;
+            table
+                .optimize(OptimizeAction::Prune {
+                    older_than: Some(chrono::Duration::zero()),
+                    delete_unverified: Some(false),
+                    error_if_tagged_old_versions: Some(false),
+                })
+                .await?;
+            Ok(())
+        })
+    }
+
+    /// Row count, optionally filtered. Retries once on the transient
+    /// not-found of a scan whose table version an eager `prune_versions`
+    /// (`index_forget` reclamation) deleted mid-read — see `search`.
     pub fn count(&self, filter: Option<&str>) -> Result<usize, IndexError> {
+        with_pruned_version_retry(|| self.count_once(filter))
+    }
+
+    fn count_once(&self, filter: Option<&str>) -> Result<usize, IndexError> {
+        #[cfg(test)]
+        if let Some(e) = note_read_attempt() {
+            return Err(e);
+        }
         self.rt.block_on(async {
             let table = self.table().await?;
             Ok(table
@@ -398,6 +569,20 @@ impl EntityIndex {
     /// filter-only queries unless `skip_exact_count` is set (scan skipped,
     /// `None` returned); always `None` for FTS (page-capped).
     pub fn search(&self, q: &SearchQuery) -> Result<SearchResult, IndexError> {
+        // An `index_forget` in this or another process prunes old table
+        // versions eagerly (see `prune_versions`); a scan pinned to a
+        // pruned version fails with a transient not-found. One retry —
+        // `search_once` re-opens the table, pinning the current version —
+        // covers that window. `count` and `stats` share the same retry:
+        // every read path that pins a version survives the eager prune.
+        with_pruned_version_retry(|| self.search_once(q))
+    }
+
+    fn search_once(&self, q: &SearchQuery) -> Result<SearchResult, IndexError> {
+        #[cfg(test)]
+        if let Some(e) = note_read_attempt() {
+            return Err(e);
+        }
         self.rt.block_on(async {
             let table = self.table().await?;
             let filter = filter_sql(q);
@@ -448,7 +633,18 @@ impl EntityIndex {
         })
     }
 
+    /// One-scan stats. Retries once on the transient not-found of a scan
+    /// whose table version an eager `prune_versions` (`index_forget`
+    /// reclamation) deleted mid-read — see `search`.
     pub fn stats(&self) -> Result<IndexStats, IndexError> {
+        with_pruned_version_retry(|| self.stats_once())
+    }
+
+    fn stats_once(&self) -> Result<IndexStats, IndexError> {
+        #[cfg(test)]
+        if let Some(e) = note_read_attempt() {
+            return Err(e);
+        }
         self.rt.block_on(async {
             let table = self.table().await?;
             // One projected scan computes total, per-app counts and the
@@ -879,6 +1075,364 @@ mod tests {
         // stats
         let stats = idx.stats().unwrap();
         assert_eq!(stats.total, 2);
+    }
+
+    #[test]
+    fn search_survives_eager_version_prune() {
+        // `index_forget` reclamation prunes old table versions eagerly; a
+        // scan pinned to a pruned version must not surface that as a hard
+        // failure — `search` retries once on a fresh table handle.
+        // Search → prune → search on the SAME EntityIndex pins the
+        // contract end to end (the second search opens the post-prune
+        // version and succeeds first try — the retry branch itself is
+        // pinned by `with_pruned_version_retry_recovers_exactly_once`,
+        // and the read-path wiring through the wrapper by
+        // `read_paths_retry_through_the_wrapper`).
+        let dir = temp_dir("prune-retry");
+        let idx = EntityIndex::open(&dir).unwrap();
+        idx.ingest(&[record(
+            "mail",
+            "m1",
+            "Hello",
+            "plain greeting body",
+            Some(true),
+        )])
+        .unwrap();
+        let q = SearchQuery {
+            app: Some("mail".into()),
+            limit: 10,
+            ..Default::default()
+        };
+        let res = idx.search(&q).expect("search before prune");
+        assert_eq!(res.hits.len(), 1);
+        idx.prune_versions().expect("eager prune");
+        let res = idx.search(&q).expect("search after eager prune");
+        assert_eq!(res.hits.len(), 1, "the row must still be findable");
+    }
+
+    #[test]
+    fn with_pruned_version_retry_recovers_exactly_once() {
+        // The retry branch itself. The e2e test above opens the post-prune
+        // version on its second search and succeeds first try, so it can
+        // never prove the retry fires; this injects the pruned-version
+        // error directly into the wrapped operation and pins all three
+        // behaviors `search`/`count`/`stats` rely on: recover on the
+        // second attempt, NO second retry after a repeat failure, and no
+        // retry at all for unrelated errors.
+        let pruned = || {
+            IndexError::Other(
+                "Object at location /idx/_versions/2.manifest not found: No such file or directory (os error 2)"
+                    .to_string(),
+            )
+        };
+        let mut calls = 0;
+        let out = with_pruned_version_retry(|| {
+            calls += 1;
+            if calls == 1 {
+                Err(pruned())
+            } else {
+                Ok(7usize)
+            }
+        })
+        .expect("second attempt succeeds");
+        assert_eq!(out, 7);
+        assert_eq!(calls, 2, "exactly one retry");
+
+        let mut calls = 0;
+        let err = with_pruned_version_retry::<usize>(|| {
+            calls += 1;
+            Err(pruned())
+        })
+        .expect_err("a repeat pruned failure surfaces");
+        assert!(is_pruned_version_gone(&err));
+        assert_eq!(calls, 2, "never a third attempt");
+
+        let mut calls = 0;
+        let err = with_pruned_version_retry::<usize>(|| {
+            calls += 1;
+            Err(IndexError::Other(
+                "arrow schema mismatch: expected Utf8".into(),
+            ))
+        })
+        .expect_err("unrelated errors surface");
+        assert!(!is_pruned_version_gone(&err));
+        assert_eq!(calls, 1, "unrelated errors are not retried");
+    }
+
+    #[test]
+    fn read_paths_retry_through_the_wrapper() {
+        // Pins the WIRING, which the two tests around it cannot see:
+        // `search_survives_eager_version_prune` opens the post-prune
+        // version on its second search and succeeds first try, and the
+        // helper test never touches a read path — so a read path that
+        // stopped routing through `with_pruned_version_retry` would
+        // still pass every other test. Here the first `_once` attempt
+        // of each public read fails with the pruned-version not-found
+        // BEFORE touching lancedb: the call must still succeed and must
+        // have made exactly two attempts. Remove the wrapper from any
+        // of the three read paths and the injected error surfaces here.
+        let dir = temp_dir("prune-retry-wiring");
+        let idx = EntityIndex::open(&dir).unwrap();
+        idx.ingest(&[record(
+            "mail",
+            "m1",
+            "Hello",
+            "plain greeting body",
+            Some(true),
+        )])
+        .unwrap();
+
+        let arm = |failures: u32| {
+            PRUNED_READ_INJECTIONS.with(|f| f.set(failures));
+            READ_ATTEMPTS.with(|a| a.set(0));
+        };
+        let attempts = || READ_ATTEMPTS.with(|a| a.get());
+
+        arm(1);
+        let res = idx
+            .search(&SearchQuery {
+                app: Some("mail".into()),
+                limit: 10,
+                ..Default::default()
+            })
+            .expect("search must retry through the wrapper");
+        assert_eq!(res.hits.len(), 1);
+        assert_eq!(attempts(), 2, "one failed attempt + one retry");
+
+        arm(1);
+        assert_eq!(
+            idx.count(Some("app = 'mail'"))
+                .expect("count must retry through the wrapper"),
+            1
+        );
+        assert_eq!(attempts(), 2, "one failed attempt + one retry");
+
+        arm(1);
+        assert_eq!(
+            idx.stats()
+                .expect("stats must retry through the wrapper")
+                .total,
+            1
+        );
+        assert_eq!(attempts(), 2, "one failed attempt + one retry");
+    }
+
+    #[test]
+    fn is_pruned_version_gone_matches_pruned_scan_errors_only() {
+        // object_store's NotFound wording, as surfaced by lance when a
+        // scan pins a version whose files the eager prune deleted
+        let gone = IndexError::Other(
+            "Object at location /idx/_versions/2.manifest not found: No such file or directory (os error 2)"
+                .to_string(),
+        );
+        assert!(
+            is_pruned_version_gone(&gone),
+            "a pruned-version not-found must be retried"
+        );
+        // an unrelated failure must NOT be retried — a retry storm on a
+        // genuinely broken index hides the real error
+        let other = IndexError::Other("arrow schema mismatch: expected Utf8".to_string());
+        assert!(
+            !is_pruned_version_gone(&other),
+            "unrelated errors must not match the pruned-version retry"
+        );
+        // not-found wordings that are NOT a pruned version must fail fast
+        // too: a wiped table (retrying re-creates nothing) and a bad
+        // filter column
+        let wiped = IndexError::Other("Table 'entities' was not found".to_string());
+        assert!(
+            !is_pruned_version_gone(&wiped),
+            "a wiped table is not a pruned version"
+        );
+        let bad_filter = IndexError::Other("column bite.unknown not found".to_string());
+        assert!(
+            !is_pruned_version_gone(&bad_filter),
+            "a bad filter column is not a pruned version"
+        );
+        // a pruned data fragment — the other table-file path shape — must
+        // match just like the manifest case above
+        let gone_fragment =
+            IndexError::Other("Object at location /idx/data/9-abc.lance not found".to_string());
+        assert!(
+            is_pruned_version_gone(&gone_fragment),
+            "a pruned fragment file is a pruned version"
+        );
+        // the eager prune also deletes rebuilt-away FTS index fragments
+        // and pre-compaction deletion vectors — a scan pinned to such a
+        // version fails on an `_indices/` or `_deletions/` path and must
+        // retry just like the manifest/fragment cases above
+        let gone_fts = IndexError::Other(
+            "Object at location /idx/entities.lance/_indices/9b2c7ad1-6f24-4f0e-9c0b-6b5a2d8e4f10/index.idx not found"
+                .to_string(),
+        );
+        assert!(
+            is_pruned_version_gone(&gone_fts),
+            "a pruned FTS index fragment is a pruned version"
+        );
+        let gone_deletions = IndexError::Other(
+            "Object at location /idx/entities.lance/_deletions/9-abc.lance not found".to_string(),
+        );
+        assert!(
+            is_pruned_version_gone(&gone_deletions),
+            "a pruned deletion-vector file is a pruned version"
+        );
+        // `metadata/` CONTAINS the substring `data/` but is not a data
+        // path — the `/data/` anchor keeps it from matching
+        let metadata = IndexError::Other(
+            "Object at location /idx/entities.lance/_metadata/stats.json not found".to_string(),
+        );
+        assert!(
+            !is_pruned_version_gone(&metadata),
+            "a metadata path is not a pruned data fragment"
+        );
+    }
+
+    #[test]
+    fn purge_compaction_materializes_sparse_deletions() {
+        // A sparse purge (1 row in ~50, far below lance's default 10%
+        // materialize threshold) must still leave the data files — the
+        // index_forget retention promise cannot depend on the deletion
+        // ratio. Pins the primitives forget() composes on the purge path:
+        // delete_where -> compact_deletions -> refresh_fts.
+        let dir = temp_dir("purge-sparse-compaction");
+        let idx = EntityIndex::open(&dir).unwrap();
+
+        let mut rows: Vec<_> = (0..50)
+            .map(|i| {
+                record(
+                    "mail",
+                    &format!("live{i}"),
+                    "Real",
+                    "quarterly report attached",
+                    Some(true),
+                )
+            })
+            .collect();
+        rows.push(record(
+            "mail",
+            "purged1",
+            "Spam",
+            "unique purge marker body",
+            Some(false),
+        ));
+        idx.ingest(&rows).unwrap();
+
+        idx.delete_where("id = 'purged1'").unwrap();
+        // Discriminator: a fresh delete is SOFT — the live count already
+        // excludes the row, but the bytes sit in a deletion vector. This
+        // is exactly the state the default threshold would leave behind
+        // indefinitely on a sparse purge.
+        assert_eq!(idx.count(Some("id = 'purged1'")).unwrap(), 0);
+        assert_eq!(idx.soft_deleted_rows().unwrap(), 1);
+
+        // The purge path's forced compaction folds the deletion away at
+        // any ratio; refresh_fts (as in forget()) then rebuilds FTS over
+        // the compacted fragments.
+        idx.compact_deletions().unwrap();
+        idx.refresh_fts().unwrap();
+        assert_eq!(
+            idx.soft_deleted_rows().unwrap(),
+            0,
+            "purge compaction must materialize deletions below the default 10% threshold"
+        );
+        assert_eq!(idx.count(None).unwrap(), 50);
+        assert_eq!(idx.count(Some("id = 'purged1'")).unwrap(), 0);
+    }
+
+    #[test]
+    fn purge_prune_reclaims_old_version_files() {
+        // Compaction alone leaves the PRE-compaction data files on disk:
+        // every old table version still references them (time travel), and
+        // lance prunes old versions only after 7 days by default. The
+        // purge path's eager prune must delete those files NOW — the
+        // on-disk bytes are the whole point of index_forget, and
+        // soft_deleted_rows() reads only the LATEST manifest's deletion
+        // vectors, so it passes while the purged plaintext still sits in
+        // old fragments.
+        use std::collections::HashSet;
+        fn walk(root: &std::path::Path) -> HashSet<std::path::PathBuf> {
+            let mut out = HashSet::new();
+            let mut stack = vec![root.to_path_buf()];
+            while let Some(d) = stack.pop() {
+                for e in std::fs::read_dir(&d).unwrap() {
+                    let e = e.unwrap();
+                    if e.file_type().unwrap().is_dir() {
+                        stack.push(e.path());
+                    } else {
+                        out.insert(e.path());
+                    }
+                }
+            }
+            out
+        }
+
+        let dir = temp_dir("purge-prune");
+        let idx = EntityIndex::open(&dir).unwrap();
+
+        let mut rows: Vec<_> = (0..50)
+            .map(|i| {
+                record(
+                    "mail",
+                    &format!("live{i}"),
+                    "Real",
+                    "quarterly report attached",
+                    Some(true),
+                )
+            })
+            .collect();
+        rows.push(record(
+            "mail",
+            "purged1",
+            "Spam",
+            "zqxpurgemarker",
+            Some(false),
+        ));
+        idx.ingest(&rows).unwrap();
+
+        // Positive control: the marker must be physically on disk BEFORE
+        // the purge, or the absence assert after the prune proves nothing
+        // (an encoding change that never wrote the marker raw would pass
+        // vacuously). A single rare TOKEN, not a phrase: the FTS inverted
+        // index stores tokens, so a phrase marker can vanish from the data
+        // files while its terms linger in a rebuilt index's dictionary —
+        // one token cannot hide that way.
+        let marker = b"zqxpurgemarker";
+        let pre_purge = walk(&dir);
+        let marker_present = pre_purge.iter().any(|f| {
+            let bytes = std::fs::read(f).unwrap();
+            bytes.windows(marker.len()).any(|w| w == marker)
+        });
+        assert!(
+            marker_present,
+            "marker token must be on disk before the purge (positive control)"
+        );
+
+        idx.delete_where("id = 'purged1'").unwrap();
+        idx.compact_deletions().unwrap();
+        idx.refresh_fts().unwrap();
+        assert_eq!(idx.soft_deleted_rows().unwrap(), 0);
+        // Pre-prune state: compaction wrote new fragments, but the files
+        // the old versions reference are all still here.
+        let before = walk(&dir);
+        idx.prune_versions().unwrap();
+        let after = walk(&dir);
+        let gone: Vec<_> = before.difference(&after).collect();
+        assert!(
+            !gone.is_empty(),
+            "eager prune must delete the pre-compaction files — nothing disappeared"
+        );
+        // The purged plaintext is absent from EVERY file still on disk
+        // (data fragments, manifests, FTS index/dictionary files alike).
+        for f in &after {
+            let bytes = std::fs::read(f).unwrap();
+            assert!(
+                !bytes.windows(marker.len()).any(|w| w == marker),
+                "purge marker still on disk in {}",
+                f.display()
+            );
+        }
+        assert_eq!(idx.count(None).unwrap(), 50);
+        assert_eq!(idx.count(Some("id = 'purged1'")).unwrap(), 0);
     }
 
     #[test]
