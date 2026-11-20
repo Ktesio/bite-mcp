@@ -156,6 +156,17 @@ it can ship.
 
 ### Security
 
+- `Cargo.lock` pinned `quinn-proto` 0.11.18 and `quinn-udp` 0.5.15, both
+  carrying published RustSec advisories (RUSTSEC-2026-0523/0524: a
+  MAX_STREAM_DATA frame can open streams beyond the stream limit and a long
+  Retry token can panic or exhaust memory in a QUIC client;
+  RUSTSEC-2026-0538: the receive loop can spin after a truncated datagram).
+  The quinn stack enters the lock through reqwest's optional `http3`
+  feature, which no workspace crate enables, so no shipped binary links
+  the affected code — but `cargo audit` scans every lock entry, which had
+  turned the audit lane red. The lock now pins quinn-proto 0.11.19 and
+  quinn-udp 0.5.16, the patched releases.
+
 - `messages_chats_recent` and `messages_history` now clamp a client-supplied
   `limit` to 1..200 at the MCP boundary (the same guard the index search
   path already carries via `MAX_SEARCH_LIMIT`). Previously the raw value
