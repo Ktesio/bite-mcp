@@ -261,7 +261,13 @@ it can ship.
   on the same stream parses normally. A line of exactly 16 MiB parses
   normally, and every prior loop behavior (blank-line skip, invalid
   UTF-8 ends the session, final unterminated line delivered) is
-  preserved and pinned by tests.
+  preserved and pinned by tests — unit tests for the reader, plus
+  end-to-end stdio smoke tests driving the real binary through the
+  serve() loop (an overlong line is answered and serving continues;
+  invalid UTF-8 ends the session cleanly). The reused line buffer also
+  releases any cap-grown allocation, so steady-state memory tracks the
+  small requests that follow a near-cap line instead of staying at its
+  peak.
 
 ## [v0.5.0] - 2026-10-22
 

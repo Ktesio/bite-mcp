@@ -131,8 +131,9 @@ enum LineRead {
     /// The stream ended cleanly and nothing is buffered.
     Eof,
     /// The line exceeded `MAX_REQUEST_LINE_BYTES`. Its remainder has been
-    /// drained and the buffer emptied, so the stream is positioned at the
-    /// start of the next line and no cap-sized prefix is retained.
+    /// drained and the buffer emptied (length and allocation), so the stream
+    /// is positioned at the start of the next line and no cap-sized prefix
+    /// is retained.
     Overlong,
 }
 
@@ -143,7 +144,14 @@ enum LineRead {
 /// discarded chunk by chunk until its newline arrives (or the stream
 /// ends). A line of exactly `MAX_REQUEST_LINE_BYTES` bytes parses normally.
 fn read_request_line(reader: &mut impl BufRead, buf: &mut Vec<u8>) -> std::io::Result<LineRead> {
+    // `clear()` alone would keep the allocation: one line near the cap
+    // leaves the reused buffer holding ~16 MiB for the life of the server.
+    // Shrink oversized buffers back so the steady-state footprint tracks
+    // the small requests that actually follow.
     buf.clear();
+    if buf.capacity() > 64 * 1024 {
+        buf.shrink_to(64 * 1024);
+    }
     let mut overlong = false;
     loop {
         // `fill_buf` borrows the reader; decide what to consume inside the
@@ -170,7 +178,9 @@ fn read_request_line(reader: &mut impl BufRead, buf: &mut Vec<u8>) -> std::io::R
                 Some(pos) => {
                     let end = pos + 1;
                     if overlong || buf.len() + end > MAX_REQUEST_LINE_BYTES {
-                        buf.clear();
+                        // release the cap-grown prefix allocation, not just
+                        // its length
+                        *buf = Vec::new();
                         (end, Some(LineRead::Overlong))
                     } else {
                         buf.extend_from_slice(&available[..end]);
@@ -183,7 +193,9 @@ fn read_request_line(reader: &mut impl BufRead, buf: &mut Vec<u8>) -> std::io::R
                     let n = available.len();
                     if overlong || buf.len() + n > MAX_REQUEST_LINE_BYTES {
                         overlong = true;
-                        buf.clear();
+                        // release the cap-grown prefix allocation, not just
+                        // its length
+                        *buf = Vec::new();
                         (n, None)
                     } else {
                         buf.extend_from_slice(available);
