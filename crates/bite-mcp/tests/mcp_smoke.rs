@@ -9,7 +9,8 @@ use serde_json::{json, Value};
 /// The fake helper is a bin of bite-bridge; locate it in the shared target dir.
 fn fake_helper_path() -> std::path::PathBuf {
     let exe = std::env::current_exe().expect("test exe");
-    let debug_dir = exe.ancestors().nth(2).expect("target dir").to_path_buf();
+    let dir = exe.parent().expect("test exe dir");
+    let debug_dir = profile_dir_from(dir);
     let candidate = debug_dir.join("bite-fake-helper");
     assert!(
         candidate.exists(),
@@ -17,6 +18,65 @@ fn fake_helper_path() -> std::path::PathBuf {
         candidate.display()
     );
     candidate
+}
+
+/// `target/<profile>/` from the directory the test binary runs from.
+/// Cargo ≤1.99 runs integration-test binaries from `target/<profile>/deps/`;
+/// Cargo 1.100 runs them from `target/<profile>/build/<package>/<hash>/out/`.
+/// Workspace bins (like `bite-fake-helper`) are uplifted to
+/// `target/<profile>/` under both layouts, so climb back to it from either.
+fn profile_dir_from(dir: &std::path::Path) -> std::path::PathBuf {
+    if dir.ends_with("out") {
+        let mut profile = dir.to_path_buf();
+        profile.pop(); // out
+        profile.pop(); // <hash>
+        profile.pop(); // <package>
+        if profile.ends_with("build") {
+            profile.pop(); // build → .../target/<profile>/
+            return profile;
+        }
+    }
+    dir.ancestors().nth(1).expect("target dir").to_path_buf()
+}
+
+#[cfg(test)]
+mod locator_tests {
+    use super::profile_dir_from;
+    use std::path::PathBuf;
+
+    #[test]
+    fn deps_layout_climbs_one_hop() {
+        // Cargo ≤1.99: the integration-test binary sits in deps/.
+        assert_eq!(
+            profile_dir_from(&PathBuf::from("/t/debug/deps")),
+            PathBuf::from("/t/debug")
+        );
+    }
+
+    #[test]
+    fn cargo_1100_build_dir_layout_climbs_four_hops() {
+        // Cargo 1.100: the test binary runs from build/<package>/<hash>/out/.
+        assert_eq!(
+            profile_dir_from(&PathBuf::from(
+                "/t/debug/build/bite-mcp/1040faffb66f9d83/out"
+            )),
+            PathBuf::from("/t/debug")
+        );
+        assert_eq!(
+            profile_dir_from(&PathBuf::from("/t/release/build/bite-mcp/0123abcd/out")),
+            PathBuf::from("/t/release")
+        );
+    }
+
+    #[test]
+    fn out_dir_outside_build_package_hash_is_left_to_the_default_climb() {
+        // An `out/` that is not under build/<package>/<hash>/ keeps the
+        // one-hop behaviour instead of misreading the layout.
+        assert_eq!(
+            profile_dir_from(&PathBuf::from("/t/debug/x/out")),
+            PathBuf::from("/t/debug/x")
+        );
+    }
 }
 
 struct McpProc {
@@ -973,4 +1033,53 @@ fn concurrent_same_key_pipelined_requests_single_dispatch() {
         fresh["structuredContent"]["message_id"],
         json!("must-not-double-send")
     );
+}
+
+/// The serve()-level line-cap contract, driven end to end against the real
+/// binary: a line one byte past the 16 MiB cap (MAX_REQUEST_LINE_BYTES in
+/// src/mcp.rs — private, keep in sync) is answered with a null-id `-32600`
+/// error and the server KEEPS SERVING: the very next well-formed request
+/// on the same stream gets its normal reply.
+#[test]
+fn overlong_line_is_rejected_and_server_keeps_serving() {
+    let mut mcp = McpProc::start();
+    let cap: usize = 16 * 1024 * 1024; // MAX_REQUEST_LINE_BYTES in src/mcp.rs
+    let mut flood = vec![b'a'; cap + 1];
+    flood.push(b'\n');
+    mcp.stdin.write_all(&flood).unwrap();
+    mcp.stdin.flush().unwrap();
+    let mut line = String::new();
+    mcp.reader.read_line(&mut line).expect("error reply line");
+    let reply: Value = serde_json::from_str(line.trim()).expect("valid json error reply");
+    assert_eq!(reply["id"], Value::Null, "an unparsed line has no id");
+    assert_eq!(reply["error"]["code"], json!(-32600));
+    // keep-serving: the next well-formed request parses normally
+    let tools = mcp.request("tools/list", json!({}));
+    assert!(
+        tools["tools"].is_array(),
+        "server must keep serving after an overlong line"
+    );
+}
+
+/// serve()'s UTF-8 contract, end to end: a line that is not valid UTF-8
+/// ends the session (the same contract the `lines()` iterator had) — EOF
+/// on stdout and a clean process exit, with no error reply.
+#[test]
+fn invalid_utf8_line_ends_the_session() {
+    let mut mcp = McpProc::start();
+    mcp.stdin.write_all(&[0xff, b'\n']).unwrap();
+    mcp.stdin.flush().unwrap();
+    let mut line = String::new();
+    let n = mcp.reader.read_line(&mut line).expect("read to EOF");
+    assert_eq!(n, 0, "expected session end (EOF), got output: {line:?}");
+    let mut exited = false;
+    for _ in 0..100 {
+        if let Some(status) = mcp.child.try_wait().expect("try_wait") {
+            assert!(status.success(), "clean exit, not a crash: {status}");
+            exited = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert!(exited, "server process must exit after invalid UTF-8");
 }
