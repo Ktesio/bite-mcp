@@ -102,6 +102,17 @@ GUI-launched clients can start it without `~/.cargo/bin` on their PATH;
 builds straight from a dev checkout register the bare `bite` instead —
 build-tree binaries vanish on the next `cargo clean`.
 
+The stdio transport itself is bounded: a single request line is capped
+at 16 MiB, newline included. A larger line is never parsed — the server
+answers with a `-32600` invalid-request JSON-RPC error carrying a null
+id (the id sits inside the rejected bytes, so it cannot be echoed) and
+keeps serving; the next well-formed line on the same stream parses
+normally. The cap is orders of magnitude above any legitimate bite
+request (the largest arguments are mail and note bodies); it exists
+so a runaway client cannot buffer unbounded memory into the
+long-lived server. Two older loop behaviors also apply: blank lines
+are skipped, and a line that is not valid UTF-8 ends the session.
+
 The writing itself is defensive by design:
 
 - **Atomic.** The new config is written to a temp file in the same
