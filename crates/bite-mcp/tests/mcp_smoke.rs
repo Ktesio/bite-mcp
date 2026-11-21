@@ -1117,6 +1117,51 @@ fn overlong_line_rejection_is_logged_server_side() {
     );
 }
 
+/// A host that pipes stderr and then closes its read end (stops capturing
+/// logs) must not be able to kill the server by sending an overlong line:
+/// the rejection log is best-effort, so the -32600 reply still goes out and
+/// the session ends only at stdin EOF. With a panicking `eprintln!` the
+/// process died right here, before the reply.
+#[test]
+fn overlong_line_with_closed_stderr_pipe_keeps_serving() {
+    let mut scenario_file = tempfile::Builder::new()
+        .prefix("bite-mcp-smoke-")
+        .suffix(".json")
+        .tempfile()
+        .expect("scenario temp file");
+    write!(scenario_file, "{}", json!({ "echo": true })).unwrap();
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_bite"));
+    cmd.args(["mcp"])
+        .env("BITE_HELPER_BIN", fake_helper_path())
+        .env("BITE_FAKE_SCENARIO", scenario_file.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = cmd.spawn().expect("spawn bite mcp");
+    let mut stdin = child.stdin.take().unwrap();
+    let mut reader = BufReader::new(child.stdout.take().unwrap());
+    // Close the parent's end of the stderr pipe FIRST: from now on every
+    // stderr write the child makes fails with EPIPE.
+    drop(child.stderr.take().unwrap());
+    let cap: usize = 16 * 1024 * 1024; // MAX_REQUEST_LINE_BYTES in src/mcp.rs
+    let mut flood = vec![b'a'; cap + 1];
+    flood.push(b'\n');
+    stdin.write_all(&flood).unwrap();
+    stdin.flush().unwrap();
+    let mut line = String::new();
+    reader.read_line(&mut line).expect("error reply line");
+    let reply: Value = serde_json::from_str(line.trim()).expect("valid json error reply");
+    assert_eq!(reply["error"]["code"], json!(-32600));
+    // Close stdin: serve() sees EOF and exits cleanly — it must NOT have
+    // died on the stderr write before the reply was read.
+    drop(stdin);
+    let status = child.wait().expect("server exits on stdin EOF");
+    assert!(
+        status.success(),
+        "closed stderr pipe must not kill serve() before stdin EOF"
+    );
+}
+
 /// serve()'s UTF-8 contract, end to end: a line that is not valid UTF-8
 /// ends the session (the same contract the `lines()` iterator had) — EOF
 /// on stdout and a clean process exit, with no error reply.
