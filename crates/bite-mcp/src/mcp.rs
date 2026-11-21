@@ -40,6 +40,15 @@ pub fn serve() -> i32 {
             LineRead::Overlong => {
                 // The line was never parsed, so the id is unknown — answer
                 // with the null-id error form and keep serving the stream.
+                // The rejection must also be visible server-side: stderr is
+                // the only operator-facing channel a stdio MCP server has,
+                // and without this line an oversized request vanishes after
+                // the -32600 reply. Only the cap is logged — client bytes
+                // never belong in logs (the buffer is already emptied, so
+                // not even a length is available).
+                eprintln!(
+                    "bite-mcp: rejected an oversized stdio request line (>{MAX_REQUEST_LINE_BYTES} bytes) with a -32600 response; still serving"
+                );
                 write_line(&stdout, &overlong_line_response());
                 continue;
             }
