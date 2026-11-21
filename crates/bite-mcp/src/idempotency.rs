@@ -37,9 +37,23 @@
 //! The key never crosses the bridge: it is stripped from the arguments
 //! before the call is forwarded, so the Swift helper's contract is
 //! unchanged.
+//!
+//! Settled records (completed outcomes and unknown pins) are DURABLE: they
+//! are persisted to a 0600 `idempotency-ledger.json` in the 0700 data dir
+//! (see [`Idempotency::persist_ledger`]) and reloaded on startup (see
+//! [`load_ledger`]), so a server restart between a client's ambiguous
+//! failure and its same-key retry no longer drops the pin — the exact
+//! double-send window the key exists to close. The file stores SHA-256
+//! hashes of the keys (never the client's key text) plus each entry's
+//! argument fingerprint and settle time; entries expire from the ledger
+//! after [`PERSIST_TTL_SECS`] and the on-disk set honors the same
+//! [`MAX_KEYS`] cap as memory. In-flight claims are never persisted (a
+//! restart provably kills the dispatching thread with them). A missing or
+//! corrupt ledger starts the server unrecorded, with one stderr note.
 
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, VecDeque};
+use std::io::Write as _;
 
 use serde_json::Value;
 
@@ -51,9 +65,25 @@ pub(crate) const KEY_PARAM: &str = "idempotency_key";
 /// of mail body size and the MAX_KEYS cap bounds TOTAL retention memory.
 pub(crate) type Fingerprint = [u8; 32];
 
+/// Fixed-size digest of the KEY ITSELF — the ledger's stored form of a
+/// key. Client key text is user-controlled data; the file gets the same
+/// SHA-256 treatment the fingerprints already use, so nothing the client
+/// chose verbatim is written to disk.
+pub(crate) type KeyHash = [u8; 32];
+
+/// How long a settled ledger entry survives from its settle time — on disk
+/// and after reload. Retries of an ambiguous send arrive within seconds; a
+/// week bounds how long a replay/refusal answer can lag behind what the
+/// client remembers without inviting stale-key surprises.
+pub(crate) const PERSIST_TTL_SECS: u64 = 7 * 24 * 60 * 60;
+
+/// Ledger file name inside the (0700) data dir; written 0600.
+pub(crate) const LEDGER_FILE: &str = "idempotency-ledger.json";
+
 /// Keys retained per server process. Beyond this the oldest settled key is
 /// evicted, completed outcomes before unknown pins; in-flight keys are
-/// never evicted (see [`Idempotency::reserve`]).
+/// never evicted (see [`Idempotency::reserve`]). The reloaded ledger
+/// honors the same cap (oldest entries dropped on load).
 const MAX_KEYS: usize = 128;
 
 /// Longest accepted key — longer client keys are a client bug, not a
@@ -76,11 +106,13 @@ pub(crate) enum Recorded {
 /// One key's recorded state plus the fixed-size argument fingerprint of
 /// the stripped arguments its claim was made with (see [`fingerprint`]).
 /// A repeat whose fingerprint differs is refused as a reuse instead of
-/// replayed.
+/// replayed. `settled_at` (unix seconds) is set when the entry settles and
+/// rides the durable ledger; it is `None` only while in flight.
 #[derive(Debug)]
 struct Entry {
     state: Recorded,
     fingerprint: Fingerprint,
+    settled_at: Option<u64>,
 }
 
 /// The result of atomically claiming a key via [`Idempotency::reserve`].
@@ -111,11 +143,33 @@ pub(crate) enum Settled {
     Unknown(String),
 }
 
+/// Current unix time in seconds (0 if the clock is somehow before the
+/// epoch — degraded, but a fallback that only makes entries look fresh,
+/// never expires them early).
+pub(crate) fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Digest of the key text — the ledger's stored form of a key.
+pub(crate) fn key_hash(key: &str) -> KeyHash {
+    let mut hasher = Sha256::new();
+    hasher.update(key.as_bytes());
+    hasher.finalize().into()
+}
+
+/// Absolute path of the durable ledger in the private data dir.
+pub(crate) fn ledger_path() -> std::path::PathBuf {
+    bite_core::config::data_dir().join(LEDGER_FILE)
+}
+
 #[derive(Default)]
 pub(crate) struct Idempotency {
     /// Retention order, oldest first — drives eviction.
-    order: VecDeque<String>,
-    map: HashMap<String, Entry>,
+    order: VecDeque<KeyHash>,
+    map: HashMap<KeyHash, Entry>,
 }
 
 impl Idempotency {
@@ -128,7 +182,7 @@ impl Idempotency {
     /// (or in-flight) entry claimed under different arguments yields
     /// [`Reserved::Reused`] — a replay would silently discard this call's
     /// arguments, so it is refused rather than replayed.
-    pub(crate) fn reserve(&mut self, key: &str, fingerprint: &Fingerprint) -> Reserved {
+    pub(crate) fn reserve(&mut self, key: &KeyHash, fingerprint: &Fingerprint) -> Reserved {
         if let Some(entry) = self.map.get(key) {
             if entry.fingerprint != *fingerprint {
                 return Reserved::Reused;
@@ -140,12 +194,13 @@ impl Idempotency {
             };
         }
         self.evict_if_full();
-        self.order.push_back(key.to_string());
+        self.order.push_back(*key);
         self.map.insert(
-            key.to_string(),
+            *key,
             Entry {
                 state: Recorded::InFlight,
                 fingerprint: *fingerprint,
+                settled_at: None,
             },
         );
         Reserved::Fresh
@@ -154,15 +209,41 @@ impl Idempotency {
     /// Settle an in-flight reservation with a final outcome. The order
     /// entry created by `reserve` is kept — the entry is updated in place,
     /// never duplicated, and the fingerprint it was claimed under stays.
-    pub(crate) fn settle(&mut self, key: &str, outcome: Settled) {
+    pub(crate) fn settle(&mut self, key: &KeyHash, outcome: Settled) {
+        let now = unix_now();
         let state = match outcome {
             Settled::Done(value) => Recorded::Done(value),
             Settled::Unknown(code) => Recorded::Unknown(code),
         };
         match self.map.get_mut(key) {
             // Only the owning thread settles its own reservation.
-            Some(entry) => entry.state = state,
+            Some(entry) => {
+                entry.state = state;
+                entry.settled_at = Some(now);
+            }
             None => debug_assert!(false, "settle must follow reserve"),
+        }
+    }
+
+    /// Settle and best-effort persist: the durable ledger must never turn a
+    /// completed send into a client-visible failure (the client would
+    /// retry and double-send), so a persist error is noted on stderr — the
+    /// one operator-facing channel a stdio server has — and swallowed.
+    /// Callers already hold the state lock; keeping settle + persist under
+    /// that one hold means the file never serializes a half-updated table.
+    pub(crate) fn settle_and_persist(
+        &mut self,
+        key: &KeyHash,
+        outcome: Settled,
+        path: &std::path::Path,
+    ) {
+        self.settle(key, outcome);
+        if let Err(error) = self.persist_ledger(path) {
+            let _ = writeln!(
+                std::io::stderr(),
+                "bite-mcp: idempotency ledger write failed ({error}); \
+                 outcomes stay in memory for this process"
+            );
         }
     }
 
@@ -170,8 +251,9 @@ impl Idempotency {
     /// attempt failed cleanly (provably nothing was sent), so the key
     /// returns to unset and an immediate retry with the same key stays
     /// possible — with ANY arguments: no outcome was recorded, so there is
-    /// nothing for new arguments to desynchronize.
-    pub(crate) fn release(&mut self, key: &str) {
+    /// nothing for new arguments to desynchronize. Nothing to persist: an
+    /// in-flight claim was never written to the ledger.
+    pub(crate) fn release(&mut self, key: &KeyHash) {
         if matches!(
             self.map.get(key),
             Some(Entry {
@@ -223,6 +305,35 @@ impl Idempotency {
             let evicted = self.order.remove(pos).expect("position came from order");
             self.map.remove(&evicted);
         }
+    }
+
+    /// Serialize every SETTLED entry (oldest first) into the durable
+    /// ledger JSON and write it 0600 via the shared private-write helper
+    /// (temp file + rename, so a crash never leaves a half-written
+    /// table). In-flight claims are skipped — a restart kills the
+    /// dispatching thread, and a stale in-flight row would refuse retries
+    /// of a call that provably never landed.
+    pub(crate) fn persist_ledger(&self, path: &std::path::Path) -> std::io::Result<()> {
+        let entries: Vec<Value> = self
+            .order
+            .iter()
+            .filter_map(|key| self.map.get(key).map(|entry| (*key, entry)))
+            .filter_map(|(key, entry)| {
+                let settled_at = entry.settled_at?;
+                let record = match &entry.state {
+                    Recorded::Done(value) => {
+                        json_record(&key, entry, "done", Some(value), None, settled_at)
+                    }
+                    Recorded::Unknown(code) => {
+                        json_record(&key, entry, "unknown", None, Some(code), settled_at)
+                    }
+                    Recorded::InFlight => return None,
+                };
+                Some(record)
+            })
+            .collect();
+        let doc = serde_json::json!({ "v": 1, "entries": entries });
+        bite_core::fsops::write_private(path, doc.to_string().as_bytes())
     }
 }
 
@@ -319,6 +430,125 @@ pub(crate) fn ambiguous(code: &str) -> bool {
     matches!(code, "helper_exited" | "timeout")
 }
 
+/// Reload the durable ledger. Expired entries (settle time older than
+/// [`PERSIST_TTL_SECS`]) and malformed rows are dropped; surviving entries
+/// keep their original settle times, so a reload never refreshes a dying
+/// entry into another full TTL. The newest [`MAX_KEYS`] entries survive —
+/// the same cap memory enforces. A missing file is the first-run case; a
+/// corrupt file is noted on stderr (the operator channel) and otherwise
+/// treated the same: the server starts unrecorded rather than refusing to
+/// serve, trading a lost replay/refusal surface for availability.
+pub(crate) fn load_ledger(path: &std::path::Path, now_secs: u64) -> Idempotency {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(_) => return Idempotency::default(), // absent or unreadable: first run
+    };
+    let parsed: Value = match serde_json::from_slice(&bytes) {
+        Ok(value) => value,
+        Err(error) => {
+            let _ = writeln!(
+                std::io::stderr(),
+                "bite-mcp: idempotency ledger is unreadable ({error}); starting unrecorded"
+            );
+            return Idempotency::default();
+        }
+    };
+    let mut rows: Vec<(u64, KeyHash, Entry)> = Vec::new();
+    let empty: Vec<Value> = Vec::new();
+    let entries = parsed
+        .get("entries")
+        .and_then(Value::as_array)
+        .unwrap_or(&empty);
+    for record in entries {
+        let (Some(key), Some(fingerprint), Some(settled_at)) = (
+            record.get("k").and_then(Value::as_str).and_then(unhex),
+            record.get("f").and_then(Value::as_str).and_then(unhex),
+            record.get("t").and_then(Value::as_u64),
+        ) else {
+            continue; // malformed row: drop it, keep the rest
+        };
+        if now_secs.saturating_sub(settled_at) > PERSIST_TTL_SECS {
+            continue; // expired
+        }
+        let state = match record.get("s").and_then(Value::as_str) {
+            Some("done") => match record.get("o").filter(|v| !v.is_null()) {
+                Some(value) => Recorded::Done(value.clone()),
+                None => continue, // a done row without its outcome is unusable
+            },
+            Some("unknown") => match record.get("c").and_then(Value::as_str) {
+                Some(code) => Recorded::Unknown(code.to_string()),
+                None => continue,
+            },
+            _ => continue, // unknown record kind (future version): drop
+        };
+        rows.push((
+            settled_at,
+            key,
+            Entry {
+                state,
+                fingerprint,
+                settled_at: Some(settled_at),
+            },
+        ));
+    }
+    rows.sort_by_key(|(settled_at, _, _)| *settled_at);
+    let skip = rows.len().saturating_sub(MAX_KEYS);
+    let mut idem = Idempotency::default();
+    for (_, key, entry) in rows.into_iter().skip(skip) {
+        idem.order.push_back(key);
+        idem.map.insert(key, entry);
+    }
+    idem
+}
+
+/// One ledger row as JSON: hashed key, argument fingerprint, state kind,
+/// outcome (done rows) or failure code (unknown rows), settle time (unix
+/// seconds).
+fn json_record(
+    key: &KeyHash,
+    entry: &Entry,
+    kind: &str,
+    outcome: Option<&Value>,
+    code: Option<&str>,
+    settled_at: u64,
+) -> Value {
+    serde_json::json!({
+        "k": hex(key),
+        "f": hex(&entry.fingerprint),
+        "s": kind,
+        "o": outcome,
+        "c": code,
+        "t": settled_at,
+    })
+}
+
+/// Lowercase hex — the ledger's on-disk form for the two 32-byte digests.
+fn hex(bytes: &[u8]) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for &byte in bytes {
+        out.push(DIGITS[(byte >> 4) as usize] as char);
+        out.push(DIGITS[(byte & 0x0f) as usize] as char);
+    }
+    out
+}
+
+/// Inverse of [`hex`] for a 32-byte digest; `None` on length or digit
+/// mismatch (malformed rows are dropped by the loader, not fatal).
+fn unhex(text: &str) -> Option<[u8; 32]> {
+    let bytes = text.as_bytes();
+    if bytes.len() != 64 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for (i, slot) in out.iter_mut().enumerate() {
+        let hi = (bytes[2 * i] as char).to_digit(16)?;
+        let lo = (bytes[2 * i + 1] as char).to_digit(16)?;
+        *slot = (hi * 16 + lo) as u8;
+    }
+    Some(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -329,6 +559,11 @@ mod tests {
     /// but any stable digest serves the state-machine tests below.
     fn fp(label: &str) -> Fingerprint {
         fingerprint(&json!(label))
+    }
+
+    /// Test key hashes: the real `key_hash()` of the label.
+    fn kh(label: &str) -> KeyHash {
+        key_hash(label)
     }
 
     #[test]
@@ -372,13 +607,19 @@ mod tests {
     #[test]
     fn reserve_claims_fresh_and_refuses_concurrent_same_key() {
         let mut idem = Idempotency::default();
-        assert!(matches!(idem.reserve("k", &fp("args")), Reserved::Fresh));
+        assert!(matches!(
+            idem.reserve(&kh("k"), &fp("args")),
+            Reserved::Fresh
+        ));
         // A second claim while the first is still in flight is refused —
         // this is the check-then-act race the single lock hold closes.
-        assert!(matches!(idem.reserve("k", &fp("args")), Reserved::InFlight));
-        idem.settle("k", Settled::Done(json!({ "sent": true })));
+        assert!(matches!(
+            idem.reserve(&kh("k"), &fp("args")),
+            Reserved::InFlight
+        ));
+        idem.settle(&kh("k"), Settled::Done(json!({ "sent": true })));
         // Once settled, repeats replay the recorded outcome instead.
-        match idem.reserve("k", &fp("args")) {
+        match idem.reserve(&kh("k"), &fp("args")) {
             Reserved::Done(v) => assert_eq!(v, json!({ "sent": true })),
             other => panic!("expected replay after settle, got {other:?}"),
         }
@@ -387,10 +628,13 @@ mod tests {
     #[test]
     fn release_frees_a_cleanly_failed_key_for_retry() {
         let mut idem = Idempotency::default();
-        assert!(matches!(idem.reserve("k", &fp("args")), Reserved::Fresh));
-        idem.release("k");
+        assert!(matches!(
+            idem.reserve(&kh("k"), &fp("args")),
+            Reserved::Fresh
+        ));
+        idem.release(&kh("k"));
         assert!(
-            matches!(idem.reserve("k", &fp("args")), Reserved::Fresh),
+            matches!(idem.reserve(&kh("k"), &fp("args")), Reserved::Fresh),
             "a clean failure must free the key for an immediate retry"
         );
     }
@@ -398,16 +642,19 @@ mod tests {
     #[test]
     fn settle_keeps_order_and_map_in_lockstep() {
         let mut idem = Idempotency::default();
-        assert!(matches!(idem.reserve("k", &fp("args")), Reserved::Fresh));
-        idem.settle("k", Settled::Unknown("timeout".into()));
+        assert!(matches!(
+            idem.reserve(&kh("k"), &fp("args")),
+            Reserved::Fresh
+        ));
+        idem.settle(&kh("k"), Settled::Unknown("timeout".into()));
         assert_eq!(idem.order.len(), 1);
         assert_eq!(idem.map.len(), 1);
         // A stray release after settling must NOT unpin the key: only an
         // in-flight claim is releasable (production releases exactly the
         // key it reserved, before any settle).
-        idem.release("k");
+        idem.release(&kh("k"));
         assert!(
-            matches!(idem.reserve("k", &fp("args")), Reserved::Unknown(_)),
+            matches!(idem.reserve(&kh("k"), &fp("args")), Reserved::Unknown(_)),
             "release on a settled key is a no-op"
         );
     }
@@ -415,22 +662,25 @@ mod tests {
     #[test]
     fn reused_key_with_different_arguments_is_refused() {
         let mut idem = Idempotency::default();
-        assert!(matches!(idem.reserve("k", &fp("args-a")), Reserved::Fresh));
-        idem.settle("k", Settled::Done(json!({ "sent": true })));
+        assert!(matches!(
+            idem.reserve(&kh("k"), &fp("args-a")),
+            Reserved::Fresh
+        ));
+        idem.settle(&kh("k"), Settled::Done(json!({ "sent": true })));
         // Identical arguments: the recorded outcome replays.
-        match idem.reserve("k", &fp("args-a")) {
+        match idem.reserve(&kh("k"), &fp("args-a")) {
             Reserved::Done(v) => assert_eq!(v, json!({ "sent": true })),
             other => panic!("an identical repeat must replay, got {other:?}"),
         }
         // Different arguments: refused — a replay would return the old
         // outcome while this call's mail is silently never sent.
         assert!(
-            matches!(idem.reserve("k", &fp("args-b")), Reserved::Reused),
+            matches!(idem.reserve(&kh("k"), &fp("args-b")), Reserved::Reused),
             "a key reused with different arguments must be refused, not replayed"
         );
         // The refusal leaves the recording untouched: an identical repeat
         // still replays afterwards.
-        match idem.reserve("k", &fp("args-a")) {
+        match idem.reserve(&kh("k"), &fp("args-a")) {
             Reserved::Done(v) => assert_eq!(v, json!({ "sent": true })),
             other => panic!("the recording must survive a refused reuse, got {other:?}"),
         }
@@ -442,28 +692,37 @@ mod tests {
         // Unknown pin claimed under args-a: different arguments are refused
         // as a reuse — WHICH arguments were pinned matters, not just that
         // the key is pinned.
-        idem.reserve("u", &fp("args-a"));
-        idem.settle("u", Settled::Unknown("timeout".into()));
-        assert!(matches!(idem.reserve("u", &fp("args-b")), Reserved::Reused));
+        idem.reserve(&kh("u"), &fp("args-a"));
+        idem.settle(&kh("u"), Settled::Unknown("timeout".into()));
+        assert!(matches!(
+            idem.reserve(&kh("u"), &fp("args-b")),
+            Reserved::Reused
+        ));
         // The pin survives the refused reuse for the original arguments.
-        match idem.reserve("u", &fp("args-a")) {
+        match idem.reserve(&kh("u"), &fp("args-a")) {
             Reserved::Unknown(code) => assert_eq!(code, "timeout"),
             other => panic!("expected the unknown pin to survive, got {other:?}"),
         }
         // In flight: a different-arguments repeat is a reuse refusal (the
         // argument mismatch is the stronger fact); identical repeats still
         // see InFlight.
-        idem.reserve("i", &fp("args-a"));
-        assert!(matches!(idem.reserve("i", &fp("args-b")), Reserved::Reused));
+        idem.reserve(&kh("i"), &fp("args-a"));
         assert!(matches!(
-            idem.reserve("i", &fp("args-a")),
+            idem.reserve(&kh("i"), &fp("args-b")),
+            Reserved::Reused
+        ));
+        assert!(matches!(
+            idem.reserve(&kh("i"), &fp("args-a")),
             Reserved::InFlight
         ));
         // A cleanly released key is free for ANY arguments — nothing was
         // recorded, so new arguments have nothing to desynchronize.
-        idem.reserve("r", &fp("args-a"));
-        idem.release("r");
-        assert!(matches!(idem.reserve("r", &fp("args-b")), Reserved::Fresh));
+        idem.reserve(&kh("r"), &fp("args-a"));
+        idem.release(&kh("r"));
+        assert!(matches!(
+            idem.reserve(&kh("r"), &fp("args-b")),
+            Reserved::Fresh
+        ));
     }
 
     #[test]
@@ -510,44 +769,44 @@ mod tests {
         let mut idem = Idempotency::default();
         // k0 pinned unknown (ambiguous), k1..=k{MAX_KEYS-1} done, plus one
         // key left in flight.
-        idem.reserve("k0", &fp("args"));
-        idem.settle("k0", Settled::Unknown("helper_exited".into()));
+        idem.reserve(&kh("k0"), &fp("args"));
+        idem.settle(&kh("k0"), Settled::Unknown("helper_exited".into()));
         for i in 1..MAX_KEYS {
-            let key = format!("k{i}");
+            let key = kh(&format!("k{i}"));
             idem.reserve(&key, &fp("args"));
             idem.settle(&key, Settled::Done(json!({ "i": i })));
         }
         assert!(matches!(
-            idem.reserve("k-live", &fp("args")),
+            idem.reserve(&kh("k-live"), &fp("args")),
             Reserved::Fresh
         ));
 
         // Cap reached: the next reserve evicts the OLDEST Done (k1) — not
         // the older unknown pin (k0), never the in-flight key.
         assert!(matches!(
-            idem.reserve("k-new", &fp("args")),
+            idem.reserve(&kh("k-new"), &fp("args")),
             Reserved::Fresh
         ));
-        match idem.reserve("k0", &fp("args")) {
+        match idem.reserve(&kh("k0"), &fp("args")) {
             Reserved::Unknown(code) => assert_eq!(code, "helper_exited"),
             other => panic!("unknown pin must outlive settled sends, got {other:?}"),
         }
         assert!(
-            matches!(idem.reserve("k1", &fp("args")), Reserved::Fresh),
+            matches!(idem.reserve(&kh("k1"), &fp("args")), Reserved::Fresh),
             "the oldest completed outcome is the eviction victim"
         );
         assert!(
-            matches!(idem.reserve("k-live", &fp("args")), Reserved::InFlight),
+            matches!(idem.reserve(&kh("k-live"), &fp("args")), Reserved::InFlight),
             "in-flight keys are never evicted"
         );
         // The reserved-not-yet-settled key is still in flight; once its
         // owner settles, repeats replay.
         assert!(matches!(
-            idem.reserve("k-new", &fp("args")),
+            idem.reserve(&kh("k-new"), &fp("args")),
             Reserved::InFlight
         ));
-        idem.settle("k-new", Settled::Done(json!({ "n": 1 })));
-        match idem.reserve("k-new", &fp("args")) {
+        idem.settle(&kh("k-new"), Settled::Done(json!({ "n": 1 })));
+        match idem.reserve(&kh("k-new"), &fp("args")) {
             Reserved::Done(v) => assert_eq!(v, json!({ "n": 1 })),
             other => panic!("expected replay after settle, got {other:?}"),
         }
@@ -560,5 +819,197 @@ mod tests {
         assert!(!ambiguous("helper_exited_unsent"));
         assert!(!ambiguous("invalid_params"));
         assert!(!ambiguous("permission_denied"));
+    }
+
+    // ---- durable ledger ----
+
+    #[test]
+    fn ledger_round_trip_replays_done_and_keeps_unknown_pins() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(LEDGER_FILE);
+        let now = unix_now();
+
+        let mut first = Idempotency::default();
+        first.reserve(&kh("done-key"), &fp("args-a"));
+        first.settle(&kh("done-key"), Settled::Done(json!({ "sent": true })));
+        first.reserve(&kh("pinned-key"), &fp("args-b"));
+        first.settle(&kh("pinned-key"), Settled::Unknown("timeout".into()));
+        first.persist_ledger(&path).unwrap();
+
+        // A fresh process reloads: the completed outcome replays verbatim,
+        // the unknown pin still refuses — the double-send guard survives
+        // the restart (the exact gap the ledger closes).
+        let mut reloaded = load_ledger(&path, now + 1);
+        match reloaded.reserve(&kh("done-key"), &fp("args-a")) {
+            Reserved::Done(v) => assert_eq!(v, json!({ "sent": true })),
+            other => panic!("a settled send must replay after reload, got {other:?}"),
+        }
+        match reloaded.reserve(&kh("pinned-key"), &fp("args-b")) {
+            Reserved::Unknown(code) => assert_eq!(code, "timeout"),
+            other => panic!("an unknown pin must survive reload, got {other:?}"),
+        }
+        // The fingerprint contract survives too: different arguments on a
+        // reloaded key are a reuse refusal, not a replay.
+        assert!(matches!(
+            reloaded.reserve(&kh("done-key"), &fp("args-z")),
+            Reserved::Reused
+        ));
+    }
+
+    #[test]
+    fn ledger_drops_entries_past_the_ttl_and_keeps_fresh_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(LEDGER_FILE);
+        let now = 1_000_000u64;
+        let stale = now - PERSIST_TTL_SECS - 1;
+        let fresh = now - PERSIST_TTL_SECS; // exactly at the boundary: kept
+        let doc = json!({
+            "v": 1,
+            "entries": [
+                { "k": hex(&kh("stale")), "f": hex(&fp("args")), "s": "unknown",
+                  "o": null, "c": "timeout", "t": stale },
+                { "k": hex(&kh("fresh")), "f": hex(&fp("args")), "s": "unknown",
+                  "o": null, "c": "helper_exited", "t": fresh },
+            ]
+        });
+        std::fs::write(&path, doc.to_string()).unwrap();
+
+        let mut reloaded = load_ledger(&path, now);
+        assert!(
+            matches!(reloaded.reserve(&kh("stale"), &fp("args")), Reserved::Fresh),
+            "an entry past the TTL is forgotten"
+        );
+        assert!(matches!(
+            reloaded.reserve(&kh("fresh"), &fp("args")),
+            Reserved::Unknown(_)
+        ));
+    }
+
+    #[test]
+    fn corrupt_or_absent_ledger_starts_unrecorded() {
+        let dir = tempfile::tempdir().unwrap();
+        // Absent: the first-run case.
+        let mut missing = load_ledger(&dir.path().join(LEDGER_FILE), unix_now());
+        assert!(matches!(
+            missing.reserve(&kh("k"), &fp("args")),
+            Reserved::Fresh
+        ));
+        // Corrupt: noted on stderr, never fatal — the server must serve.
+        let path = dir.path().join(LEDGER_FILE);
+        std::fs::write(&path, b"{not json").unwrap();
+        let mut corrupt = load_ledger(&path, unix_now());
+        assert!(matches!(
+            corrupt.reserve(&kh("k"), &fp("args")),
+            Reserved::Fresh
+        ));
+        // Malformed rows inside a valid document drop individually.
+        let doc = json!({
+            "v": 1,
+            "entries": [
+                { "k": "nothex", "f": "nothex", "s": "done", "o": {"sent": true}, "t": 1 },
+                { "k": hex(&kh("ok")), "f": "short", "s": "done", "o": {"sent": true}, "t": 1 },
+                { "k": hex(&kh("no-outcome")), "f": hex(&fp("args")), "s": "done", "o": null, "t": 1 },
+                { "k": hex(&kh("no-code")), "f": hex(&fp("args")), "s": "unknown", "c": null, "t": 1 },
+                { "k": hex(&kh("future-kind")), "f": hex(&fp("args")), "s": "queued", "o": {"x": 1}, "t": 1 },
+            ]
+        });
+        std::fs::write(&path, doc.to_string()).unwrap();
+        let mut partial = load_ledger(&path, unix_now());
+        for key in ["nothex", "ok", "no-outcome", "no-code", "future-kind"] {
+            assert!(
+                matches!(partial.reserve(&kh(key), &fp("args")), Reserved::Fresh),
+                "malformed row {key} must be dropped, not loaded"
+            );
+        }
+    }
+
+    #[test]
+    fn ledger_never_contains_raw_keys_or_in_flight_claims() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(LEDGER_FILE);
+
+        let mut idem = Idempotency::default();
+        idem.reserve(&kh("secret-client-key"), &fp("args"));
+        idem.settle(
+            &kh("secret-client-key"),
+            Settled::Done(json!({ "sent": true })),
+        );
+        // An in-flight claim must not reach the file: a restart kills the
+        // dispatching thread, and a stale in-flight row would refuse
+        // retries of a call that provably never landed.
+        idem.reserve(&kh("in-flight-only"), &fp("args"));
+        idem.persist_ledger(&path).unwrap();
+
+        let bytes = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            !bytes.contains("secret-client-key") && !bytes.contains("in-flight-only"),
+            "the ledger stores key hashes only — raw client keys must never hit disk"
+        );
+        assert!(
+            bytes.contains(&hex(&kh("secret-client-key"))),
+            "the settled key's hash is the stored form"
+        );
+        assert!(
+            !bytes.contains(&hex(&kh("in-flight-only"))),
+            "in-flight claims are never persisted"
+        );
+    }
+
+    #[test]
+    fn ledger_load_honors_the_key_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(LEDGER_FILE);
+        let now = 5_000_000u64;
+        let entries: Vec<Value> = (0..MAX_KEYS + 2)
+            .map(|i| {
+                json!({
+                    "k": hex(&kh(&format!("cap-{i}"))),
+                    "f": hex(&fp("args")),
+                    "s": "unknown",
+                    "o": null,
+                    "c": "timeout",
+                    "t": now - (MAX_KEYS as u64 + 2) + i as u64, // ascending: oldest first
+                })
+            })
+            .collect();
+        std::fs::write(&path, json!({ "v": 1, "entries": entries }).to_string()).unwrap();
+
+        let mut reloaded = load_ledger(&path, now);
+        // The OLDEST two are dropped; the newest MAX_KEYS survive — the
+        // same bound memory enforces, applied at load so a hand-grown file
+        // cannot enlarge the retained set. Survivors are probed FIRST: a
+        // reserve on an unknown pin never mutates the table, while a Fresh
+        // probe inserts an in-flight entry — at the cap that evicts the
+        // oldest survivor, so probing the dropped keys first would evict
+        // the very entries this test asserts survive.
+        for i in 2..MAX_KEYS + 2 {
+            assert!(
+                matches!(
+                    reloaded.reserve(&kh(&format!("cap-{i}")), &fp("args")),
+                    Reserved::Unknown(_)
+                ),
+                "newest entry cap-{i} must survive the load cap"
+            );
+        }
+        assert!(matches!(
+            reloaded.reserve(&kh("cap-0"), &fp("args")),
+            Reserved::Fresh
+        ));
+        assert!(matches!(
+            reloaded.reserve(&kh("cap-1"), &fp("args")),
+            Reserved::Fresh
+        ));
+    }
+
+    #[test]
+    fn key_hash_is_stable_and_discriminating() {
+        assert_eq!(key_hash("k"), key_hash("k"));
+        assert_ne!(key_hash("k"), key_hash("k "));
+        assert_eq!(key_hash("k").len(), 32);
+        // hex/unhex round-trip the stored form.
+        let digest = key_hash("round-trip");
+        assert_eq!(unhex(&hex(&digest)), Some(digest));
+        assert_eq!(unhex("zz"), None);
+        assert_eq!(unhex(&"0".repeat(63)), None);
     }
 }

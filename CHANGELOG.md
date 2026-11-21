@@ -13,6 +13,14 @@ it can ship.
 
 ### Added
 
+- Settled `idempotency_key` records (replayable outcomes and unknown pins)
+  are now durable: they persist to a 0600 `idempotency-ledger.json` in the
+  private data dir and reload on startup, so a server restart between a
+  client's ambiguous `mail_send` failure and its same-key retry no longer
+  drops the double-send guard. The ledger stores SHA-256 hashes of keys
+  (never key text), expires entries after 7 days, honors the same 128-key
+  cap as memory, and never persists in-flight claims; a missing or corrupt
+  ledger starts the server unrecorded with one stderr note.
 - Configuration reference: docs/configuration.md now documents every
   config.toml key (`default_calendar`, `default_mail_account`,
   `timeout_secs`, `release_repo`, `auto_refresh_hours`) with defaults, the

@@ -26,7 +26,12 @@ struct ServerState {
 pub fn serve() -> i32 {
     let state = std::sync::Arc::new(ServerState {
         handle: BridgeHandle::new(),
-        idempotency: std::sync::Mutex::new(idempotency::Idempotency::default()),
+        // Durable ledger: settled idempotency records survive restarts, so
+        // the double-send guard outlives the server process.
+        idempotency: std::sync::Mutex::new(idempotency::load_ledger(
+            &idempotency::ledger_path(),
+            idempotency::unix_now(),
+        )),
     });
     let stdout = std::sync::Arc::new(std::io::stdout());
     let stdin = std::io::stdin();
@@ -430,6 +435,8 @@ fn run_tool_idempotent(
     let Some(key) = key else {
         return run_tool_retrying(state, name, args).outcome;
     };
+    // The ledger stores SHA-256 of the key, never the client's text.
+    let key = idempotency::key_hash(&key);
     // Fingerprint the stripped arguments this call would dispatch with: a
     // replay must return the recorded outcome for the SAME call, so a key
     // reused with different arguments is refused outright instead of
@@ -498,22 +505,28 @@ fn run_tool_idempotent(
         idempotency::Reserved::Fresh => {}
     }
     let run = run_tool_retrying(state, name, args);
+    // Settled records persist best-effort under the same lock hold: a
+    // failed ledger write must never turn a completed send into a
+    // client-visible failure (the client's retry would double-send).
+    let ledger = idempotency::ledger_path();
     match &run.outcome {
-        Ok(value) => state
-            .idempotency
-            .lock()
-            .unwrap()
-            .settle(&key, idempotency::Settled::Done(value.clone())),
+        Ok(value) => state.idempotency.lock().unwrap().settle_and_persist(
+            &key,
+            idempotency::Settled::Done(value.clone()),
+            &ledger,
+        ),
         // Pin only when a request write actually landed: the ambiguous
         // codes are also produced by a failed spawn/handshake (and by a
         // failed respawn after an unsent attempt), where provably nothing
         // was written — those release below so an immediate retry with
         // the same key stays possible.
-        Err(e) if run.request_written && idempotency::ambiguous(e.code()) => state
-            .idempotency
-            .lock()
-            .unwrap()
-            .settle(&key, idempotency::Settled::Unknown(e.code().to_string())),
+        Err(e) if run.request_written && idempotency::ambiguous(e.code()) => {
+            state.idempotency.lock().unwrap().settle_and_persist(
+                &key,
+                idempotency::Settled::Unknown(e.code().to_string()),
+                &ledger,
+            )
+        }
         // Clean failures provably did not send — release the claim so the
         // key stays free for an immediate retry.
         _ => state.idempotency.lock().unwrap().release(&key),
