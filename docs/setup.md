@@ -108,10 +108,10 @@ answers with a `-32600` invalid-request JSON-RPC error carrying a null
 id (the id sits inside the rejected bytes, so it cannot be echoed) and
 keeps serving; the next well-formed line on the same stream parses
 normally. The cap is orders of magnitude above any legitimate bite
-request (the largest arguments are mail search queries); it exists so a
-runaway client cannot buffer unbounded memory into the long-lived
-server. Two older loop behaviors also apply: blank lines are skipped,
-and a line that is not valid UTF-8 ends the session.
+request (the largest arguments are mail and note bodies); it exists
+so a runaway client cannot buffer unbounded memory into the
+long-lived server. Two older loop behaviors also apply: blank lines
+are skipped, and a line that is not valid UTF-8 ends the session.
 
 The writing itself is defensive by design:
 
