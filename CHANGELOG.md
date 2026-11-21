@@ -75,6 +75,16 @@ it can ship.
   previously undocumented `helper_spawn_failed`, `protocol_error`,
   `helper_exited` and `helper_exited_unsent` rows.
 
+- The stdio transport's request-line bound is now documented where MCP
+  clients are configured: the client-registration section of
+  docs/setup.md states the 16 MiB maximum request line (newline
+  included) the server enforces, the null-id `-32600` invalid-request
+  error an oversized line receives (the id is inside the rejected
+  bytes, so it cannot be echoed), and that the server keeps serving —
+  the next well-formed line on the same stream parses normally. The
+  bound itself shipped with #82 but was described only here in the
+  CHANGELOG; no client-facing doc mentioned it.
+
 ### Fixed
 
 - The `msrv` CI lane never tested the declared floor: the rust-toolchain
