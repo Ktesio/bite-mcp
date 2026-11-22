@@ -18,9 +18,19 @@ it can ship.
   private data dir and reload on startup, so a server restart between a
   client's ambiguous `mail_send` failure and its same-key retry no longer
   drops the double-send guard. The ledger stores SHA-256 hashes of keys
-  (never key text), expires entries after 7 days, honors the same 128-key
-  cap as memory, and never persists in-flight claims; a missing or corrupt
-  ledger starts the server unrecorded with one stderr note.
+  (never key text), expires entries after 7 days (at load, at reserve, and
+  on every write), honors the same 128-key cap as memory, and merges
+  across servers sharing a data dir — a memory-fresh key is checked
+  against the disk before it is claimed, and a write never drops rows the
+  writing process does not own. In-flight claims are durable too: the
+  claim is pinned to disk before dispatch, so a server that dies mid-send
+  leaves a row the next start loads as an unknown pin (`interrupted`) and
+  the same-key retry is refused instead of re-dispatched. A missing,
+  corrupt, or unreadable ledger starts the server unrecorded (one stderr
+  note for the latter two). The stored outcome of a completed send carries
+  its subject and recipients: documented in PRIVACY.md and removed by
+  `bite index wipe`. The smoke harness now runs every server process in an
+  isolated data dir, so keyed tests never touch a developer's real ledger.
 - The 16 MiB stdio request-line rejection is now logged server-side:
   `serve()` writes one stderr line per rejected oversized request (naming
   the cap value only — client bytes never enter the log) alongside the

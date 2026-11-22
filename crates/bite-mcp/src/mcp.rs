@@ -460,12 +460,17 @@ fn run_tool_idempotent(
     let fingerprint = idempotency::fingerprint(&args);
     // Claim the key and read any prior state in ONE lock hold: requests are
     // served one thread per call, so a separate lookup and dispatch would
-    // let two concurrent same-key calls both reach the helper.
+    // let two concurrent same-key calls both reach the helper. The durable
+    // form also consults the on-disk ledger on a memory-fresh key (another
+    // server sharing the data dir may have recorded it) and persists the
+    // fresh claim's in-flight pin BEFORE dispatch — a crash mid-send then
+    // leaves a row the next start refuses the retry from.
+    let ledger = idempotency::ledger_path();
     match state
         .idempotency
         .lock()
         .unwrap()
-        .reserve(&key, &fingerprint)
+        .reserve_durable(&key, &fingerprint, &ledger)
     {
         idempotency::Reserved::Done(value) => return Ok(value),
         idempotency::Reserved::Reused => {
@@ -524,7 +529,6 @@ fn run_tool_idempotent(
     // Settled records persist best-effort under the same lock hold: a
     // failed ledger write must never turn a completed send into a
     // client-visible failure (the client's retry would double-send).
-    let ledger = idempotency::ledger_path();
     match &run.outcome {
         Ok(value) => state.idempotency.lock().unwrap().settle_and_persist(
             &key,
@@ -544,8 +548,13 @@ fn run_tool_idempotent(
             )
         }
         // Clean failures provably did not send — release the claim so the
-        // key stays free for an immediate retry.
-        _ => state.idempotency.lock().unwrap().release(&key),
+        // key stays free for an immediate retry, and persist so the
+        // durable in-flight row written at claim time leaves the ledger.
+        _ => state
+            .idempotency
+            .lock()
+            .unwrap()
+            .release_and_persist(&key, &ledger),
     }
     run.outcome
 }
