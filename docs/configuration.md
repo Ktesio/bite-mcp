@@ -23,7 +23,7 @@ precedence are all defined by code — this page mirrors `crates/bite-core/src/c
 |---|---|---|---|
 | `default_calendar` | string | none | Used as the `calendar` argument for calendar event creation and event searches when the request itself doesn't specify a calendar. When unset, no default is injected — the request goes through as-is. |
 | `default_mail_account` | string | none | Used as the `account` argument for **every** `mail.*` call (send, reply, search, …) when the request doesn't name an account. |
-| `timeout_secs` | number | `300` | Per-request bridge timeout: how long the Rust side waits for the Swift helper to answer one call. Slow Apple Event queries on large mailboxes can legitimately take a while. |
+| `timeout_secs` | number | `300` | Per-request bridge timeout: how long the Rust side waits for the Swift helper to answer one call. Slow Apple Event queries on large mailboxes can legitimately take a while. Also caps the short live attempt used when the mail index is still empty (`min(timeout_secs, 45 s)`) — a ceiling below 45 s shortens that degrade window too. |
 | `release_repo` | string | none | `owner/repo` reserved for prebuilt-helper downloads. Accepted and persisted, but currently **no code consumes it** — helper installation resolves locally (see below). Kept for the download path. |
 | `auto_refresh_hours` | number | `24` | How old the entity index may get before a background refresh crawl is spawned when you read mail through bite. File-only: `bite config set` does not accept this key. |
 
