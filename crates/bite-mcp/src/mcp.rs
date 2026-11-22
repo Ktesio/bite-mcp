@@ -359,6 +359,18 @@ fn handle_request(state: &ServerState, method: &str, params: &Value) -> Result<V
             if crate::index::is_local_tool(name) {
                 let value = crate::index::run_local_unwrapped(name, &args, Some(&state.handle))
                     .map_err(|e| err(-32000, e.render()))?;
+                if name == "index_wipe" {
+                    // The wipe deleted the ledger file, but THIS server's
+                    // in-memory table still holds every prior record —
+                    // the next keyed send would write them straight back,
+                    // un-purging the wipe. Reset the table so the wipe is
+                    // complete for this server too. (A CLI wipe from
+                    // another process cannot reach this table: PRIVACY.md
+                    // tells those users to restart running servers.)
+                    if let Ok(mut idem) = state.idempotency.lock() {
+                        *idem = idempotency::Idempotency::default();
+                    }
+                }
                 return Ok(json!({
                     "content": [ { "type": "text", "text": serde_json::to_string_pretty(&value).unwrap_or_default() } ],
                     "structuredContent": value,

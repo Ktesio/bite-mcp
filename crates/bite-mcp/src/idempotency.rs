@@ -53,11 +53,13 @@
 //! server exit mid-send leaves a row the next start loads as an unknown
 //! pin (code [`INTERRUPTED`]) — the retry is refused instead of
 //! re-dispatched. Because several server processes may share one data
-//! dir, every persist MERGES the on-disk ledger (rows this process does
-//! not hold are re-written, not dropped) and a memory-fresh reserve
-//! consults the disk first ([`Idempotency::reserve_durable`]) — the
-//! residual race (two processes claiming the same free key in the same
-//! instant) is inherent without an OS-level lock and documented in
+//! dir, every persist MERGES the on-disk ledger: rows this process does
+//! not OWN follow the disk copy (which may be newer than the snapshot
+//! folded into memory, or gone because its writer released the key),
+//! and a memory-fresh reserve consults the disk first
+//! ([`Idempotency::reserve_durable`]) — the residual race (two
+//! processes claiming the same free key in the same instant) is
+//! inherent without an OS-level lock and documented in
 //! docs/protocol.md. A missing, corrupt, or unreadable ledger starts the
 //! server unrecorded, with one stderr note for the latter two.
 
@@ -77,8 +79,10 @@ pub(crate) type Fingerprint = [u8; 32];
 
 /// Fixed-size digest of the KEY ITSELF — the ledger's stored form of a
 /// key. Client key text is user-controlled data; the file gets the same
-/// SHA-256 treatment the fingerprints already use, so nothing the client
-/// chose verbatim is written to disk.
+/// SHA-256 treatment the fingerprints already use, so the key TEXT never
+/// reaches the disk. (A completed send's stored outcome is replayed
+/// verbatim, so its row carries what that send returned — subject and
+/// recipients — as PRIVACY.md documents; only the key is hashed away.)
 pub(crate) type KeyHash = [u8; 32];
 
 /// How long a settled ledger entry survives from its settle time — on disk
@@ -191,6 +195,14 @@ pub(crate) struct Idempotency {
     /// Cleared after every successful persist — membership only matters
     /// between the release and the write that removes the row.
     dropped: HashSet<KeyHash>,
+    /// Keys whose current row THIS process produced (a fresh claim, or the
+    /// settle that followed it): for these the in-memory row is
+    /// authoritative and beats the disk on every write. Every other row in
+    /// `map` was folded in from the ledger — loaded at startup or merged
+    /// from a disk read — and stays UN-owned: the writing process remains
+    /// its authority, so a persist follows the DISK row for it (which may
+    /// be newer, or gone because that process released the key).
+    owned: HashSet<KeyHash>,
 }
 
 impl Idempotency {
@@ -238,6 +250,7 @@ impl Idempotency {
                 settled_at: None,
             },
         );
+        self.owned.insert(*key);
         Reserved::Fresh
     }
 
@@ -258,6 +271,16 @@ impl Idempotency {
         fingerprint: &Fingerprint,
         path: &std::path::Path,
     ) -> Reserved {
+        // A memory row this process does NOT own was folded in from the
+        // disk (startup load or an earlier merge) and may be stale: the
+        // writing server may have settled it since, or released it (row
+        // gone). Refresh from the durable row first so the verdict below
+        // reflects the NEWEST durable state, not the first snapshot this
+        // process ever took of it — otherwise a key another server
+        // completed stays refused as `interrupted` here for the whole TTL.
+        if self.map.contains_key(key) && !self.owned.contains(key) {
+            self.merge_disk_row(key, fingerprint, path);
+        }
         match self.reserve(key, fingerprint) {
             Reserved::Fresh => {}
             other => return other,
@@ -277,11 +300,12 @@ impl Idempotency {
 
     /// Fold the durable row for `key`, if any, into memory and return the
     /// verdict it implies. `None`: no durable row — the key is genuinely
-    /// free. The loader maps on-disk in-flight rows to unknown pins, so a
-    /// LIVE other-process claim reads as an ambiguous refusal here: this
+    /// free (a stale un-owned memory row it replaces is forgotten). The
+    /// loader maps on-disk in-flight rows to unknown pins, so a LIVE
+    /// other-process claim reads as an ambiguous refusal here: this
     /// process cannot tell live from dead, and refusing is the safe side.
-    /// (Row freshness rides the merge in [`persist_ledger`], which never
-    /// drops rows it does not hold.)
+    /// (Row freshness rides the merge in [`persist_ledger`], which follows
+    /// the disk row for every key this process does not own.)
     fn merge_disk_row(
         &mut self,
         key: &KeyHash,
@@ -289,13 +313,22 @@ impl Idempotency {
         path: &std::path::Path,
     ) -> Option<Reserved> {
         let disk = load_ledger(path, unix_now());
-        let entry = disk.map.get(key)?.clone();
-        self.evict_if_full();
+        let Some(entry) = disk.map.get(key).cloned() else {
+            // No durable row. If memory still holds a row for this key
+            // that this process does not own, the server that wrote it
+            // has since released it (or the ledger was wiped): forget
+            // the stale snapshot — the key is genuinely free. An OWNED
+            // row here is a fresh claim whose pin has not been persisted
+            // yet; it stays.
+            if !self.owned.contains(key) {
+                self.forget(key);
+            }
+            return None;
+        };
         if entry.fingerprint != *fingerprint {
             // Another process recorded this key under different
             // arguments: keep the durable pin, refuse the reuse.
-            self.order.push_back(*key);
-            self.map.insert(*key, entry);
+            self.adopt(key, entry);
             return Some(Reserved::Reused);
         }
         let verdict = match &entry.state {
@@ -303,9 +336,34 @@ impl Idempotency {
             Recorded::Unknown(code) => Reserved::Unknown(code.clone()),
             Recorded::InFlight => Reserved::InFlight,
         };
-        self.order.push_back(*key);
-        self.map.insert(*key, entry);
+        self.adopt(key, entry);
         Some(verdict)
+    }
+
+    /// Install a durable row folded in from the disk. A row this process
+    /// already holds (its own fresh `reserve` claim on the
+    /// `reserve_durable` path, or the un-owned snapshot being refreshed)
+    /// is REPLACED in place — the key enters `order` exactly once, keeping
+    /// order/map in lockstep. Adopted rows are never `owned`: the writing
+    /// process remains their authority.
+    fn adopt(&mut self, key: &KeyHash, entry: Entry) {
+        if !self.map.contains_key(key) {
+            self.evict_if_full();
+            self.order.push_back(*key);
+        }
+        self.owned.remove(key);
+        self.map.insert(*key, entry);
+    }
+
+    /// Remove a key's row together with its `order` slot and ownership —
+    /// used when a durable row this process folded in has vanished from
+    /// the ledger (its writer released the key, or the ledger was wiped).
+    fn forget(&mut self, key: &KeyHash) {
+        self.map.remove(key);
+        self.owned.remove(key);
+        if let Some(pos) = self.order.iter().position(|k| k == key) {
+            self.order.remove(pos);
+        }
     }
 
     /// Settle an in-flight reservation with a final outcome. The order
@@ -369,6 +427,7 @@ impl Idempotency {
             if let Some(pos) = self.order.iter().position(|k| k == key) {
                 self.order.remove(pos);
             }
+            self.owned.remove(key);
             self.dropped.insert(*key);
         }
     }
@@ -429,7 +488,7 @@ impl Idempotency {
 
     /// Serialize the table into the durable ledger JSON and write it 0600
     /// via the shared private-write helper (temp file + rename, so a crash
-    /// never leaves a half-written table). Three behaviors keep the file
+    /// never leaves a half-written table). Four behaviors keep the file
     /// honest across processes and time:
     ///
     /// * settled entries past [`PERSIST_TTL_SECS`] are not written — the
@@ -439,9 +498,17 @@ impl Idempotency {
     ///   next start loads it as an unknown pin (`interrupted`) instead of
     ///   reopening the double-send window — a cleanly released claim's
     ///   row is dropped here via the `dropped` set;
-    /// * rows in the ON-DISK ledger for keys this process does not hold
+    /// * rows in the ON-DISK ledger for keys this process does not OWN
     ///   are re-written verbatim — several servers may share one data
     ///   dir, and a persist must never erase another process's records.
+    ///   Ownership matters: a row this process loaded or merged but never
+    ///   claimed itself is the OTHER server's record, so the disk copy
+    ///   (which may have settled since) wins — and when such a row has
+    ///   VANISHED from disk its writer released the key, so the stale
+    ///   memory snapshot is dropped instead of being written back;
+    /// * the merged set is cut to [`MAX_KEYS`] before writing, with the
+    ///   same victim rule as memory (oldest `done` first, then oldest
+    ///   `unknown`; an in-flight pin is never a victim).
     ///
     /// The residual race (two processes writing in the same instant, or
     /// claiming the same free key concurrently) is inherent without an
@@ -449,9 +516,15 @@ impl Idempotency {
     pub(crate) fn persist_ledger(&mut self, path: &std::path::Path) -> std::io::Result<()> {
         let now = unix_now();
         let expired = |settled_at: u64| now.saturating_sub(settled_at) > PERSIST_TTL_SECS;
-        let mut entries: Vec<Value> = self
+        // (settle time, victim rank, record). Rank drives the on-disk cap:
+        // 0 = done (first victim), 1 = unknown, 2 = in-flight (protected,
+        // mirroring `evict_if_full`).
+        let mut rows: Vec<(u64, u8, Value)> = self
             .order
             .iter()
+            // Un-owned rows are re-derived from the disk below: this
+            // process's snapshot of them may be older than the writer's.
+            .filter(|key| self.owned.contains(*key))
             .filter_map(|key| self.map.get(key).map(|entry| (*key, entry)))
             .filter_map(|(key, entry)| {
                 let record = match &entry.state {
@@ -460,35 +533,47 @@ impl Idempotency {
                         if expired(settled_at) {
                             return None;
                         }
-                        json_record(&key, entry, "done", Some(value), None, settled_at)
+                        (
+                            settled_at,
+                            0,
+                            json_record(&key, entry, "done", Some(value), None, settled_at),
+                        )
                     }
                     Recorded::Unknown(code) => {
                         let settled_at = entry.settled_at?;
                         if expired(settled_at) {
                             return None;
                         }
-                        json_record(&key, entry, "unknown", None, Some(code), settled_at)
+                        (
+                            settled_at,
+                            1,
+                            json_record(&key, entry, "unknown", None, Some(code), settled_at),
+                        )
                     }
                     // The claim time is the write time: the row expires
                     // from its last refresh, so a live process's pins stay
                     // current while an abandoned one ages out within the
                     // TTL.
-                    Recorded::InFlight => serde_json::json!({
-                        "k": hex(&key),
-                        "f": hex(&entry.fingerprint),
-                        "s": "inflight",
-                        "t": now,
-                    }),
+                    Recorded::InFlight => (
+                        now,
+                        2,
+                        serde_json::json!({
+                            "k": hex(&key),
+                            "f": hex(&entry.fingerprint),
+                            "s": "inflight",
+                            "t": now,
+                        }),
+                    ),
                 };
                 Some(record)
             })
             .collect();
-        // Merge rows this process does not hold (written by a server that
-        // shares the data dir), except the ones it deliberately released.
+        // Merge the on-disk ledger: rows this process does not own (and
+        // has not deliberately released) are re-written verbatim.
         // `load_ledger` already dropped expired and malformed rows.
         let disk = load_ledger(path, now);
         for key in &disk.order {
-            if self.map.contains_key(key) || self.dropped.contains(key) {
+            if self.owned.contains(key) || self.dropped.contains(key) {
                 continue;
             }
             let Some(entry) = disk.map.get(key) else {
@@ -498,16 +583,48 @@ impl Idempotency {
                 continue; // the loader never yields in-flight rows
             };
             let record = match &entry.state {
-                Recorded::Done(value) => {
-                    json_record(key, entry, "done", Some(value), None, settled_at)
-                }
-                Recorded::Unknown(code) => {
-                    json_record(key, entry, "unknown", None, Some(code), settled_at)
-                }
+                Recorded::Done(value) => (
+                    settled_at,
+                    0,
+                    json_record(key, entry, "done", Some(value), None, settled_at),
+                ),
+                Recorded::Unknown(code) => (
+                    settled_at,
+                    1,
+                    json_record(key, entry, "unknown", None, Some(code), settled_at),
+                ),
                 Recorded::InFlight => continue,
             };
-            entries.push(record);
+            rows.push(record);
         }
+        // Un-owned memory rows whose durable row has vanished: the writer
+        // released the key (or the ledger was wiped) — forget the stale
+        // snapshot so it neither answers a later reserve nor rides back
+        // to disk on a later write.
+        let snapshot: Vec<KeyHash> = self.order.iter().copied().collect();
+        for key in snapshot {
+            if !self.owned.contains(&key)
+                && !disk.map.contains_key(&key)
+                && !self.dropped.contains(&key)
+            {
+                self.forget(&key);
+            }
+        }
+        // The on-disk set honors the same cap as memory. Oldest first
+        // (settle time; stable sort keeps insertion order on ties), a
+        // done row evicted before an unknown pin, an in-flight pin never.
+        rows.sort_by_key(|(settled_at, _, _)| *settled_at);
+        while rows.len() > MAX_KEYS {
+            let victim = rows
+                .iter()
+                .position(|(_, rank, _)| *rank == 0)
+                .or_else(|| rows.iter().position(|(_, rank, _)| *rank == 1));
+            let Some(pos) = victim else {
+                break; // only protected in-flight rows remain
+            };
+            rows.remove(pos);
+        }
+        let entries: Vec<Value> = rows.into_iter().map(|(_, _, record)| record).collect();
         let doc = serde_json::json!({ "v": 1, "entries": entries });
         bite_core::fsops::write_private(path, doc.to_string().as_bytes())?;
         self.dropped.clear();
@@ -1218,6 +1335,200 @@ mod tests {
             reloaded.reserve(&kh("b-key"), &fp("args-b")),
             Reserved::Done(_)
         ));
+    }
+
+    #[test]
+    fn reserve_durable_keeps_order_and_map_in_lockstep_for_disk_backed_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(LEDGER_FILE);
+
+        // Server A settles a key and writes the shared ledger.
+        let mut a = Idempotency::default();
+        a.reserve(&kh("disk-key"), &fp("args"));
+        a.settle(&kh("disk-key"), Settled::Done(json!({ "sent": true })));
+        a.persist_ledger(&path).unwrap();
+
+        // Server B folds the row in via reserve_durable: a key that is
+        // already in memory (the fresh claim `reserve` just made) must be
+        // REPLACED, never given a second `order` slot.
+        let mut b = load_ledger(&path, unix_now());
+        assert!(matches!(
+            b.reserve_durable(&kh("disk-key"), &fp("args"), &path),
+            Reserved::Done(_)
+        ));
+        assert_eq!(
+            b.order.len(),
+            b.map.len(),
+            "a disk-backed key must enter order exactly once"
+        );
+        assert_eq!(b.order.iter().filter(|k| **k == kh("disk-key")).count(), 1);
+
+        // And after memory evicts the key (table fills past the cap) it
+        // lives on disk only; reserving it again must still not duplicate
+        // the slot — dead slots would eat the cap.
+        for i in 0..MAX_KEYS {
+            let key = kh(&format!("fill-{i}"));
+            b.reserve(&key, &fp("args"));
+            b.settle(&key, Settled::Done(json!({ "sent": true })));
+        }
+        b.reserve_durable(&kh("disk-key"), &fp("args"), &path);
+        assert_eq!(
+            b.order.iter().filter(|k| **k == kh("disk-key")).count(),
+            1,
+            "no duplicate order slots for a disk-only key"
+        );
+        assert_eq!(b.order.len(), b.map.len());
+    }
+
+    #[test]
+    fn persist_follows_newer_disk_rows_for_unowned_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(LEDGER_FILE);
+
+        // B claims the shared key; its in-flight pin hits the disk.
+        let mut b = Idempotency::default();
+        assert!(matches!(
+            b.reserve(&kh("shared"), &fp("args")),
+            Reserved::Fresh
+        ));
+        b.persist_ledger(&path).unwrap();
+
+        // A starts on the same data dir: the row loads as an unknown pin
+        // (interrupted) — a snapshot A does not own.
+        let mut a = load_ledger(&path, unix_now());
+        assert!(matches!(
+            a.reserve(&kh("shared"), &fp("args")),
+            Reserved::Unknown(_)
+        ));
+
+        // B finishes: the disk now says done.
+        b.settle(&kh("shared"), Settled::Done(json!({ "sent": true })));
+        b.persist_ledger(&path).unwrap();
+
+        // A settles its OWN key and persists: the shared key is not A's
+        // to answer — B's completed row must survive, and A's stale
+        // interrupted snapshot must not be written over it.
+        assert!(matches!(
+            a.reserve(&kh("own"), &fp("args")),
+            Reserved::Fresh
+        ));
+        a.settle(&kh("own"), Settled::Done(json!({ "sent": true })));
+        a.persist_ledger(&path).unwrap();
+
+        let mut reloaded = load_ledger(&path, unix_now());
+        match reloaded.reserve(&kh("shared"), &fp("args")) {
+            Reserved::Done(v) => assert_eq!(v, json!({ "sent": true })),
+            other => panic!("the other server's completed send must survive, got {other:?}"),
+        }
+
+        // The reserve path refreshes too: even A's stale in-memory
+        // snapshot gives way to the durable done row on the next ask.
+        match a.reserve_durable(&kh("shared"), &fp("args"), &path) {
+            Reserved::Done(v) => assert_eq!(v, json!({ "sent": true })),
+            other => {
+                panic!("a stale un-owned snapshot must not outlive the disk row, got {other:?}")
+            }
+        }
+    }
+
+    #[test]
+    fn vanished_unowned_rows_release_the_key_for_this_server() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(LEDGER_FILE);
+
+        // B claims and persists the in-flight pin; A loads it as an
+        // interrupted pin.
+        let mut b = Idempotency::default();
+        assert!(matches!(
+            b.reserve(&kh("shared"), &fp("args")),
+            Reserved::Fresh
+        ));
+        b.persist_ledger(&path).unwrap();
+        let mut a = load_ledger(&path, unix_now());
+        assert!(matches!(
+            a.reserve(&kh("shared"), &fp("args")),
+            Reserved::Unknown(_)
+        ));
+
+        // B's attempt fails cleanly: released, row gone from the ledger.
+        b.release_and_persist(&kh("shared"), &path);
+
+        // A persists for its own key: the vanished row must leave A's
+        // memory instead of riding back to disk.
+        assert!(matches!(
+            a.reserve(&kh("own"), &fp("args")),
+            Reserved::Fresh
+        ));
+        a.settle(&kh("own"), Settled::Done(json!({ "sent": true })));
+        a.persist_ledger(&path).unwrap();
+        assert!(
+            !a.order.contains(&kh("shared")),
+            "a key its writer released must not ride back to disk"
+        );
+        assert_eq!(a.order.len(), a.map.len());
+
+        // And A's next reserve of that key claims it fresh — the writer
+        // provably never sent under it.
+        assert!(
+            matches!(
+                a.reserve_durable(&kh("shared"), &fp("args"), &path),
+                Reserved::Fresh
+            ),
+            "a released-by-writer key must free up for this server"
+        );
+    }
+
+    #[test]
+    fn persist_caps_the_merged_disk_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(LEDGER_FILE);
+
+        // A foreign ledger already at the cap, written with older settle
+        // times so the victim choice below is deterministic.
+        let now = unix_now();
+        let old: Vec<Value> = (0..MAX_KEYS)
+            .map(|i| {
+                serde_json::json!({
+                    "k": hex(&kh(&format!("old-{i}"))),
+                    "f": hex(&fp("args")),
+                    "s": "done",
+                    "o": { "sent": true },
+                    "t": now - 100,
+                })
+            })
+            .collect();
+        std::fs::write(
+            &path,
+            serde_json::json!({ "v": 1, "entries": old }).to_string(),
+        )
+        .unwrap();
+
+        // This server adds five OWN keys (settled now — strictly newer)
+        // and persists: the merged set must still cap at MAX_KEYS, with
+        // the OLDEST foreign rows as the victims.
+        let mut a = load_ledger(&path, unix_now());
+        for i in 0..5 {
+            let key = kh(&format!("new-{i}"));
+            assert!(matches!(a.reserve(&key, &fp("args")), Reserved::Fresh));
+            a.settle(&key, Settled::Done(json!({ "sent": true })));
+        }
+        a.persist_ledger(&path).unwrap();
+
+        let mut reloaded = load_ledger(&path, unix_now());
+        assert_eq!(
+            reloaded.map.len(),
+            MAX_KEYS,
+            "the on-disk cap must hold after a merge"
+        );
+        for i in 0..5 {
+            assert!(
+                matches!(
+                    reloaded.reserve(&kh(&format!("new-{i}")), &fp("args")),
+                    Reserved::Done(_)
+                ),
+                "the newest rows must never be the victims"
+            );
+        }
     }
 
     #[test]

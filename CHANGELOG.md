@@ -31,6 +31,13 @@ it can ship.
   its subject and recipients: documented in PRIVACY.md and removed by
   `bite index wipe`. The smoke harness now runs every server process in an
   isolated data dir, so keyed tests never touch a developer's real ledger.
+  Cross-process merges follow the DISK row for keys a process loaded but
+  never claimed itself (a newer row written by the claiming server wins;
+  a row that vanished because its writer released the key frees it here
+  too), the on-disk 128-key cap is enforced on every write with the same
+  done-before-unknown victim rule as memory, an in-server `index_wipe`
+  clears that server's in-memory records along with the file, and
+  reserving a disk-backed key no longer duplicates its retention slot.
 - The 16 MiB stdio request-line rejection is now logged server-side:
   `serve()` writes one stderr line per rejected oversized request (naming
   the cap value only — client bytes never enter the log) alongside the

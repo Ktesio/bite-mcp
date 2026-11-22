@@ -96,8 +96,12 @@ with your data. bite itself adds no network hop; choose agents you trust.
   carries its subject line and recipient addresses — up to 128 recent
   keyed sends, expiring 7 days after they settle. `bite index wipe`
   removes this file along with the index; deleting the file while the
-  server is stopped has the same effect (a running server re-creates it
-  from memory on its next keyed send).
+  server is stopped has the same effect. A wipe issued through the
+  server itself (`index_wipe`) also clears that server's in-memory
+  records, but a wipe from the CLI (or the file deleted by hand) does
+  not reach a RUNNING server's memory: any other bite-mcp server still
+  alive re-creates the file from memory on its next keyed send, so stop
+  or restart running servers for the purge to be complete.
 
 ## Intended use
 
