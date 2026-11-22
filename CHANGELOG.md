@@ -21,6 +21,11 @@ it can ship.
   (never key text), expires entries after 7 days, honors the same 128-key
   cap as memory, and never persists in-flight claims; a missing or corrupt
   ledger starts the server unrecorded with one stderr note.
+- The 16 MiB stdio request-line rejection is now logged server-side:
+  `serve()` writes one stderr line per rejected oversized request (naming
+  the cap value only — client bytes never enter the log) alongside the
+  `-32600` reply it already sent. Until now the rejection was visible to
+  the client but silent for the operator.
 - Configuration reference: docs/configuration.md now documents every
   config.toml key (`default_calendar`, `default_mail_account`,
   `timeout_secs`, `release_repo`, `auto_refresh_hours`) with defaults, the
