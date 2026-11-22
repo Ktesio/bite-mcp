@@ -40,6 +40,28 @@ struct LivenessHit {
 
 static LIVENESS_CACHE: Mutex<Option<LivenessHit>> = Mutex::new(None);
 
+/// TTL for the cached `crawl-state.json` read on the READ-ONLY FTS gate.
+/// `with_index` runs `refresh_fts_after_settled_crawl` on every index tool
+/// call, so the hot path re-reads (and, while a crawl is mid-flight and the
+/// text differs from the fold marker, re-parses) the crawl state once per
+/// call; the gate needs only second-level freshness — a stale verdict
+/// delays the post-settle FTS fold by one TTL at most, and unindexed rows
+/// stay searchable meanwhile.
+const CRAWL_STATE_READ_TTL_MS: u64 = 5_000;
+
+/// A cached crawl-state read: the data-dir path it was read from (a moved
+/// data dir — or a test with another dir — must never be served another
+/// directory's state), the raw text (None = no readable crawl state; that
+/// verdict is cached too — absence can only change by a crawl settling,
+/// which the TTL expiry re-reads within seconds), and when it was taken.
+struct CrawlStateHit {
+    path: std::path::PathBuf,
+    raw: Option<String>,
+    at_ms: u64,
+}
+
+static CRAWL_STATE_CACHE: Mutex<Option<CrawlStateHit>> = Mutex::new(None);
+
 /// Last background index failures (auto-ingest, post-crawl FTS refresh).
 /// Those paths deliberately never fail the tool call that carried them —
 /// without this record the failure is visible only on this process's
@@ -241,6 +263,59 @@ fn crawl_state_raw() -> Option<String> {
     std::fs::read_to_string(bite_core::config::data_dir().join("crawl-state.json")).ok()
 }
 
+/// Pure gate for the cached crawl-state read: usable only while it was
+/// taken from this same data-dir path AND the TTL has not elapsed.
+fn crawl_state_cache_usable(
+    cached_path: &std::path::Path,
+    cached_at_ms: u64,
+    path: &std::path::Path,
+    now_ms: u64,
+    ttl_ms: u64,
+) -> bool {
+    cached_path == path && now_ms.saturating_sub(cached_at_ms) <= ttl_ms
+}
+
+/// Injectable core of `crawl_state_raw_cached`: consult `cache` for a read
+/// of `path` still within `ttl_ms`; on a miss or staleness run `fresh_read`
+/// and cache the result — BOTH the hit and the miss (unlike the liveness
+/// verdict, a not-found file is as cacheable as a found one: see
+/// `CrawlStateHit`).
+fn cached_crawl_state_raw(
+    cache: &Mutex<Option<CrawlStateHit>>,
+    path: &std::path::Path,
+    now_ms: u64,
+    ttl_ms: u64,
+    fresh_read: &mut dyn FnMut() -> Option<String>,
+) -> Option<String> {
+    if let Some(hit) = cache.lock().unwrap().as_ref() {
+        if crawl_state_cache_usable(&hit.path, hit.at_ms, path, now_ms, ttl_ms) {
+            return hit.raw.clone();
+        }
+    }
+    let raw = fresh_read();
+    *cache.lock().unwrap() = Some(CrawlStateHit {
+        path: path.to_path_buf(),
+        raw: raw.clone(),
+        at_ms: now_ms,
+    });
+    raw
+}
+
+/// TTL-cached `crawl-state.json` read for the READ-ONLY FTS gate only.
+/// The authoritative fold (`refresh_fts_if_crawl_settled`, under the writer
+/// lock) keeps the fresh read, so the marker it writes is always the state
+/// text it actually optimized for.
+fn crawl_state_raw_cached() -> Option<String> {
+    let path = bite_core::config::data_dir().join("crawl-state.json");
+    cached_crawl_state_raw(
+        &CRAWL_STATE_CACHE,
+        &path,
+        now_ms(),
+        CRAWL_STATE_READ_TTL_MS,
+        &mut || std::fs::read_to_string(&path).ok(),
+    )
+}
+
 /// Parsed `state` field of raw crawl-state text ("unknown" when unparseable).
 fn crawl_state_of(raw: &str) -> String {
     serde_json::from_str::<Value>(raw)
@@ -265,11 +340,13 @@ fn fts_refresh_settled(state: &str, crawler_alive: bool) -> bool {
 }
 
 /// Is there a settled crawl state whose rows have not been folded into the
-/// FTS index yet? Cheap: two small file reads, plus a pid check only when
-/// the crawl-state text actually differs from the marker. Read-only — uses
-/// the TTL-cached liveness probe.
+/// FTS index yet? Cheap: a marker read plus the TTL-cached crawl-state
+/// read, plus a pid check only when the crawl-state text actually differs
+/// from the marker. Read-only — rides the TTL-cached liveness probe and
+/// crawl-state text; a true verdict is re-gated on FRESH reads by
+/// `refresh_fts_if_crawl_settled` before anything writes.
 fn fts_refresh_pending() -> bool {
-    let Some(raw) = crawl_state_raw() else {
+    let Some(raw) = crawl_state_raw_cached() else {
         return false;
     };
     let marker = std::fs::read_to_string(fts_refresh_marker_path()).unwrap_or_default();
@@ -2206,6 +2283,140 @@ mod tests {
         // ttl 0: only a verdict taken at this exact instant is usable
         assert!(liveness_cache_usable("1234", 1_000, "1234", 1_000, 0));
         assert!(!liveness_cache_usable("1234", 999, "1234", 1_000, 0));
+    }
+
+    #[test]
+    fn crawl_state_cache_gate_respects_path_and_ttl() {
+        const TTL: u64 = CRAWL_STATE_READ_TTL_MS;
+        let a = std::path::Path::new("/x/bite");
+        let b = std::path::Path::new("/y/bite");
+        // same data dir, within the TTL (inclusive) → usable
+        assert!(crawl_state_cache_usable(a, 1_000, a, 1_000 + TTL, TTL));
+        // one tick past the TTL → stale, re-read
+        assert!(!crawl_state_cache_usable(a, 1_000, a, 1_000 + TTL + 1, TTL));
+        // a different data dir → never trusted, whatever the age
+        assert!(!crawl_state_cache_usable(a, 1_000, b, 1_000, TTL));
+        assert!(!crawl_state_cache_usable(a, 1_000, b, 0, TTL));
+        // saturating math: elapsed clamps at 0 (never panics, never wraps)
+        assert!(crawl_state_cache_usable(a, u64::MAX, a, u64::MAX, TTL));
+        // ttl 0: only a read taken at this exact instant is usable
+        assert!(crawl_state_cache_usable(a, 1_000, a, 1_000, 0));
+        assert!(!crawl_state_cache_usable(a, 999, a, 1_000, 0));
+    }
+
+    #[test]
+    fn cached_crawl_state_raw_serves_hits_and_misses_within_ttl() {
+        use std::cell::Cell;
+
+        let cache = Mutex::new(None);
+        let path = std::path::PathBuf::from("/tmp/bite-test/crawl-state.json");
+        let other = std::path::PathBuf::from("/tmp/bite-other/crawl-state.json");
+        let reads = Cell::new(0u32);
+        let text = Cell::new(Some("state-v1"));
+
+        let mut read = || {
+            reads.set(reads.get() + 1);
+            text.get().map(String::from)
+        };
+
+        // miss → fresh read, cached
+        assert_eq!(
+            cached_crawl_state_raw(&cache, &path, 1_000, 5_000, &mut read),
+            Some("state-v1".to_string())
+        );
+        assert_eq!(reads.get(), 1);
+
+        // the "file" changes behind the cache: within the TTL the cached
+        // text is served and no new read happens
+        text.set(Some("state-v2"));
+        assert_eq!(
+            cached_crawl_state_raw(&cache, &path, 2_000, 5_000, &mut read),
+            Some("state-v1".to_string())
+        );
+        assert_eq!(reads.get(), 1, "within the TTL the read must be cached");
+
+        // past the TTL the new text is read (and cached)
+        assert_eq!(
+            cached_crawl_state_raw(&cache, &path, 1_000 + 5_000 + 1, 5_000, &mut read),
+            Some("state-v2".to_string())
+        );
+        assert_eq!(reads.get(), 2);
+
+        // a different data dir is a different key: fresh read even inside
+        // the TTL
+        assert_eq!(
+            cached_crawl_state_raw(&cache, &other, 6_002, 5_000, &mut read),
+            Some("state-v2".to_string())
+        );
+        assert_eq!(reads.get(), 3);
+
+        // a not-found (None) read is cached like a found one: within the
+        // TTL the miss is served without touching the file again — the
+        // opposite of the liveness verdict, whose miss must stay uncached
+        let mut miss_read = || {
+            reads.set(reads.get() + 1);
+            None
+        };
+        assert_eq!(
+            cached_crawl_state_raw(&cache, &path, 10_000, 5_000, &mut miss_read),
+            None
+        );
+        assert_eq!(
+            cached_crawl_state_raw(&cache, &path, 11_000, 5_000, &mut miss_read),
+            None
+        );
+        assert_eq!(reads.get(), 4, "a None read must be cached within the TTL");
+    }
+
+    #[test]
+    fn fts_fold_uses_fresh_crawl_state_gate_rides_the_cache() {
+        // Tripwire in the style of `spawn_cancel_bulk_paths_probe_fresh_not_cached`:
+        // the READ-ONLY gate (`fts_refresh_pending`) may ride the TTL-cached
+        // crawl-state text, but the authoritative fold under the writer lock
+        // (`refresh_fts_if_crawl_settled`) must decide on the FRESH read —
+        // caching there would write a fold marker for state text it never
+        // saw. Swapping either side compiles and passes every behavioral
+        // test, but must fail here.
+        let src = include_str!("index.rs");
+
+        let body = |marker: &str, known_line: &str| {
+            let start = src
+                .find(marker)
+                .unwrap_or_else(|| panic!("tripwire anchor lost: {marker}"));
+            let rest = &src[start..];
+            let end = [
+                rest.find("\nfn "),
+                rest.find("\n///"),
+                rest.find("\n#[cfg(test)]"),
+            ]
+            .into_iter()
+            .flatten()
+            .min()
+            .unwrap_or(rest.len());
+            let slice = &rest[..end];
+            assert!(
+                !slice.trim().is_empty() && slice.contains(known_line),
+                "tripwire slice for {marker} is empty or off-target — \
+                 the anchor or known-line drifted"
+            );
+            slice
+        };
+
+        let fold = body("fn refresh_fts_if_crawl_settled(", "index.refresh_fts()");
+        assert!(
+            fold.contains("crawl_state_raw()"),
+            "the writer-side fold must take the FRESH crawl-state read"
+        );
+        assert!(
+            !fold.contains("crawl_state_raw_cached()"),
+            "the writer-side fold must not consult the TTL cache"
+        );
+
+        let gate = body("fn fts_refresh_pending()", "fts_refresh_due");
+        assert!(
+            gate.contains("crawl_state_raw_cached()"),
+            "the read-only gate should ride the TTL-cached read"
+        );
     }
 
     #[test]
