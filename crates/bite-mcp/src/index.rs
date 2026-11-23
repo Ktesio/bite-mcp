@@ -44,19 +44,21 @@ static LIVENESS_CACHE: Mutex<Option<LivenessHit>> = Mutex::new(None);
 /// `with_index` runs `refresh_fts_after_settled_crawl` on every index tool
 /// call, so the hot path re-reads (and, while a crawl is mid-flight and the
 /// text differs from the fold marker, re-parses) the crawl state once per
-/// call; the gate needs only second-level freshness — a stale verdict
+/// call; the cached verdict carries the parsed `state` too, so a hit skips
+/// both. The gate needs only second-level freshness — a stale verdict
 /// delays the post-settle FTS fold by one TTL at most, and unindexed rows
 /// stay searchable meanwhile.
 const CRAWL_STATE_READ_TTL_MS: u64 = 5_000;
 
-/// A cached crawl-state read: the data-dir path it was read from (a moved
-/// data dir — or a test with another dir — must never be served another
-/// directory's state), the raw text (None = no readable crawl state; that
-/// verdict is cached too — absence can only change by a crawl settling,
-/// which the TTL expiry re-reads within seconds), and when it was taken.
+/// A cached crawl-state read: the raw text (None = no readable crawl
+/// state; that verdict is cached too — absence can only change by a crawl
+/// settling, which the TTL expiry re-reads within seconds), the `state`
+/// field parsed from that text (a hit serves it, skipping the JSON
+/// re-parse), and when it was taken. No path key: `data_dir()` cannot
+/// change within a process, so the entry is simply process-wide.
 struct CrawlStateHit {
-    path: std::path::PathBuf,
     raw: Option<String>,
+    state: String,
     at_ms: u64,
 }
 
@@ -263,57 +265,80 @@ fn crawl_state_raw() -> Option<String> {
     std::fs::read_to_string(bite_core::config::data_dir().join("crawl-state.json")).ok()
 }
 
-/// Pure gate for the cached crawl-state read: usable only while it was
-/// taken from this same data-dir path AND the TTL has not elapsed.
-fn crawl_state_cache_usable(
-    cached_path: &std::path::Path,
-    cached_at_ms: u64,
-    path: &std::path::Path,
+/// Pure gate for the cached crawl-state read: usable only while the TTL
+/// has not elapsed. Checked with a GUARDED subtraction (not saturating):
+/// a backwards wall-clock step (NTP correction, manual change, a fix-up
+/// after sleep) must read as stale — saturating math would clamp elapsed
+/// to 0 and keep the entry "fresh" for however long the clock stepped
+/// back.
+fn crawl_state_cache_usable(cached_at_ms: u64, now_ms: u64, ttl_ms: u64) -> bool {
+    now_ms >= cached_at_ms && now_ms - cached_at_ms <= ttl_ms
+}
+
+/// Cache a crawl-state read THIS process just made — raw text plus the
+/// `state` field parsed from it (once, here) — and return the pair.
+/// Production callers: the read-only gate's miss path and the fold, which
+/// seeds the cache with the text it just acted on.
+fn store_crawl_state(
+    cache: &Mutex<Option<CrawlStateHit>>,
+    raw: Option<String>,
     now_ms: u64,
-    ttl_ms: u64,
-) -> bool {
-    cached_path == path && now_ms.saturating_sub(cached_at_ms) <= ttl_ms
+) -> Option<(String, String)> {
+    let state = raw
+        .as_deref()
+        .map_or_else(|| "unknown".to_string(), crawl_state_of);
+    *cache.lock().unwrap() = Some(CrawlStateHit {
+        raw: raw.clone(),
+        state: state.clone(),
+        at_ms: now_ms,
+    });
+    raw.map(|raw| (raw, state))
 }
 
 /// Injectable core of `crawl_state_raw_cached`: consult `cache` for a read
-/// of `path` still within `ttl_ms`; on a miss or staleness run `fresh_read`
-/// and cache the result — BOTH the hit and the miss (unlike the liveness
+/// still within `ttl_ms`; on a miss or staleness run `fresh_read` and
+/// cache the result — BOTH the hit and the miss (unlike the liveness
 /// verdict, a not-found file is as cacheable as a found one: see
-/// `CrawlStateHit`).
+/// `CrawlStateHit`). Returns the raw text AND its parsed `state`, so a
+/// hit skips the file read and the JSON parse alike.
 fn cached_crawl_state_raw(
     cache: &Mutex<Option<CrawlStateHit>>,
-    path: &std::path::Path,
     now_ms: u64,
     ttl_ms: u64,
     fresh_read: &mut dyn FnMut() -> Option<String>,
-) -> Option<String> {
+) -> Option<(String, String)> {
     if let Some(hit) = cache.lock().unwrap().as_ref() {
-        if crawl_state_cache_usable(&hit.path, hit.at_ms, path, now_ms, ttl_ms) {
-            return hit.raw.clone();
+        if crawl_state_cache_usable(hit.at_ms, now_ms, ttl_ms) {
+            return hit.raw.clone().map(|raw| (raw, hit.state.clone()));
         }
     }
     let raw = fresh_read();
-    *cache.lock().unwrap() = Some(CrawlStateHit {
-        path: path.to_path_buf(),
-        raw: raw.clone(),
-        at_ms: now_ms,
-    });
-    raw
+    store_crawl_state(cache, raw, now_ms)
 }
 
-/// TTL-cached `crawl-state.json` read for the READ-ONLY FTS gate only.
-/// The authoritative fold (`refresh_fts_if_crawl_settled`, under the writer
-/// lock) keeps the fresh read, so the marker it writes is always the state
-/// text it actually optimized for.
-fn crawl_state_raw_cached() -> Option<String> {
+/// TTL-cached `crawl-state.json` read for the READ-ONLY FTS gate only —
+/// raw text plus parsed `state`, so a hit touches neither the file nor
+/// the JSON parser. The authoritative fold
+/// (`refresh_fts_if_crawl_settled`, under the writer lock) keeps the
+/// fresh read, so the marker it writes is always the state text it
+/// actually optimized for.
+fn crawl_state_raw_cached() -> Option<(String, String)> {
     let path = bite_core::config::data_dir().join("crawl-state.json");
     cached_crawl_state_raw(
         &CRAWL_STATE_CACHE,
-        &path,
         now_ms(),
         CRAWL_STATE_READ_TTL_MS,
         &mut || std::fs::read_to_string(&path).ok(),
     )
+}
+
+/// Re-seed the gate's TTL cache with a read this process just made on the
+/// writer side (the fold) and hand the parsed pair back to the caller.
+/// Without this the gate keeps serving the PRE-fold text for up to one
+/// TTL after every settle — re-taking the writer lock on each call for a
+/// fold that already happened.
+fn seed_crawl_state_cache(raw: Option<String>) -> Option<(String, String)> {
+    store_crawl_state(&CRAWL_STATE_CACHE, raw, now_ms())
 }
 
 /// Parsed `state` field of raw crawl-state text ("unknown" when unparseable).
@@ -346,19 +371,21 @@ fn fts_refresh_settled(state: &str, crawler_alive: bool) -> bool {
 /// crawl-state text; a true verdict is re-gated on FRESH reads by
 /// `refresh_fts_if_crawl_settled` before anything writes.
 fn fts_refresh_pending() -> bool {
-    let Some(raw) = crawl_state_raw_cached() else {
+    let Some((raw, state)) = crawl_state_raw_cached() else {
         return false;
     };
     let marker = std::fs::read_to_string(fts_refresh_marker_path()).unwrap_or_default();
-    fts_refresh_due(&raw, &marker, crawl_running_cached())
+    fts_refresh_due(&raw, &state, &marker, crawl_running_cached())
 }
 
-/// Pure form of `fts_refresh_pending` (raw crawl-state text vs marker text).
-fn fts_refresh_due(raw: &str, marker: &str, crawler_alive: bool) -> bool {
+/// Pure form of `fts_refresh_pending` (raw crawl-state text and its parsed
+/// `state`, vs marker text). `state` is passed in — not parsed here — so
+/// the cached read can serve its verdict without a JSON parse.
+fn fts_refresh_due(raw: &str, state: &str, marker: &str, crawler_alive: bool) -> bool {
     if raw == marker {
         return false; // this exact crawl state is already folded in
     }
-    fts_refresh_settled(&crawl_state_of(raw), crawler_alive)
+    fts_refresh_settled(state, crawler_alive)
 }
 
 /// Fold rows written since the last FTS refresh into the index — exactly
@@ -376,10 +403,21 @@ fn fts_refresh_due(raw: &str, marker: &str, crawler_alive: bool) -> bool {
 /// Caller must hold the store's writer lock (both ingest paths do).
 fn refresh_fts_if_crawl_settled(index: &bite_index::EntityIndex) {
     let Some(raw) = crawl_state_raw() else {
+        // seed the None verdict too — the gate would otherwise re-read the
+        // absent file for a full TTL after every writer-side check
+        seed_crawl_state_cache(None);
+        return;
+    };
+    // seed the gate's cache with the text this fresh read saw (and reuse
+    // its parsed state below): the read-only gate then agrees with the
+    // fold immediately instead of serving the pre-fold text — and
+    // re-taking the writer lock for a fold that already happened — for
+    // up to one TTL after every settle
+    let Some((raw, state)) = seed_crawl_state_cache(Some(raw)) else {
         return;
     };
     let marker = std::fs::read_to_string(fts_refresh_marker_path()).unwrap_or_default();
-    if !fts_refresh_due(&raw, &marker, crawl_running_cached()) {
+    if !fts_refresh_due(&raw, &state, &marker, crawl_running_cached()) {
         return;
     }
     match index.refresh_fts() {
@@ -1181,6 +1219,9 @@ pub fn wipe(confirm: bool) -> Result<Value, BiteError> {
         // single recent window. Stale crawl.pid is also gone so nothing
         // references the dead run.
         let _ = std::fs::remove_file(bite_core::config::data_dir().join("crawl-state.json"));
+        // the gate's cached crawl-state verdict died with the file — serve
+        // nothing until a fresh crawl records state again
+        *CRAWL_STATE_CACHE.lock().unwrap() = None;
         let _ = std::fs::remove_file(bite_core::config::data_dir().join("crawl.pid"));
         // Purge-scope tombstones go too: wipe is the COMPLETE reset, and a
         // wiped-then-rebuilt index whose rows never come back (because an old
@@ -2069,14 +2110,20 @@ mod tests {
     fn fts_refresh_due_marker_matching() {
         let done = r#"{"state":"done","processed":10}"#;
         // marker equals raw state → already folded in, not due
-        assert!(!fts_refresh_due(done, done, false));
+        assert!(!fts_refresh_due(done, "done", done, false));
         // any other marker (older crawl, or never written) → due
-        assert!(fts_refresh_due(done, "", false));
-        assert!(fts_refresh_due(done, r#"{"state":"running"}"#, false));
-        // unparseable crawl state text behaves as unknown → not due
-        assert!(!fts_refresh_due("garbage", "", false));
+        assert!(fts_refresh_due(done, "done", "", false));
+        assert!(fts_refresh_due(
+            done,
+            "done",
+            r#"{"state":"running"}"#,
+            false
+        ));
+        // the state comes from the caller: text parsed as unknown upstream
+        // behaves exactly like an unknown state → not due
+        assert!(!fts_refresh_due("garbage", "unknown", "", false));
         // and the alive gate still wins over a differing marker
-        assert!(!fts_refresh_due(done, "", true));
+        assert!(!fts_refresh_due(done, "done", "", true));
     }
 
     #[test]
@@ -2286,22 +2333,21 @@ mod tests {
     }
 
     #[test]
-    fn crawl_state_cache_gate_respects_path_and_ttl() {
+    fn crawl_state_cache_gate_respects_ttl() {
         const TTL: u64 = CRAWL_STATE_READ_TTL_MS;
-        let a = std::path::Path::new("/x/bite");
-        let b = std::path::Path::new("/y/bite");
-        // same data dir, within the TTL (inclusive) → usable
-        assert!(crawl_state_cache_usable(a, 1_000, a, 1_000 + TTL, TTL));
+        // within the TTL (inclusive) → usable
+        assert!(crawl_state_cache_usable(1_000, 1_000 + TTL, TTL));
         // one tick past the TTL → stale, re-read
-        assert!(!crawl_state_cache_usable(a, 1_000, a, 1_000 + TTL + 1, TTL));
-        // a different data dir → never trusted, whatever the age
-        assert!(!crawl_state_cache_usable(a, 1_000, b, 1_000, TTL));
-        assert!(!crawl_state_cache_usable(a, 1_000, b, 0, TTL));
-        // saturating math: elapsed clamps at 0 (never panics, never wraps)
-        assert!(crawl_state_cache_usable(a, u64::MAX, a, u64::MAX, TTL));
+        assert!(!crawl_state_cache_usable(1_000, 1_000 + TTL + 1, TTL));
+        // backwards wall-clock step (NTP correction, manual change) →
+        // stale, never "elapsed 0 = maximally fresh"
+        assert!(!crawl_state_cache_usable(1_000, 999, TTL));
+        assert!(!crawl_state_cache_usable(1_000, 0, TTL));
+        // same instant → usable (guard is >=, not >)
+        assert!(crawl_state_cache_usable(u64::MAX, u64::MAX, TTL));
         // ttl 0: only a read taken at this exact instant is usable
-        assert!(crawl_state_cache_usable(a, 1_000, a, 1_000, 0));
-        assert!(!crawl_state_cache_usable(a, 999, a, 1_000, 0));
+        assert!(crawl_state_cache_usable(1_000, 1_000, 0));
+        assert!(!crawl_state_cache_usable(999, 1_000, 0));
     }
 
     #[test]
@@ -2309,46 +2355,36 @@ mod tests {
         use std::cell::Cell;
 
         let cache = Mutex::new(None);
-        let path = std::path::PathBuf::from("/tmp/bite-test/crawl-state.json");
-        let other = std::path::PathBuf::from("/tmp/bite-other/crawl-state.json");
         let reads = Cell::new(0u32);
-        let text = Cell::new(Some("state-v1"));
+        let text = Cell::new(Some(r#"{"state":"running"}"#));
 
         let mut read = || {
             reads.set(reads.get() + 1);
             text.get().map(String::from)
         };
 
-        // miss → fresh read, cached
+        // miss → fresh read, cached with its parsed state
         assert_eq!(
-            cached_crawl_state_raw(&cache, &path, 1_000, 5_000, &mut read),
-            Some("state-v1".to_string())
+            cached_crawl_state_raw(&cache, 1_000, 5_000, &mut read),
+            Some((r#"{"state":"running"}"#.to_string(), "running".to_string()))
         );
         assert_eq!(reads.get(), 1);
 
         // the "file" changes behind the cache: within the TTL the cached
-        // text is served and no new read happens
-        text.set(Some("state-v2"));
+        // text AND parsed state are served and no new read happens
+        text.set(Some(r#"{"state":"done"}"#));
         assert_eq!(
-            cached_crawl_state_raw(&cache, &path, 2_000, 5_000, &mut read),
-            Some("state-v1".to_string())
+            cached_crawl_state_raw(&cache, 2_000, 5_000, &mut read),
+            Some((r#"{"state":"running"}"#.to_string(), "running".to_string()))
         );
         assert_eq!(reads.get(), 1, "within the TTL the read must be cached");
 
         // past the TTL the new text is read (and cached)
         assert_eq!(
-            cached_crawl_state_raw(&cache, &path, 1_000 + 5_000 + 1, 5_000, &mut read),
-            Some("state-v2".to_string())
+            cached_crawl_state_raw(&cache, 1_000 + 5_000 + 1, 5_000, &mut read),
+            Some((r#"{"state":"done"}"#.to_string(), "done".to_string()))
         );
         assert_eq!(reads.get(), 2);
-
-        // a different data dir is a different key: fresh read even inside
-        // the TTL
-        assert_eq!(
-            cached_crawl_state_raw(&cache, &other, 6_002, 5_000, &mut read),
-            Some("state-v2".to_string())
-        );
-        assert_eq!(reads.get(), 3);
 
         // a not-found (None) read is cached like a found one: within the
         // TTL the miss is served without touching the file again — the
@@ -2358,14 +2394,59 @@ mod tests {
             None
         };
         assert_eq!(
-            cached_crawl_state_raw(&cache, &path, 10_000, 5_000, &mut miss_read),
+            cached_crawl_state_raw(&cache, 12_000, 5_000, &mut miss_read),
             None
         );
         assert_eq!(
-            cached_crawl_state_raw(&cache, &path, 11_000, 5_000, &mut miss_read),
+            cached_crawl_state_raw(&cache, 13_000, 5_000, &mut miss_read),
             None
         );
-        assert_eq!(reads.get(), 4, "a None read must be cached within the TTL");
+        assert_eq!(reads.get(), 3, "a None read must be cached within the TTL");
+    }
+
+    #[test]
+    fn fold_seeded_cache_settles_the_gate_within_ttl() {
+        use std::cell::Cell;
+
+        // The fold (writer side) re-seeds the gate's cache with the text
+        // it just read — otherwise a call during the crawl caches R0, the
+        // crawler settles and the fold writes marker = R1, and every later
+        // gate call within the TTL still compares cached R0 vs marker R1:
+        // "running" + dead crawler → due → writer lock re-taken for a
+        // fold that already happened.
+        let cache = Mutex::new(None);
+        let reads = Cell::new(0u32);
+        let text = Cell::new(Some(r#"{"state":"running"}"#));
+
+        let mut read = || {
+            reads.set(reads.get() + 1);
+            text.get().map(String::from)
+        };
+
+        // gate call during the crawl caches R0
+        let (raw0, state0) = cached_crawl_state_raw(&cache, 1_000, 5_000, &mut read).unwrap();
+        assert_eq!(state0, "running");
+        assert_eq!(reads.get(), 1);
+
+        // the crawl settles; the fold's FRESH read sees R1 and seeds the
+        // cache with it (production: `seed_crawl_state_cache`)
+        text.set(Some(r#"{"state":"done"}"#));
+        let (raw1, state1) = store_crawl_state(&cache, read(), 2_000).unwrap();
+        assert_eq!(raw1, r#"{"state":"done"}"#);
+        assert_eq!(state1, "done");
+        assert_eq!(reads.get(), 2);
+
+        // within the TTL the gate now serves the SEEDED R1: against
+        // marker = R1 (the fold wrote exactly that) it reports not
+        // pending — no re-read, no writer lock
+        let (raw, state) = cached_crawl_state_raw(&cache, 3_000, 5_000, &mut read).unwrap();
+        assert_eq!(raw, r#"{"state":"done"}"#);
+        assert_eq!(reads.get(), 2, "the seed must be served, not re-read");
+        assert!(!fts_refresh_due(&raw, &state, &raw1, false));
+
+        // and the guard holds: without the seed the cached R0 against
+        // marker R1 would read due (running + dead crawler)
+        assert!(fts_refresh_due(&raw0, &state0, &raw1, false));
     }
 
     #[test]

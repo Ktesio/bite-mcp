@@ -92,15 +92,19 @@ it can ship.
 
 ### Changed
 
-- Indexed mail searches no longer re-read `crawl-state.json` on every tool
-  call: the read-only post-settle FTS gate — `with_index` runs it after
-  every index touch — now serves the crawl-state text from a 5 s TTL cache
-  keyed by the data-dir path, keeping the fast path free of that read (and,
-  while a crawl is mid-flight and the text differs from the fold marker, of
-  the per-call JSON re-parse). Misses are cached like hits; the
-  authoritative fold under the writer lock keeps the fresh read, so the
-  fold marker is only ever written for state text that was actually
-  optimized for.
+- Indexed mail searches no longer re-read or re-parse `crawl-state.json`
+  on every tool call: the read-only post-settle FTS gate — `with_index`
+  runs it after every index touch — now serves the crawl-state text AND
+  its parsed `state` field from a 5 s TTL cache, keeping the fast path
+  free of that read and, while a crawl is mid-flight and the text differs
+  from the fold marker, of the per-call JSON parse. Misses are cached
+  like hits; the fold seeds the cache with the text it just acted on, so
+  the gate goes quiet immediately after a settle instead of re-taking the
+  writer lock for up to one TTL; `index wipe` drops the cached verdict
+  with the file; and a backwards wall-clock step reads as stale, so the
+  entry can never outlive its TTL. The authoritative fold under the
+  writer lock keeps the fresh read, so the fold marker is only ever
+  written for state text that was actually optimized for.
 
 ### Fixed
 
