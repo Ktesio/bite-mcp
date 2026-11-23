@@ -200,7 +200,15 @@ outcome carries its subject and recipients for replay; the file is 0600
 in the private data dir, covered by `bite index wipe`, and documented in
 PRIVACY.md. A missing, corrupt, or unreadable ledger starts the server
 unrecorded (one stderr note for the latter two), trading a lost
-replay/refusal surface for availability.
+replay/refusal surface for availability. Mid-run the failure modes
+split: a file that fails to PARSE keeps this process's rows in memory
+and writes them back (one note per failure streak), while a file that
+fails to READ (permissions, I/O error) refuses the next write and
+leaves the bytes untouched — the unreadable file may be a valid ledger
+this process cannot see, and neither mode ever treats a missing row as
+a released key. An in-server `index_wipe` keeps the claims of sends
+still in flight: their pins are re-written to the wiped file and their
+outcomes are recorded when they settle.
 
 ## Result shapes (contract)
 

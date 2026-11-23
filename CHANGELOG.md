@@ -27,7 +27,11 @@ it can ship.
   leaves a row the next start loads as an unknown pin (`interrupted`) and
   the same-key retry is refused instead of re-dispatched. A missing,
   corrupt, or unreadable ledger starts the server unrecorded (one stderr
-  note for the latter two). The stored outcome of a completed send carries
+  note for the latter two). Mid-run, a ledger that fails to parse keeps
+  the process's rows in memory and writes them back (one note per
+  failure streak), while one that fails to read (permissions, I/O
+  error) refuses the write instead of replacing a file it could not
+  see. The stored outcome of a completed send carries
   its subject and recipients: documented in PRIVACY.md and removed by
   `bite index wipe`. The smoke harness now runs every server process in an
   isolated data dir, so keyed tests never touch a developer's real ledger.
@@ -36,7 +40,9 @@ it can ship.
   a row that vanished because its writer released the key frees it here
   too), the on-disk 128-key cap is enforced on every write with the same
   done-before-unknown victim rule as memory, an in-server `index_wipe`
-  clears that server's in-memory records along with the file, and
+  clears that server's in-memory records along with the file (sends
+  still in flight keep their claim, and their outcome is recorded when
+  they settle), and
   reserving a disk-backed key no longer duplicates its retention slot.
 - The 16 MiB stdio request-line rejection is now logged server-side:
   `serve()` writes one stderr line per rejected oversized request (naming

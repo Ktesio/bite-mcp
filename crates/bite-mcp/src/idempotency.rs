@@ -203,6 +203,12 @@ pub(crate) struct Idempotency {
     /// its authority, so a persist follows the DISK row for it (which may
     /// be newer, or gone because that process released the key).
     owned: HashSet<KeyHash>,
+    /// Whether the operator note for a mid-run unreadable ledger has
+    /// already been printed in the current failure streak. A keyed call
+    /// reads the file up to four times (merge, claim persist, settle or
+    /// release persist); the protocol document promises ONE line, not
+    /// one per read. Cleared by the next read that succeeds.
+    noted_unreadable: bool,
 }
 
 impl Idempotency {
@@ -321,8 +327,19 @@ impl Idempotency {
             // the caller's memory-based verdict stands (for the
             // `reserve_durable` refresh that means the un-owned
             // snapshot answers: refused or replayed, never Fresh).
-            LedgerRead::Failed => return None,
+            // The note fires once per failure streak, not once per
+            // read (a keyed call lands here up to four times).
+            LedgerRead::Unparseable(reason) => {
+                self.note_unreadable_streak(&reason);
+                return None;
+            }
+            LedgerRead::Io(error) => {
+                self.note_unreadable_streak(&error.to_string());
+                return None;
+            }
         };
+        // The read succeeded: any earlier unreadable streak is over.
+        self.noted_unreadable = false;
         let Some(entry) = disk.map.get(key).cloned() else {
             // No durable row. If memory still holds a row for this key
             // that this process does not own, the server that wrote it
@@ -348,6 +365,20 @@ impl Idempotency {
         };
         self.adopt(key, entry);
         Some(verdict)
+    }
+
+    /// The one-line operator note for a mid-run unreadable ledger, printed
+    /// ONCE per failure streak (see `noted_unreadable`): the wording is the
+    /// mid-run truth — this process keeps answering from memory — unlike
+    /// the startup note, which says the server starts unrecorded.
+    fn note_unreadable_streak(&mut self, reason: &str) {
+        if !self.noted_unreadable {
+            self.noted_unreadable = true;
+            let _ = writeln!(
+                std::io::stderr(),
+                "bite-mcp: idempotency ledger is unreadable ({reason}); rows kept in memory"
+            );
+        }
     }
 
     /// Install a durable row folded in from the disk. A row this process
@@ -435,8 +466,10 @@ impl Idempotency {
     /// wipe lands must not lose its claim — wiping it would let a
     /// concurrent same-key retry dispatch a second send (the exact
     /// double-send the key exists to prevent) and strand the original
-    /// settle on a missing row. Call [`persist_ledger`] afterwards so
-    /// the surviving in-flight pins return to the wiped file.
+    /// settle on a missing row. Call
+    /// [`persist_ledger_discarding_disk`] afterwards so the surviving
+    /// in-flight pins return to the wiped file WITHOUT merging whatever
+    /// the file holds at that moment.
     pub(crate) fn wipe_settled(&mut self) {
         let snapshot: Vec<KeyHash> = self.order.iter().copied().collect();
         for key in snapshot {
@@ -568,6 +601,31 @@ impl Idempotency {
     /// claiming the same free key concurrently) is inherent without an
     /// OS-level lock and documented in docs/protocol.md.
     pub(crate) fn persist_ledger(&mut self, path: &std::path::Path) -> std::io::Result<()> {
+        self.persist_ledger_with(path, false)
+    }
+
+    /// Variant for the write that immediately follows an in-server
+    /// `index_wipe` ([`wipe_settled`]): the on-disk set is treated as
+    /// EMPTY — no read, no merge — so the new ledger holds exactly this
+    /// process's surviving in-flight pins. `index::wipe` deletes the
+    /// file BEFORE the state lock is taken, so a keyed persist on
+    /// another request thread can land in that gap and re-create the
+    /// file with settled rows; merging them back would resurrect
+    /// exactly what the wipe deleted. A `remove_file` that silently
+    /// failed is covered the same way: the write REPLACES whatever the
+    /// file holds instead of merging it.
+    pub(crate) fn persist_ledger_discarding_disk(
+        &mut self,
+        path: &std::path::Path,
+    ) -> std::io::Result<()> {
+        self.persist_ledger_with(path, true)
+    }
+
+    fn persist_ledger_with(
+        &mut self,
+        path: &std::path::Path,
+        discard_disk: bool,
+    ) -> std::io::Result<()> {
         let now = unix_now();
         let expired = |settled_at: u64| now.saturating_sub(settled_at) > PERSIST_TTL_SECS;
         // A failed read (unreadable or corrupt file) must not turn into
@@ -578,11 +636,30 @@ impl Idempotency {
         // pins this server loaded at startup survive the bad read
         // instead of being silently forgotten (a forgotten pin re-opens
         // the double-send window on the next same-key retry).
-        let read = read_ledger(path, now);
-        let read_failed = matches!(read, LedgerRead::Failed);
-        let disk = match read {
-            LedgerRead::Ready(disk) => disk,
-            LedgerRead::Failed => Idempotency::default(),
+        let (read_failed, disk) = if discard_disk {
+            (false, Idempotency::default())
+        } else {
+            match read_ledger(path, now) {
+                LedgerRead::Ready(disk) => {
+                    // The read succeeded: any earlier unreadable streak
+                    // is over.
+                    self.noted_unreadable = false;
+                    (false, disk)
+                }
+                LedgerRead::Unparseable(reason) => {
+                    self.note_unreadable_streak(&reason);
+                    (true, Idempotency::default())
+                }
+                // An I/O read failure is NOT license to rewrite the file
+                // from memory: the unreadable bytes are probably still a
+                // valid ledger holding rows this process never loaded
+                // (another server's pins), and write_private's temp-file
+                // rename would erase them. Refuse the write and hand the
+                // error to the caller's best-effort note; the rows stay
+                // in memory either way. Only an unparseable file — whose
+                // bytes are unrecoverable — is safe to replace.
+                LedgerRead::Io(error) => return Err(error),
+            }
         };
         // (settle time, victim rank, record). Rank drives the on-disk cap:
         // 0 = done (first victim), 1 = unknown, 2 = in-flight (protected,
@@ -818,13 +895,22 @@ enum LedgerRead {
     /// The file was read (or is absent): row ABSENCE is real evidence —
     /// a key with no durable row was released by its writer (or wiped).
     Ready(Idempotency),
-    /// The file exists but could not be read or parsed: which rows it
-    /// holds is UNKNOWN. Callers must not treat a missing row as a
-    /// released key — un-owned memory snapshots stay put and ride back
-    /// to disk on the next successful write (the pins a server loaded
-    /// at startup must survive a transient EACCES/EIO or a truncated
-    /// file, or a same-key retry after the bad read re-sends).
-    Failed,
+    /// The file exists but could not be parsed: which rows it holds is
+    /// UNKNOWN. Callers must not treat a missing row as a released key
+    /// — un-owned memory snapshots stay put and ride back to disk on
+    /// the next write (the pins a server loaded at startup must survive
+    /// a truncated file, or a same-key retry after the bad read
+    /// re-sends). Rewriting from memory IS safe here: the bytes cannot
+    /// be recovered, so this process's rows are the newest state that
+    /// exists. Carries the parse error for the operator note.
+    Unparseable(String),
+    /// The file exists but could not be READ (permissions, I/O error):
+    /// unlike [`LedgerRead::Unparseable`], the bytes are probably still
+    /// a valid ledger this process cannot see, so a persist must not
+    /// replace the file — it returns the error instead of writing.
+    /// Row absence still carries no release evidence, so memory rows
+    /// stay put either way. Carries the error for the caller.
+    Io(std::io::Error),
 }
 
 /// Read and parse the durable ledger, separating a clean (or absent)
@@ -837,26 +923,19 @@ fn read_ledger(path: &std::path::Path, now_secs: u64) -> LedgerRead {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             return LedgerRead::Ready(Idempotency::default())
         }
-        // Present but unreadable (permissions, I/O error): the operator
-        // gets the one-line note the protocol document promises; row
-        // absence below must NOT be read as a release.
-        Err(error) => {
-            let _ = writeln!(
-                std::io::stderr(),
-                "bite-mcp: idempotency ledger is unreadable ({error}); rows kept in memory"
-            );
-            return LedgerRead::Failed;
-        }
+        // Present but unreadable (permissions, I/O error): row absence
+        // below must NOT be read as a release; the persist path refuses
+        // to write rather than replace a file it cannot see. The error
+        // rides the variant — each caller notes its own wording
+        // (startup: starting unrecorded; mid-run: rows kept in memory).
+        Err(error) => return LedgerRead::Io(error),
     };
     let parsed: Value = match serde_json::from_slice(&bytes) {
         Ok(value) => value,
-        Err(error) => {
-            let _ = writeln!(
-                std::io::stderr(),
-                "bite-mcp: idempotency ledger is unreadable ({error}); rows kept in memory"
-            );
-            return LedgerRead::Failed;
-        }
+        // Present but unparseable (truncated, wrong format): the bytes
+        // are unrecoverable, so rewriting from memory is safe — the
+        // parse error rides the variant for the caller's note.
+        Err(error) => return LedgerRead::Unparseable(error.to_string()),
     };
     let mut rows: Vec<(u64, KeyHash, Entry)> = Vec::new();
     let empty: Vec<Value> = Vec::new();
@@ -915,10 +994,20 @@ fn read_ledger(path: &std::path::Path, now_secs: u64) -> LedgerRead {
 /// start is availability-first. Mid-flight readers that must NOT mistake
 /// a failed read for released keys use [`read_ledger`] instead.
 pub(crate) fn load_ledger(path: &std::path::Path, now_secs: u64) -> Idempotency {
-    match read_ledger(path, now_secs) {
-        LedgerRead::Ready(idem) => idem,
-        LedgerRead::Failed => Idempotency::default(),
-    }
+    // A file that exists but cannot be read or parsed starts the server
+    // UNRECORDED — the table is empty, so "rows kept in memory" (the
+    // mid-run wording) would be wrong here. One startup note, then the
+    // availability-first degradation the protocol document promises.
+    let failed = match read_ledger(path, now_secs) {
+        LedgerRead::Ready(idem) => return idem,
+        LedgerRead::Unparseable(reason) => reason,
+        LedgerRead::Io(error) => error.to_string(),
+    };
+    let _ = writeln!(
+        std::io::stderr(),
+        "bite-mcp: idempotency ledger is unreadable ({failed}); starting unrecorded"
+    );
+    Idempotency::default()
 }
 
 /// One ledger row as JSON: hashed key, argument fingerprint, state kind,
@@ -1778,8 +1867,9 @@ mod tests {
 
         // The surviving pin returns to the wiped file FIRST (probing
         // memory before the persist would insert fresh claims and ride
-        // them to disk, masking what the wipe itself wrote).
-        idem.persist_ledger(&path).unwrap();
+        // them to disk, masking what the wipe itself wrote). The discard
+        // variant mirrors the mcp.rs call site exactly.
+        idem.persist_ledger_discarding_disk(&path).unwrap();
         let mut reloaded = load_ledger(&path, unix_now());
         assert!(
             matches!(
@@ -1811,6 +1901,144 @@ mod tests {
             Reserved::Done(v) => assert_eq!(v, json!({ "sent": true })),
             other => panic!("the settled live claim must replay, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn wipe_persist_discards_rows_written_in_the_delete_gap() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(LEDGER_FILE);
+        let now = unix_now();
+        // index::wipe removed the file, but a keyed persist on another
+        // request thread re-created it BEFORE the wipe took the state
+        // lock: the file holds a settled row again. (The same shape
+        // arises when the remove_file itself silently failed and the
+        // old ledger stayed in place.)
+        let foreign = json!({
+            "v": 1,
+            "entries": [
+                { "k": hex(&kh("racing")), "f": hex(&fp("args")),
+                  "s": "done", "o": { "sent": true }, "t": now },
+            ]
+        });
+        std::fs::write(&path, foreign.to_string()).unwrap();
+
+        // One live claim survives the wipe; the post-wipe write must
+        // REPLACE the file, not merge it — merging would resurrect the
+        // racing settled row the wipe just deleted (and the whole old
+        // ledger when the delete failed).
+        let mut idem = Idempotency::default();
+        assert!(matches!(
+            idem.reserve(&kh("live"), &fp("args")),
+            Reserved::Fresh
+        ));
+        idem.wipe_settled();
+        idem.persist_ledger_discarding_disk(&path).unwrap();
+
+        let mut reloaded = load_ledger(&path, unix_now());
+        assert!(
+            matches!(
+                reloaded.reserve(&kh("live"), &fp("args")),
+                Reserved::Unknown(_)
+            ),
+            "the surviving in-flight pin must be on the wiped file"
+        );
+        assert!(
+            matches!(
+                reloaded.reserve(&kh("racing"), &fp("args")),
+                Reserved::Fresh
+            ),
+            "a row re-created in the delete gap must NOT survive the wipe persist"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn persist_after_io_read_error_refuses_the_write() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(LEDGER_FILE);
+        let now = unix_now();
+        // Another server's settled row — unread, unknown to this process.
+        let foreign = json!({
+            "v": 1,
+            "entries": [
+                { "k": hex(&kh("theirs")), "f": hex(&fp("args")),
+                  "s": "unknown", "c": "timeout", "t": now },
+            ]
+        });
+        std::fs::write(&path, foreign.to_string()).unwrap();
+        let bytes_before = std::fs::read(&path).unwrap();
+        // Unreadable FILE inside a writable DIRECTORY (chmod 000): the
+        // read fails with EACCES — not NotFound — while write_private's
+        // temp-file + rename would still succeed and clobber the file.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let mut idem = Idempotency::default();
+        assert!(matches!(
+            idem.reserve(&kh("ours"), &fp("args")),
+            Reserved::Fresh
+        ));
+        let verdict = idem.persist_ledger(&path);
+        assert!(
+            verdict.is_err(),
+            "a persist that cannot READ the file must refuse to write it"
+        );
+        // Restore readability: the foreign row must be untouched — a
+        // rewrite from memory would have erased it (and with it the
+        // other server's double-send guard).
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            bytes_before,
+            "the unreadable ledger must be left byte-for-byte intact"
+        );
+        let mut reloaded = load_ledger(&path, unix_now());
+        assert!(
+            matches!(
+                reloaded.reserve(&kh("theirs"), &fp("args")),
+                Reserved::Unknown(_)
+            ),
+            "the foreign row must still be loadable after the refused write"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn unreadable_note_fires_once_per_failure_streak() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(LEDGER_FILE);
+        // A valid ledger made I/O-unreadable (chmod 000): every read
+        // fails for the same reason, and the persist path REFUSES to
+        // rewrite — so the file stays bad across calls, exactly the
+        // failure streak the once-only note covers. (An unparseable
+        // file is a one-shot streak: the first persist rewrites it.)
+        std::fs::write(&path, b"{\"v\":1,\"entries\":[]}").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let mut idem = Idempotency::default();
+        // Each reserve_durable reads the ledger up to twice (merge,
+        // then the claim persist) — the streak flag must collapse the
+        // whole streak to ONE note, pinned by the flag state rather
+        // than stderr capture.
+        idem.reserve_durable(&kh("kd"), &fp("args"), &path);
+        assert!(
+            idem.noted_unreadable,
+            "the first bad read must arm the streak note"
+        );
+        idem.reserve_durable(&kh("kd2"), &fp("args"), &path);
+        assert!(
+            idem.noted_unreadable,
+            "the streak flag must stay armed while the file stays bad"
+        );
+        // A recovered file clears the streak: the next failure notes
+        // again instead of being silenced forever.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        idem.persist_ledger(&path).unwrap(); // absent file = clean read
+        assert!(
+            !idem.noted_unreadable,
+            "a successful read must clear the streak note"
+        );
     }
 
     #[test]

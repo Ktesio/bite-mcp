@@ -98,7 +98,10 @@ with your data. bite itself adds no network hop; choose agents you trust.
   removes this file along with the index; deleting the file while the
   server is stopped has the same effect. A wipe issued through the
   server itself (`index_wipe`) also clears that server's in-memory
-  records, but a wipe from the CLI (or the file deleted by hand) does
+  records — sends still in flight when the wipe lands keep their claim
+  (so a concurrent same-key retry cannot double-send), and their
+  outcome is recorded when they settle — but a wipe from the CLI (or
+  the file deleted by hand) does
   not reach a RUNNING server's memory: any other bite-mcp server still
   alive re-creates the file from memory on its next keyed send, so stop
   or restart running servers for the purge to be complete.

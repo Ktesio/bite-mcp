@@ -381,12 +381,17 @@ fn handle_request(state: &ServerState, method: &str, params: &Value) -> Result<V
                     // claim would let a concurrent same-key retry
                     // dispatch a second send. The immediate re-persist
                     // returns the surviving in-flight pins to the wiped
-                    // file. (A CLI wipe from another process cannot reach
+                    // file, DISCARDING whatever the file holds: the
+                    // delete raced any persist that re-created it, and
+                    // merging would resurrect the rows the wipe removed.
+                    // (A CLI wipe from another process cannot reach
                     // this table: PRIVACY.md tells those users to
                     // restart running servers.)
                     if let Ok(mut idem) = state.idempotency.lock() {
                         idem.wipe_settled();
-                        if let Err(error) = idem.persist_ledger(&idempotency::ledger_path()) {
+                        if let Err(error) =
+                            idem.persist_ledger_discarding_disk(&idempotency::ledger_path())
+                        {
                             let _ = writeln!(
                                 std::io::stderr(),
                                 "bite-mcp: idempotency ledger write failed ({error}); \
