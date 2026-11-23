@@ -375,11 +375,24 @@ fn handle_request(state: &ServerState, method: &str, params: &Value) -> Result<V
                     // in-memory table still holds every prior record —
                     // the next keyed send would write them straight back,
                     // un-purging the wipe. Reset the table so the wipe is
-                    // complete for this server too. (A CLI wipe from
-                    // another process cannot reach this table: PRIVACY.md
-                    // tells those users to restart running servers.)
+                    // complete for this server too — but KEEP live
+                    // claims: each request runs on its own thread, so a
+                    // keyed send can be in flight right now; dropping its
+                    // claim would let a concurrent same-key retry
+                    // dispatch a second send. The immediate re-persist
+                    // returns the surviving in-flight pins to the wiped
+                    // file. (A CLI wipe from another process cannot reach
+                    // this table: PRIVACY.md tells those users to
+                    // restart running servers.)
                     if let Ok(mut idem) = state.idempotency.lock() {
-                        *idem = idempotency::Idempotency::default();
+                        idem.wipe_settled();
+                        if let Err(error) = idem.persist_ledger(&idempotency::ledger_path()) {
+                            let _ = writeln!(
+                                std::io::stderr(),
+                                "bite-mcp: idempotency ledger write failed ({error}); \
+                                 surviving in-flight pins are memory-only until the next write"
+                            );
+                        }
                     }
                 }
                 return Ok(json!({

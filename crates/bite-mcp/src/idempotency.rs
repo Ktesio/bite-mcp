@@ -312,7 +312,17 @@ impl Idempotency {
         fingerprint: &Fingerprint,
         path: &std::path::Path,
     ) -> Option<Reserved> {
-        let disk = load_ledger(path, unix_now());
+        let disk = match read_ledger(path, unix_now()) {
+            LedgerRead::Ready(disk) => disk,
+            // A failed read carries NO information about the durable
+            // row: absence must not be read as a release here, or a
+            // transient EACCES/EIO or truncated file unpins the key
+            // and the retry re-sends. Return without touching memory —
+            // the caller's memory-based verdict stands (for the
+            // `reserve_durable` refresh that means the un-owned
+            // snapshot answers: refused or replayed, never Fresh).
+            LedgerRead::Failed => return None,
+        };
         let Some(entry) = disk.map.get(key).cloned() else {
             // No durable row. If memory still holds a row for this key
             // that this process does not own, the server that wrote it
@@ -381,7 +391,18 @@ impl Idempotency {
                 entry.state = state;
                 entry.settled_at = Some(now);
             }
-            None => debug_assert!(false, "settle must follow reserve"),
+            // Unreachable while the contract holds (settle follows a
+            // reserve on the same key), but NEVER fatal: settle runs
+            // with the state lock held, and a panic here poisons the
+            // mutex — every later keyed call would then panic on
+            // `.lock().unwrap()`. Dropping the outcome is the
+            // least-harm degradation and matches release builds.
+            None => {
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "bite-mcp: idempotency settle without a reservation; outcome dropped"
+                );
+            }
         }
     }
 
@@ -405,6 +426,32 @@ impl Idempotency {
                  outcomes stay in memory for this process"
             );
         }
+    }
+
+    /// Reset the table for `index_wipe`, KEEPING live claims: in-flight
+    /// entries survive with their `owned` membership and `order` slots,
+    /// every settled row is dropped, and stale release markers go with
+    /// them. A keyed send running on another request thread while the
+    /// wipe lands must not lose its claim — wiping it would let a
+    /// concurrent same-key retry dispatch a second send (the exact
+    /// double-send the key exists to prevent) and strand the original
+    /// settle on a missing row. Call [`persist_ledger`] afterwards so
+    /// the surviving in-flight pins return to the wiped file.
+    pub(crate) fn wipe_settled(&mut self) {
+        let snapshot: Vec<KeyHash> = self.order.iter().copied().collect();
+        for key in snapshot {
+            if !matches!(
+                self.map.get(&key),
+                Some(Entry {
+                    state: Recorded::InFlight,
+                    ..
+                })
+            ) {
+                self.forget(&key);
+            }
+        }
+        // The released-key markers targeted rows that died with the file.
+        self.dropped.clear();
     }
 
     /// Release an in-flight reservation WITHOUT recording an outcome: the
@@ -483,6 +530,13 @@ impl Idempotency {
         if let Some(pos) = victim {
             let evicted = self.order.remove(pos).expect("position came from order");
             self.map.remove(&evicted);
+            // The key is no longer in this process's memory, so its row
+            // is no longer this process's to manage: `persist_ledger`
+            // re-derives owned rows from memory and SKIPS disk rows for
+            // owned keys, so a key left in `owned` after eviction has
+            // its row (whoever wrote it, this server or another)
+            // silently deleted from the ledger on every later write.
+            self.owned.remove(&evicted);
         }
     }
 
@@ -516,6 +570,20 @@ impl Idempotency {
     pub(crate) fn persist_ledger(&mut self, path: &std::path::Path) -> std::io::Result<()> {
         let now = unix_now();
         let expired = |settled_at: u64| now.saturating_sub(settled_at) > PERSIST_TTL_SECS;
+        // A failed read (unreadable or corrupt file) must not turn into
+        // "every un-owned row was released": absence is only evidence
+        // when the file was read. On failure the merge below sees no
+        // disk rows, the sweep is skipped, and un-owned memory rows are
+        // written back AS THEY ARE — the pre-sweep behavior — so the
+        // pins this server loaded at startup survive the bad read
+        // instead of being silently forgotten (a forgotten pin re-opens
+        // the double-send window on the next same-key retry).
+        let read = read_ledger(path, now);
+        let read_failed = matches!(read, LedgerRead::Failed);
+        let disk = match read {
+            LedgerRead::Ready(disk) => disk,
+            LedgerRead::Failed => Idempotency::default(),
+        };
         // (settle time, victim rank, record). Rank drives the on-disk cap:
         // 0 = done (first victim), 1 = unknown, 2 = in-flight (protected,
         // mirroring `evict_if_full`).
@@ -524,7 +592,10 @@ impl Idempotency {
             .iter()
             // Un-owned rows are re-derived from the disk below: this
             // process's snapshot of them may be older than the writer's.
-            .filter(|key| self.owned.contains(*key))
+            // EXCEPT after a failed read — with no disk to re-derive
+            // from, the memory snapshot is the newest state that exists
+            // and rides back to disk verbatim.
+            .filter(|key| read_failed || self.owned.contains(*key))
             .filter_map(|key| self.map.get(key).map(|entry| (*key, entry)))
             .filter_map(|(key, entry)| {
                 let record = match &entry.state {
@@ -570,8 +641,8 @@ impl Idempotency {
             .collect();
         // Merge the on-disk ledger: rows this process does not own (and
         // has not deliberately released) are re-written verbatim.
-        // `load_ledger` already dropped expired and malformed rows.
-        let disk = load_ledger(path, now);
+        // `read_ledger` already dropped expired and malformed rows; on a
+        // failed read `disk` is empty and contributes nothing.
         for key in &disk.order {
             if self.owned.contains(key) || self.dropped.contains(key) {
                 continue;
@@ -600,14 +671,19 @@ impl Idempotency {
         // Un-owned memory rows whose durable row has vanished: the writer
         // released the key (or the ledger was wiped) — forget the stale
         // snapshot so it neither answers a later reserve nor rides back
-        // to disk on a later write.
-        let snapshot: Vec<KeyHash> = self.order.iter().copied().collect();
-        for key in snapshot {
-            if !self.owned.contains(&key)
-                && !disk.map.contains_key(&key)
-                && !self.dropped.contains(&key)
-            {
-                self.forget(&key);
+        // to disk on a later write. SKIPPED after a failed read, where
+        // "vanished" is indistinguishable from "unreadable": the rows
+        // stay in memory (answering reserves with their recorded state)
+        // and were already written back above.
+        if !read_failed {
+            let snapshot: Vec<KeyHash> = self.order.iter().copied().collect();
+            for key in snapshot {
+                if !self.owned.contains(&key)
+                    && !disk.map.contains_key(&key)
+                    && !self.dropped.contains(&key)
+                {
+                    self.forget(&key);
+                }
             }
         }
         // The on-disk set honors the same cap as memory. Oldest first
@@ -725,34 +801,51 @@ pub(crate) fn ambiguous(code: &str) -> bool {
     matches!(code, "helper_exited" | "timeout")
 }
 
-/// Reload the durable ledger. Expired entries (settle time older than
-/// [`PERSIST_TTL_SECS`]) and malformed rows are dropped; surviving entries
-/// keep their original settle times, so a reload never refreshes a dying
-/// entry into another full TTL. The newest [`MAX_KEYS`] entries survive —
-/// the same cap memory enforces. An on-disk in-flight row (its process
-/// died mid-dispatch, or another server sharing the data dir is still
-/// running) loads as an unknown pin with code [`INTERRUPTED`]: the
-/// attempt may or may not have committed, and refusing the retry is the
-/// safe answer. A missing file is the first-run case (silent); a corrupt
-/// or unreadable file is noted on stderr (the operator channel) and
-/// treated the same: the server starts unrecorded rather than refusing to
-/// serve, trading a lost replay/refusal surface for availability.
-pub(crate) fn load_ledger(path: &std::path::Path, now_secs: u64) -> Idempotency {
+/// Row semantics shared by every ledger read. Expired entries (settle
+/// time older than [`PERSIST_TTL_SECS`]) and malformed rows are dropped;
+/// surviving entries keep their original settle times, so a reload never
+/// refreshes a dying entry into another full TTL. The newest
+/// [`MAX_KEYS`] entries survive — the same cap memory enforces. An
+/// on-disk in-flight row (its process died mid-dispatch, or another
+/// server sharing the data dir is still running) loads as an unknown
+/// pin with code [`INTERRUPTED`]: the attempt may or may not have
+/// committed, and refusing the retry is the safe answer.
+///
+/// Outcome of reading the durable ledger, telling a clean read apart
+/// from a FAILED one: the difference matters because "no row for key K"
+/// is evidence of a release only when the file was actually read.
+enum LedgerRead {
+    /// The file was read (or is absent): row ABSENCE is real evidence —
+    /// a key with no durable row was released by its writer (or wiped).
+    Ready(Idempotency),
+    /// The file exists but could not be read or parsed: which rows it
+    /// holds is UNKNOWN. Callers must not treat a missing row as a
+    /// released key — un-owned memory snapshots stay put and ride back
+    /// to disk on the next successful write (the pins a server loaded
+    /// at startup must survive a transient EACCES/EIO or a truncated
+    /// file, or a same-key retry after the bad read re-sends).
+    Failed,
+}
+
+/// Read and parse the durable ledger, separating a clean (or absent)
+/// file from a failed read (see [`LedgerRead`]); row semantics are
+/// [`load_ledger`]'s.
+fn read_ledger(path: &std::path::Path, now_secs: u64) -> LedgerRead {
     let bytes = match std::fs::read(path) {
         Ok(bytes) => bytes,
         // Absent: a first run (or a purge) — not worth an operator line.
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Idempotency::default()
+            return LedgerRead::Ready(Idempotency::default())
         }
-        // Present but unreadable (permissions, I/O error): same degraded
-        // start, but the operator gets the one-line note the protocol
-        // document promises.
+        // Present but unreadable (permissions, I/O error): the operator
+        // gets the one-line note the protocol document promises; row
+        // absence below must NOT be read as a release.
         Err(error) => {
             let _ = writeln!(
                 std::io::stderr(),
-                "bite-mcp: idempotency ledger is unreadable ({error}); starting unrecorded"
+                "bite-mcp: idempotency ledger is unreadable ({error}); rows kept in memory"
             );
-            return Idempotency::default();
+            return LedgerRead::Failed;
         }
     };
     let parsed: Value = match serde_json::from_slice(&bytes) {
@@ -760,9 +853,9 @@ pub(crate) fn load_ledger(path: &std::path::Path, now_secs: u64) -> Idempotency 
         Err(error) => {
             let _ = writeln!(
                 std::io::stderr(),
-                "bite-mcp: idempotency ledger is unreadable ({error}); starting unrecorded"
+                "bite-mcp: idempotency ledger is unreadable ({error}); rows kept in memory"
             );
-            return Idempotency::default();
+            return LedgerRead::Failed;
         }
     };
     let mut rows: Vec<(u64, KeyHash, Entry)> = Vec::new();
@@ -814,7 +907,18 @@ pub(crate) fn load_ledger(path: &std::path::Path, now_secs: u64) -> Idempotency 
         idem.order.push_back(key);
         idem.map.insert(key, entry);
     }
-    idem
+    LedgerRead::Ready(idem)
+}
+
+/// Reload the durable ledger for a FRESH table (server start): a missing,
+/// unreadable, or corrupt file all yield an empty table — the degraded
+/// start is availability-first. Mid-flight readers that must NOT mistake
+/// a failed read for released keys use [`read_ledger`] instead.
+pub(crate) fn load_ledger(path: &std::path::Path, now_secs: u64) -> Idempotency {
+    match read_ledger(path, now_secs) {
+        LedgerRead::Ready(idem) => idem,
+        LedgerRead::Failed => Idempotency::default(),
+    }
 }
 
 /// One ledger row as JSON: hashed key, argument fingerprint, state kind,
@@ -1651,5 +1755,174 @@ mod tests {
         assert_eq!(unhex(&hex(&digest)), Some(digest));
         assert_eq!(unhex("zz"), None);
         assert_eq!(unhex(&"0".repeat(63)), None);
+    }
+
+    #[test]
+    fn wipe_settled_keeps_live_claims_and_drops_settled_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(LEDGER_FILE);
+
+        // A settled send, a released claim, and a LIVE claim coexist when
+        // index_wipe lands mid-send (each request runs on its own thread).
+        let mut idem = Idempotency::default();
+        idem.reserve(&kh("settled"), &fp("args"));
+        idem.settle(&kh("settled"), Settled::Done(json!({ "sent": true })));
+        idem.reserve(&kh("released"), &fp("args"));
+        idem.release(&kh("released")); // a dropped-marker is live at wipe time
+        assert!(matches!(
+            idem.reserve(&kh("live"), &fp("args")),
+            Reserved::Fresh
+        ));
+
+        idem.wipe_settled();
+
+        // The surviving pin returns to the wiped file FIRST (probing
+        // memory before the persist would insert fresh claims and ride
+        // them to disk, masking what the wipe itself wrote).
+        idem.persist_ledger(&path).unwrap();
+        let mut reloaded = load_ledger(&path, unix_now());
+        assert!(
+            matches!(
+                reloaded.reserve(&kh("live"), &fp("args")),
+                Reserved::Unknown(_)
+            ),
+            "the live claim's pin must survive the wipe on disk (as an interrupted pin)"
+        );
+        assert!(
+            matches!(
+                reloaded.reserve(&kh("settled"), &fp("args")),
+                Reserved::Fresh
+            ),
+            "the wipe must purge settled rows"
+        );
+
+        // In memory the live claim still refuses a concurrent same-key
+        // retry — this is the double-send window the wipe must not open.
+        assert!(
+            matches!(idem.reserve(&kh("live"), &fp("args")), Reserved::InFlight),
+            "a live claim must survive the wipe in memory"
+        );
+        // The stranded-settle case: the original send returns after the
+        // wipe and settles — no panic (settle used to debug_assert while
+        // the state lock was held, poisoning the mutex for the whole
+        // server), and the outcome replays afterwards.
+        idem.settle(&kh("live"), Settled::Done(json!({ "sent": true })));
+        match idem.reserve(&kh("live"), &fp("args")) {
+            Reserved::Done(v) => assert_eq!(v, json!({ "sent": true })),
+            other => panic!("the settled live claim must replay, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn eviction_releases_ownership_so_foreign_rows_survive() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(LEDGER_FILE);
+
+        // Fill the table with owned settled keys: own-0 is the oldest
+        // done row, so it is the eviction victim when one more key
+        // claims the last slot.
+        let mut a = Idempotency::default();
+        for i in 0..MAX_KEYS {
+            let key = kh(&format!("own-{i}"));
+            a.reserve(&key, &fp("args"));
+            a.settle(&key, Settled::Done(json!({ "sent": true })));
+        }
+        assert!(matches!(
+            a.reserve(&kh("extra"), &fp("args")),
+            Reserved::Fresh
+        ));
+        assert!(!a.map.contains_key(&kh("own-0")), "own-0 must be evicted");
+
+        // Another server (which never saw the eviction) records its own
+        // row for the evicted key in the shared ledger.
+        std::fs::write(
+            &path,
+            json!({
+                "v": 1,
+                "entries": [
+                    json!({
+                        "k": hex(&kh("own-0")),
+                        "f": hex(&fp("args")),
+                        "s": "unknown",
+                        "o": null,
+                        "c": "timeout",
+                        "t": unix_now(),
+                    })
+                ]
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        // This server persists: a key it evicted is no longer its to
+        // manage, so the foreign row must survive the merge (an evicted
+        // key left in `owned` would be skipped and erased).
+        a.persist_ledger(&path).unwrap();
+
+        let mut reloaded = load_ledger(&path, unix_now());
+        match reloaded.reserve(&kh("own-0"), &fp("args")) {
+            Reserved::Unknown(code) => assert_eq!(code, "timeout"),
+            other => panic!("the foreign row for an evicted key must survive, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn failed_ledger_read_preserves_unowned_pins() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(LEDGER_FILE);
+
+        // B's in-flight pin is on disk; A starts and loads it as an
+        // interrupted unknown — a snapshot A does not own.
+        let mut b = Idempotency::default();
+        assert!(matches!(
+            b.reserve(&kh("pinned"), &fp("args")),
+            Reserved::Fresh
+        ));
+        b.persist_ledger(&path).unwrap();
+        let mut a = load_ledger(&path, unix_now());
+        assert!(matches!(
+            a.reserve(&kh("pinned"), &fp("args")),
+            Reserved::Unknown(_)
+        ));
+
+        // A backup or sync tool leaves the file truncated: every later
+        // read of the ledger FAILS (does not parse).
+        std::fs::write(&path, b"{\"v\":1,\"entr").unwrap();
+
+        // The refresh path of reserve_durable must not mistake the
+        // failed read for a released key: the un-owned snapshot answers
+        // (refused), never a false Fresh that would re-send.
+        assert!(
+            matches!(
+                a.reserve_durable(&kh("pinned"), &fp("args"), &path),
+                Reserved::Unknown(_)
+            ),
+            "a failed ledger read must not unpin a loaded key"
+        );
+
+        // A settles its OWN key and persists: the pin rides back to disk
+        // as-is instead of being swept out with the bad read.
+        assert!(matches!(
+            a.reserve(&kh("own"), &fp("args")),
+            Reserved::Fresh
+        ));
+        a.settle_and_persist(&kh("own"), Settled::Done(json!({ "sent": true })), &path);
+
+        assert!(
+            matches!(a.reserve(&kh("pinned"), &fp("args")), Reserved::Unknown(_)),
+            "the un-owned pin must stay in memory across a failed read"
+        );
+        let mut reloaded = load_ledger(&path, unix_now());
+        assert!(
+            matches!(
+                reloaded.reserve(&kh("pinned"), &fp("args")),
+                Reserved::Unknown(_)
+            ),
+            "the un-owned pin must ride back to disk after a failed read"
+        );
+        assert!(matches!(
+            reloaded.reserve(&kh("own"), &fp("args")),
+            Reserved::Done(_)
+        ));
     }
 }
