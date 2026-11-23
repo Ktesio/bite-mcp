@@ -13,6 +13,11 @@ it can ship.
 
 ### Added
 
+- The 16 MiB stdio request-line rejection is now logged server-side:
+  `serve()` writes one stderr line per rejected oversized request (naming
+  the cap value only — client bytes never enter the log) alongside the
+  `-32600` reply it already sent. Until now the rejection was visible to
+  the client but silent for the operator.
 - Configuration reference: docs/configuration.md now documents every
   config.toml key (`default_calendar`, `default_mail_account`,
   `timeout_secs`, `release_repo`, `auto_refresh_hours`) with defaults, the
@@ -178,6 +183,17 @@ it can ship.
 
 ### Security
 
+- `Cargo.lock` pinned `url` 2.5.8, which carries the published RustSec
+  advisory RUSTSEC-2026-0592: a stack overflow in `Url::origin()` on
+  nested `blob:` URLs (advisory dated 2026-11-20). No workspace crate
+  calls `Url::origin()` (or constructs a `url::Url` at all) — but unlike
+  the earlier quinn pins, `url` is linked into the shipped binaries: it
+  enters the lock through the lance/datafusion stack behind
+  `bite-index`, so the unpatched code sits in the binary regardless.
+  `cargo audit` scans every lock entry and the advisory had turned the
+  audit lane red. The lock now pins url 2.5.9 (with its own
+  `form_urlencoded` 1.2.3 dependency refresh), the patched release.
+
 - `Cargo.lock` pinned `quinn-proto` 0.11.18 and `quinn-udp` 0.5.15, both
   carrying published RustSec advisories (RUSTSEC-2026-0523/0524: a
   MAX_STREAM_DATA frame can open streams beyond the stream limit and a long
@@ -290,6 +306,15 @@ it can ship.
   releases any cap-grown allocation, so steady-state memory tracks the
   small requests that follow a near-cap line instead of staying at its
   peak.
+
+### Fixed
+
+- The short live-degrade attempt for `mail_messages_search` (used while the
+  entity index is still empty) now honors a stricter `timeout_secs` ceiling:
+  its window is `min(timeout_secs, 45 s)` instead of a fixed 45 s, so an
+  operator who caps the per-request timeout below 45 s no longer sees the
+  degrade attempt outlast the ceiling `timeout_secs` is documented to
+  enforce.
 
 ## [v0.5.0] - 2026-10-22
 
