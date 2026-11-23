@@ -255,6 +255,15 @@ fn err(code: i32, message: impl Into<String>) -> RpcError {
     (code, message.into())
 }
 
+/// The empty-index live-degrade window for `mail_messages_search`: a fixed
+/// 45 s ceiling, capped by the operator's `timeout_secs` when that is
+/// tighter. `timeout_secs` is documented as THE per-request bridge timeout,
+/// so the degrade attempt must not outlast a stricter ceiling the operator
+/// set; values below 1 s floor at 1 s so the attempt always gets a window.
+fn degrade_window_secs(timeout_secs: Option<u64>) -> u64 {
+    timeout_secs.unwrap_or(45).clamp(1, 45)
+}
+
 fn handle_request(state: &ServerState, method: &str, params: &Value) -> Result<Value, RpcError> {
     match method {
         "initialize" => {
@@ -318,7 +327,9 @@ fn handle_request(state: &ServerState, method: &str, params: &Value) -> Result<V
                             .handle
                             .get()
                             .map_err(|e| err(-32000, bite_core::BiteError::from(e).render()))?;
-                        let short = std::time::Duration::from_secs(45);
+                        let short = std::time::Duration::from_secs(degrade_window_secs(
+                            bite_core::config::Config::cached().timeout_secs,
+                        ));
                         match bite_core::ops::run_with_timeout(&bridge, name, args.clone(), short) {
                             Ok(value) => {
                                 let mut value = value;
@@ -1210,5 +1221,20 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn degrade_window_respects_stricter_timeout_secs() {
+        // default (unset timeout_secs) keeps the fixed 45 s degrade ceiling
+        assert_eq!(degrade_window_secs(None), 45);
+        // a stricter operator ceiling wins: the degrade attempt must not
+        // outlast a timeout_secs set below the fixed window
+        assert_eq!(degrade_window_secs(Some(10)), 10);
+        assert_eq!(degrade_window_secs(Some(1)), 1);
+        // a looser ceiling never widens the fixed 45 s window
+        assert_eq!(degrade_window_secs(Some(300)), 45);
+        assert_eq!(degrade_window_secs(Some(u64::MAX)), 45);
+        // degenerate values floor at 1 s so the attempt always gets a window
+        assert_eq!(degrade_window_secs(Some(0)), 1);
     }
 }
