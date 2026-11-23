@@ -171,6 +171,17 @@ it can ship.
 
 ### Security
 
+- `Cargo.lock` pinned `url` 2.5.8, which carries the published RustSec
+  advisory RUSTSEC-2026-0592: a stack overflow in `Url::origin()` on
+  nested `blob:` URLs (advisory dated 2026-11-20). No workspace crate
+  calls `Url::origin()` (or constructs a `url::Url` at all) — but unlike
+  the earlier quinn pins, `url` is linked into the shipped binaries: it
+  enters the lock through the lance/datafusion stack behind
+  `bite-index`, so the unpatched code sits in the binary regardless.
+  `cargo audit` scans every lock entry and the advisory had turned the
+  audit lane red. The lock now pins url 2.5.9 (with its own
+  `form_urlencoded` 1.2.3 dependency refresh), the patched release.
+
 - `Cargo.lock` pinned `quinn-proto` 0.11.18 and `quinn-udp` 0.5.15, both
   carrying published RustSec advisories (RUSTSEC-2026-0523/0524: a
   MAX_STREAM_DATA frame can open streams beyond the stream limit and a long
