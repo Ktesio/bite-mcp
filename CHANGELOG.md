@@ -295,6 +295,15 @@ it can ship.
   small requests that follow a near-cap line instead of staying at its
   peak.
 
+### Fixed
+
+- The short live-degrade attempt for `mail_messages_search` (used while the
+  entity index is still empty) now honors a stricter `timeout_secs` ceiling:
+  its window is `min(timeout_secs, 45 s)` instead of a fixed 45 s, so an
+  operator who caps the per-request timeout below 45 s no longer sees the
+  degrade attempt outlast the ceiling `timeout_secs` is documented to
+  enforce.
+
 ## [v0.5.0] - 2026-10-22
 
 This release adds scoped, durable index purges (index_forget MCP tool and bite index forget CLI), an opt-in skip of the exact-total count scan, and safer helper-death replay semantics. It also enforces data-dir privacy at startup, resolves kill from absolute paths, dispatches requests concurrently, and updates dependencies including rustls-webpki for RUSTSEC-2026-0382.
