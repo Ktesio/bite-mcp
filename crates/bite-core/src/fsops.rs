@@ -106,6 +106,16 @@ pub fn enforce_private_data_dir(data_dir: &Path) -> io::Result<()> {
     ensure_private_dir(data_dir)?;
     tighten_file(&data_dir.join("config.toml")).ok();
     tighten_file(&data_dir.join(".writer.lock")).ok();
+    // Root-level state files. crawl-state.json is written by the Swift
+    // helper in the crawl-first lifecycle (FileManager defaults are
+    // world-readable until this sweep runs); purge-scopes.json and
+    // idempotency-ledger.json are created 0600 by `write_private` but can
+    // drift like any restored backup or moved dir. `tighten_file` is a
+    // no-op while a file does not exist (fresh installs, and the ledger
+    // before its introducing change lands).
+    tighten_file(&data_dir.join("crawl-state.json")).ok();
+    tighten_file(&data_dir.join("purge-scopes.json")).ok();
+    tighten_file(&data_dir.join("idempotency-ledger.json")).ok();
     tighten_dir(&data_dir.join("index.lance")).ok();
     // batches/ itself (the old code tightened only its files — a dir created
     // by the Swift crawler with FileManager defaults stayed 0755), every
@@ -248,6 +258,18 @@ mod tests {
         std::fs::write(quarantine.join("crawl-0-9.jsonl"), b"bad").unwrap();
         std::fs::write(dir.join("config.toml"), b"x=1").unwrap();
         std::fs::create_dir(dir.join("index.lance")).unwrap();
+        // Root-level state files, explicitly loosened to 0644 so the
+        // sweep's fix is non-vacuous even under a restrictive umask.
+        std::fs::write(dir.join("crawl-state.json"), b"{}").unwrap();
+        std::fs::write(dir.join("purge-scopes.json"), b"{}").unwrap();
+        std::fs::write(dir.join("idempotency-ledger.json"), b"{}").unwrap();
+        for name in [
+            "crawl-state.json",
+            "purge-scopes.json",
+            "idempotency-ledger.json",
+        ] {
+            std::fs::set_permissions(dir.join(name), Permissions::from_mode(0o644)).unwrap();
+        }
         // Permissions/PermissionsExt come from the parent module via super::*
         let loosen = |p: &std::path::Path| {
             std::fs::set_permissions(p, Permissions::from_mode(0o755)).unwrap();
@@ -271,6 +293,21 @@ mod tests {
         );
         assert_eq!(mode(&dir.join("config.toml")), 0o600, "config.toml");
         assert_eq!(mode(&dir.join("index.lance")), 0o700, "index.lance dir");
+        assert_eq!(
+            mode(&dir.join("crawl-state.json")),
+            0o600,
+            "crawl-state.json"
+        );
+        assert_eq!(
+            mode(&dir.join("purge-scopes.json")),
+            0o600,
+            "purge-scopes.json"
+        );
+        assert_eq!(
+            mode(&dir.join("idempotency-ledger.json")),
+            0o600,
+            "idempotency-ledger.json"
+        );
     }
 
     #[test]

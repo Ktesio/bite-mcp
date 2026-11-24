@@ -92,6 +92,17 @@ it can ship.
 
 ### Fixed
 
+- The privacy sweep missed the data dir's root-level state files:
+  `crawl-state.json` (written by the Swift helper with FileManager's
+  world-readable defaults in a crawl-first lifecycle) and
+  `purge-scopes.json` never appeared in `enforce_private_data_dir`'s
+  fixed list, so a loose file stayed loose until something else
+  rewrote it — the sweep's retroactive-repair promise did not cover
+  them. Both are now tightened to 0600 alongside `config.toml`, and
+  `idempotency-ledger.json` (the durable idempotency-key ledger) is
+  swept too, so the file is covered from the moment its introducing
+  change lands rather than after a later fix. Missing files remain a
+  no-op, keeping fresh installs and the pre-ledger tree quiet.
 - The `msrv` CI lane never tested the declared floor: the rust-toolchain
   action carried no `toolchain` input and the repo has no
   `rust-toolchain.toml`, so the lane resolved `stable` — which is how the
