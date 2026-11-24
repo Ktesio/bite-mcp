@@ -206,7 +206,9 @@ and writes them back (one note per failure streak), while a file that
 fails to READ (permissions, I/O error) refuses the next write and
 leaves the bytes untouched — the unreadable file may be a valid ledger
 this process cannot see, and neither mode ever treats a missing row as
-a released key. An in-server `index_wipe` keeps the claims of sends
+a released key. The refused write prints nothing itself: no write was
+attempted, so the streak note is the only operator line. An in-server
+`index_wipe` keeps the claims of sends
 still in flight: their pins are re-written to the wiped file and their
 outcomes are recorded when they settle.
 

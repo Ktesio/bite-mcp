@@ -294,7 +294,9 @@ impl Idempotency {
         if let Some(verdict) = self.merge_disk_row(key, fingerprint, path) {
             return verdict;
         }
-        if let Err(error) = self.persist_ledger(path) {
+        // A refused-on-read persist is silent here (see `PersistError`):
+        // the unreadable streak note is the operator line for that case.
+        if let Err(PersistError::Write(error)) = self.persist_ledger(path) {
             let _ = writeln!(
                 std::io::stderr(),
                 "bite-mcp: idempotency ledger write failed ({error}); \
@@ -450,7 +452,9 @@ impl Idempotency {
         path: &std::path::Path,
     ) {
         self.settle(key, outcome);
-        if let Err(error) = self.persist_ledger(path) {
+        // Silent on a refused-on-read persist (`PersistError`): the
+        // unreadable streak note covers the operator channel.
+        if let Err(PersistError::Write(error)) = self.persist_ledger(path) {
             let _ = writeln!(
                 std::io::stderr(),
                 "bite-mcp: idempotency ledger write failed ({error}); \
@@ -518,7 +522,9 @@ impl Idempotency {
     /// never sent under.
     pub(crate) fn release_and_persist(&mut self, key: &KeyHash, path: &std::path::Path) {
         self.release(key);
-        if let Err(error) = self.persist_ledger(path) {
+        // Silent on a refused-on-read persist (`PersistError`): the
+        // unreadable streak note covers the operator channel.
+        if let Err(PersistError::Write(error)) = self.persist_ledger(path) {
             let _ = writeln!(
                 std::io::stderr(),
                 "bite-mcp: idempotency ledger write failed ({error}); the \
@@ -600,7 +606,7 @@ impl Idempotency {
     /// The residual race (two processes writing in the same instant, or
     /// claiming the same free key concurrently) is inherent without an
     /// OS-level lock and documented in docs/protocol.md.
-    pub(crate) fn persist_ledger(&mut self, path: &std::path::Path) -> std::io::Result<()> {
+    pub(crate) fn persist_ledger(&mut self, path: &std::path::Path) -> Result<(), PersistError> {
         self.persist_ledger_with(path, false)
     }
 
@@ -617,7 +623,7 @@ impl Idempotency {
     pub(crate) fn persist_ledger_discarding_disk(
         &mut self,
         path: &std::path::Path,
-    ) -> std::io::Result<()> {
+    ) -> Result<(), PersistError> {
         self.persist_ledger_with(path, true)
     }
 
@@ -625,7 +631,7 @@ impl Idempotency {
         &mut self,
         path: &std::path::Path,
         discard_disk: bool,
-    ) -> std::io::Result<()> {
+    ) -> Result<(), PersistError> {
         let now = unix_now();
         let expired = |settled_at: u64| now.saturating_sub(settled_at) > PERSIST_TTL_SECS;
         // A failed read (unreadable or corrupt file) must not turn into
@@ -654,11 +660,19 @@ impl Idempotency {
                 // from memory: the unreadable bytes are probably still a
                 // valid ledger holding rows this process never loaded
                 // (another server's pins), and write_private's temp-file
-                // rename would erase them. Refuse the write and hand the
-                // error to the caller's best-effort note; the rows stay
-                // in memory either way. Only an unparseable file — whose
-                // bytes are unrecoverable — is safe to replace.
-                LedgerRead::Io(error) => return Err(error),
+                // rename would erase them. Refuse the write and mark the
+                // refusal DISTINCT from a write failure so the
+                // best-effort callers stay silent — the unreadable note
+                // below is the one operator line this streak gets, even
+                // when this persist is the streak's first failed read
+                // (a settle whose reserve predated the file turning bad
+                // never passes through `merge_disk_row`). Only an
+                // unparseable file — whose bytes are unrecoverable — is
+                // safe to replace.
+                LedgerRead::Io(error) => {
+                    self.note_unreadable_streak(&error.to_string());
+                    return Err(PersistError::RefusedOnRead);
+                }
             }
         };
         // (settle time, victim rank, record). Rank drives the on-disk cap:
@@ -779,7 +793,8 @@ impl Idempotency {
         }
         let entries: Vec<Value> = rows.into_iter().map(|(_, _, record)| record).collect();
         let doc = serde_json::json!({ "v": 1, "entries": entries });
-        bite_core::fsops::write_private(path, doc.to_string().as_bytes())?;
+        bite_core::fsops::write_private(path, doc.to_string().as_bytes())
+            .map_err(PersistError::Write)?;
         self.dropped.clear();
         Ok(())
     }
@@ -876,6 +891,28 @@ fn canonical_json(value: &Value, push: &mut impl FnMut(&str)) {
 /// errors provably did not send; both leave the key free for a retry.
 pub(crate) fn ambiguous(code: &str) -> bool {
     matches!(code, "helper_exited" | "timeout")
+}
+
+/// Why a ledger persist did not complete. Splitting the refusal from
+/// the failure keeps the operator channel honest: a write that was
+/// never attempted because the file could not be READ is not a write
+/// failure, and the best-effort callers ([`Idempotency::reserve_durable`],
+/// [`Idempotency::settle_and_persist`],
+/// [`Idempotency::release_and_persist`]) stay silent on it — the
+/// unreadable-note streak already told the operator, and repeating a
+/// "write failed" line per keyed call misdescribes what happened.
+#[derive(Debug)]
+pub(crate) enum PersistError {
+    /// The write was REFUSED because reading the on-disk ledger failed
+    /// with an I/O error ([`LedgerRead::Io`]): the file probably still
+    /// holds valid rows this process never loaded, and the temp-file
+    /// rename would erase them. A bare marker — the streak note (fired
+    /// inside the persist, before the refusal is returned) is the
+    /// operator channel for the underlying error, so best-effort
+    /// callers have nothing left to report and stay silent.
+    RefusedOnRead,
+    /// The write itself failed after a clean read; callers report it.
+    Write(std::io::Error),
 }
 
 /// Row semantics shared by every ledger read. Expired entries (settle
@@ -1972,6 +2009,14 @@ mod tests {
         // read fails with EACCES — not NotFound — while write_private's
         // temp-file + rename would still succeed and clobber the file.
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        // Root (CAP_DAC_OVERRIDE) ignores mode bits, so the chmod may
+        // not actually block reads (root Docker/dev containers). Probe
+        // and skip rather than fail on such hosts.
+        if std::fs::read(&path).is_ok() {
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+            eprintln!("skip: chmod 000 does not block reads for this user");
+            return;
+        }
 
         let mut idem = Idempotency::default();
         assert!(matches!(
@@ -1980,8 +2025,9 @@ mod tests {
         ));
         let verdict = idem.persist_ledger(&path);
         assert!(
-            verdict.is_err(),
-            "a persist that cannot READ the file must refuse to write it"
+            matches!(verdict, Err(PersistError::RefusedOnRead)),
+            "a persist that cannot READ the file must refuse to write it, \
+             and report the refusal distinctly from a write failure"
         );
         // Restore readability: the foreign row must be untouched — a
         // rewrite from memory would have erased it (and with it the
@@ -2015,6 +2061,12 @@ mod tests {
         // file is a one-shot streak: the first persist rewrites it.)
         std::fs::write(&path, b"{\"v\":1,\"entries\":[]}").unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        // Root guard, as above: skip hosts where chmod 000 still reads.
+        if std::fs::read(&path).is_ok() {
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+            eprintln!("skip: chmod 000 does not block reads for this user");
+            return;
+        }
         let mut idem = Idempotency::default();
         // Each reserve_durable reads the ledger up to twice (merge,
         // then the claim persist) — the streak flag must collapse the
@@ -2039,6 +2091,52 @@ mod tests {
             !idem.noted_unreadable,
             "a successful read must clear the streak note"
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn refused_on_read_persist_notes_the_streak_itself() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(LEDGER_FILE);
+        // A ledger that turns I/O-unreadable BETWEEN the reserve and the
+        // settle: the settle path never passes through `merge_disk_row`,
+        // so the persist's own read is the failure streak's FIRST — it
+        // must arm the unreadable note itself (the one operator line)
+        // and return the refusal marker, which `settle_and_persist`
+        // then treats as silence instead of a "write failed" note.
+        std::fs::write(&path, b"{\"v\":1,\"entries\":[]}").unwrap();
+        let mut idem = Idempotency::default();
+        idem.reserve(&kh("late"), &fp("args")); // memory claim, no disk read
+        assert!(
+            !idem.noted_unreadable,
+            "precondition: no ledger read has failed yet"
+        );
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read(&path).is_ok() {
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+            eprintln!("skip: chmod 000 does not block reads for this user");
+            return;
+        }
+        // Direct variant pin: the refusal is distinguishable from a
+        // write failure.
+        assert!(matches!(
+            idem.persist_ledger(&path),
+            Err(PersistError::RefusedOnRead)
+        ));
+        assert!(
+            idem.noted_unreadable,
+            "the refused persist must arm the unreadable streak itself, \
+             covering settle paths whose reserve predated the bad file"
+        );
+        // The best-effort caller stays silent on the refusal: the state
+        // it guards (outcome recorded in memory) is unchanged either
+        // way, pinned by the map still holding the settled row.
+        idem.settle(&kh("late"), Settled::Done(json!({ "sent": true })));
+        assert!(matches!(
+            idem.reserve(&kh("late"), &fp("args")),
+            Reserved::Done(_)
+        ));
     }
 
     #[test]

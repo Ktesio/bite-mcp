@@ -389,7 +389,9 @@ fn handle_request(state: &ServerState, method: &str, params: &Value) -> Result<V
                     // restart running servers.)
                     if let Ok(mut idem) = state.idempotency.lock() {
                         idem.wipe_settled();
-                        if let Err(error) =
+                        // The discarding variant never reads the disk, so
+                        // every failure here is a genuine write failure.
+                        if let Err(idempotency::PersistError::Write(error)) =
                             idem.persist_ledger_discarding_disk(&idempotency::ledger_path())
                         {
                             let _ = writeln!(

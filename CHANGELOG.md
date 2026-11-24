@@ -31,7 +31,8 @@ it can ship.
   the process's rows in memory and writes them back (one note per
   failure streak), while one that fails to read (permissions, I/O
   error) refuses the write instead of replacing a file it could not
-  see. The stored outcome of a completed send carries
+  see — silently, so the streak note stays the only operator line for
+  a bad read. The stored outcome of a completed send carries
   its subject and recipients: documented in PRIVACY.md and removed by
   `bite index wipe`. The smoke harness now runs every server process in an
   isolated data dir, so keyed tests never touch a developer's real ledger.
