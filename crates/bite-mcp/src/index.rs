@@ -2457,7 +2457,10 @@ mod tests {
         // (`refresh_fts_if_crawl_settled`) must decide on the FRESH read —
         // caching there would write a fold marker for state text it never
         // saw. Swapping either side compiles and passes every behavioral
-        // test, but must fail here.
+        // test, but must fail here. The fold must also SEED the gate's
+        // cache with the text it read (so the gate agrees with the fold
+        // instead of re-taking the writer lock for up to one TTL), and
+        // `wipe()` must reset the cache with the file it deletes.
         let src = include_str!("index.rs");
 
         let body = |marker: &str, known_line: &str| {
@@ -2492,11 +2495,25 @@ mod tests {
             !fold.contains("crawl_state_raw_cached()"),
             "the writer-side fold must not consult the TTL cache"
         );
+        assert!(
+            fold.contains("seed_crawl_state_cache("),
+            "the fold must seed the gate's cache with the text it just read"
+        );
 
         let gate = body("fn fts_refresh_pending()", "fts_refresh_due");
         assert!(
             gate.contains("crawl_state_raw_cached()"),
             "the read-only gate should ride the TTL-cached read"
+        );
+
+        // and the wipe must drop the cached verdict along with crawl-state.json
+        // itself: a wipe that deleted the file but left the cache serving the
+        // dead crawl's state would keep the gate deciding on text from a run
+        // that no longer exists — for up to one TTL after every wipe.
+        let wipe = body("pub fn wipe(", "crawl-state.json");
+        assert!(
+            wipe.contains("CRAWL_STATE_CACHE.lock().unwrap() = None"),
+            "wipe must drop the gate's cached crawl-state verdict"
         );
     }
 
