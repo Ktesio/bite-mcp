@@ -2495,9 +2495,19 @@ mod tests {
             !fold.contains("crawl_state_raw_cached()"),
             "the writer-side fold must not consult the TTL cache"
         );
+        // pin both seed sites separately: the fresh-text seed is the
+        // regression this guards. A bare `seed_crawl_state_cache(` is
+        // satisfied by the absent-file branch's `None` call alone, so a
+        // refactor that turns the fresh path back into `crawl_state_of`
+        // would pass the behavioral tests and this tripwire while the
+        // gate again serves pre-fold text for up to one TTL.
         assert!(
-            fold.contains("seed_crawl_state_cache("),
-            "the fold must seed the gate's cache with the text it just read"
+            fold.contains("seed_crawl_state_cache(Some(raw))"),
+            "the fold must seed the gate's cache with the fresh text it just read"
+        );
+        assert!(
+            fold.contains("seed_crawl_state_cache(None)"),
+            "the absent-file branch must seed the None verdict too"
         );
 
         let gate = body("fn fts_refresh_pending()", "fts_refresh_due");
@@ -2510,7 +2520,10 @@ mod tests {
         // itself: a wipe that deleted the file but left the cache serving the
         // dead crawl's state would keep the gate deciding on text from a run
         // that no longer exists — for up to one TTL after every wipe.
-        let wipe = body("pub fn wipe(", "crawl-state.json");
+        // `join("crawl-state.json")` anchors the slice on the real
+        // remove_file call — the bare file name also appears in the
+        // comment above it, which would satisfy the guard on its own.
+        let wipe = body("pub fn wipe(", "join(\"crawl-state.json\")");
         assert!(
             wipe.contains("CRAWL_STATE_CACHE.lock().unwrap() = None"),
             "wipe must drop the gate's cached crawl-state verdict"
