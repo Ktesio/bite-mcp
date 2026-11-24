@@ -2129,12 +2129,220 @@ mod tests {
             "the refused persist must arm the unreadable streak itself, \
              covering settle paths whose reserve predated the bad file"
         );
-        // The best-effort caller stays silent on the refusal: the state
-        // it guards (outcome recorded in memory) is unchanged either
-        // way, pinned by the map still holding the settled row.
+        // The in-memory state the refusal guards is unchanged: the
+        // settled row survives it. The best-effort callers' SILENCE on
+        // the refusal — and their operator notes on a genuine write
+        // failure — are pinned by stderr capture in
+        // `refused_persist_keeps_best_effort_callers_silent` and
+        // `write_failed_persist_notes_each_best_effort_caller` (calling
+        // the wrappers is the point: this block uses raw `settle`, so
+        // it cannot see the swallow either way).
         idem.settle(&kh("late"), Settled::Done(json!({ "sent": true })));
         assert!(matches!(
             idem.reserve(&kh("late"), &fp("args")),
+            Reserved::Done(_)
+        ));
+    }
+
+    /// In-process fd-2 capture (dup2 swap) for pinning the idempotency
+    /// operator notes: `writeln!(std::io::stderr(), …)` is a RAW fd-2
+    /// write that libtest's macro-level capture never intercepts (the
+    /// sibling tests' skip-notes print under a plain `cargo test`, which
+    /// is the proof), so swapping fd 2 for a pipe is the one honest
+    /// observer. Tests run as threads: a concurrent test's raw stderr
+    /// line may land in the pipe too, so assertions must be CONTAINS
+    /// (our note) / NOT-CONTAINS (forbidden wording) — never exact
+    /// full-output equality. Dropping the guard restores fd 2 even on
+    /// panic, so harness output is never lost.
+    mod stderr_capture {
+        use std::fs::File;
+        use std::io::Read;
+        use std::os::fd::{AsRawFd, FromRawFd};
+
+        pub struct Capture {
+            /// dup of the ORIGINAL fd 2 — the restore source.
+            saved: File,
+            /// pipe read end; drained by [`Capture::captured`].
+            read_end: File,
+            /// pipe write end — fd 2's twin; closing it (after the fd-2
+            /// restore) is what gives the blocking read its EOF. `Option`
+            /// so `captured` can take it out despite Capture's own Drop.
+            write_end: Option<File>,
+        }
+
+        impl Capture {
+            pub fn install() -> std::io::Result<Capture> {
+                let mut fds = [0i32; 2];
+                // SAFETY: `fds` is a valid, writable two-slot buffer for
+                // libc's out-params; on success both slots hold fds this
+                // process owns from here on.
+                if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                // SAFETY: libc handed us each fd exactly once; the Files
+                // take sole ownership (close on drop).
+                let read_end = unsafe { File::from_raw_fd(fds[0]) };
+                let write_end = unsafe { File::from_raw_fd(fds[1]) };
+                // SAFETY: fd 2 is open for the process lifetime; -1 is
+                // the checked failure path.
+                let saved_fd = unsafe { libc::dup(2) };
+                if saved_fd < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                let saved = unsafe { File::from_raw_fd(saved_fd) };
+                // SAFETY: dup2 onto fd 2, a valid open descriptor; the
+                // original is preserved in `saved` for the restore.
+                // NOTE: dup2 returns the NEW fd (2) on success — compare
+                // against -1, not 0 — and on failure fd 2 is left
+                // untouched, so no restore is owed on this error path.
+                if unsafe { libc::dup2(write_end.as_raw_fd(), 2) } < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(Capture {
+                    saved,
+                    read_end,
+                    write_end: Some(write_end),
+                })
+            }
+
+            /// Restore fd 2, close the pipe's write side, and drain the
+            /// captured bytes. Restoring FIRST matters: fd 2 itself still
+            /// held the write end open, and the read below blocks until
+            /// every writer is gone.
+            pub fn captured(mut self) -> std::io::Result<String> {
+                // SAFETY: `saved` was dup'd from fd 2 at install and is
+                // open until this Capture drops.
+                unsafe { libc::dup2(self.saved.as_raw_fd(), 2) };
+                drop(self.write_end.take());
+                let mut captured = String::new();
+                self.read_end.read_to_string(&mut captured)?;
+                Ok(captured)
+            }
+        }
+
+        impl Drop for Capture {
+            fn drop(&mut self) {
+                // SAFETY: same invariants as install; the repeat restore
+                // is idempotent on the happy path (`captured` already did
+                // it), and a failed one only misroutes later test notes —
+                // nothing is left to do at Drop time.
+                unsafe { libc::dup2(self.saved.as_raw_fd(), 2) };
+            }
+        }
+    }
+
+    /// The three best-effort persist wrappers must SWALLOW a
+    /// refused-on-read persist: their write-failed note stays silent
+    /// (the once-per-streak unreadable note is the operator line for
+    /// that failure class). Reverting any wrapper to match ANY
+    /// `PersistError` — or to note the refusal itself — turns stderr
+    /// loud and fails the NOT-CONTAINS pin below; a revert that drops
+    /// the note entirely is caught by the sibling write-failure test.
+    #[test]
+    #[cfg(unix)]
+    fn refused_persist_keeps_best_effort_callers_silent() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(LEDGER_FILE);
+        std::fs::write(&path, b"{\"v\":1,\"entries\":[]}").unwrap();
+        let mut idem = Idempotency::default();
+        idem.reserve(&kh("quiet-a"), &fp("args")); // memory claims, no reads yet
+        idem.reserve(&kh("quiet-b"), &fp("args"));
+        // The ledger turns I/O-unreadable AFTER the claims: every wrapper
+        // call below reads it, and every persist refuses.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        // Root guard, as in the sibling tests: chmod must actually block.
+        if std::fs::read(&path).is_ok() {
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+            eprintln!("skip: chmod 000 does not block reads for this user");
+            return;
+        }
+        let capture = stderr_capture::Capture::install().unwrap();
+        idem.reserve_durable(&kh("quiet-c"), &fp("args"), &path);
+        idem.settle_and_persist(
+            &kh("quiet-a"),
+            Settled::Done(json!({ "sent": true })),
+            &path,
+        );
+        idem.release_and_persist(&kh("quiet-b"), &path);
+        let captured = capture.captured().unwrap();
+        assert!(
+            captured.contains("idempotency ledger is unreadable"),
+            "the streak note must fire for the failure streak, got: {captured}"
+        );
+        assert!(
+            !captured.contains("idempotency ledger write failed"),
+            "the best-effort callers must stay silent on a REFUSED persist \
+             (the unreadable streak note is that class's one operator line), \
+             got: {captured}"
+        );
+        // And the in-memory truth the wrappers guard is intact:
+        assert!(matches!(
+            idem.reserve(&kh("quiet-c"), &fp("args")),
+            Reserved::InFlight
+        ));
+        assert!(matches!(
+            idem.reserve(&kh("quiet-a"), &fp("args")),
+            Reserved::Done(_)
+        ));
+    }
+
+    /// The write-failure side of the same contract: each best-effort
+    /// wrapper notes its ONE operator line on stderr when the persist
+    /// genuinely fails to write. The three wordings are distinct on
+    /// purpose — each is asserted by name, so reverting any single
+    /// wrapper's note (or its whole best-effort arm) fails by name.
+    #[test]
+    #[cfg(unix)]
+    fn write_failed_persist_notes_each_best_effort_caller() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(LEDGER_FILE);
+        std::fs::write(&path, b"{\"v\":1,\"entries\":[]}").unwrap();
+        let mut idem = Idempotency::default();
+        idem.reserve(&kh("wr-a"), &fp("args"));
+        idem.reserve(&kh("wr-b"), &fp("args"));
+        // Readable ledger in a READ-ONLY directory: reads and merges
+        // succeed, write_private's temp-file creation fails with EACCES —
+        // `PersistError::Write`, exactly the arm the wrappers note.
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
+        // Root guard (CAP_DAC_OVERRIDE ignores directory mode bits):
+        // writes must actually be blocked, else skip.
+        if std::fs::write(dir.path().join(".probe"), b"").is_ok() {
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+            eprintln!("skip: read-only directory does not block writes for this user");
+            return;
+        }
+        let capture = stderr_capture::Capture::install().unwrap();
+        let verdict = idem.reserve_durable(&kh("wr-c"), &fp("args"), &path);
+        idem.settle_and_persist(&kh("wr-a"), Settled::Done(json!({ "sent": true })), &path);
+        idem.release_and_persist(&kh("wr-b"), &path);
+        let captured = capture.captured().unwrap();
+        // Writable again before TempDir's Drop tries to clean up.
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(
+            matches!(verdict, Reserved::Fresh),
+            "a failed persist must not turn the claim itself into a refusal"
+        );
+        assert!(
+            captured.contains("the in-flight pin is memory-only for this process"),
+            "reserve_durable's note must reach stderr, got: {captured}"
+        );
+        assert!(
+            captured.contains("outcomes stay in memory for this process"),
+            "settle_and_persist's note must reach stderr, got: {captured}"
+        );
+        assert!(
+            captured.contains("the released key stays pinned on disk until a later write"),
+            "release_and_persist's note must reach stderr, got: {captured}"
+        );
+        assert!(
+            !captured.contains("idempotency ledger is unreadable"),
+            "a write failure must NOT fire the unreadable streak note, got: {captured}"
+        );
+        // The in-memory truth survives the failed persist:
+        assert!(matches!(
+            idem.reserve(&kh("wr-a"), &fp("args")),
             Reserved::Done(_)
         ));
     }
