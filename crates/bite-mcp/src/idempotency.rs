@@ -1099,6 +1099,27 @@ fn unhex(text: &str) -> Option<[u8; 32]> {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::sync::{Mutex, MutexGuard};
+
+    /// Serializes every test that either swaps the process-wide fd 2
+    /// (the two `stderr_capture` tests) or can write a raw-stderr
+    /// operator note (the streak, startup, and best-effort wrapper
+    /// notes). Without the lock, two capture tests overlapping under
+    /// libtest's parallel threads interleave their dup2 swaps — each
+    /// capture's blocking read then waits on the other's write end and
+    /// can hang the test binary — and a sibling test's raw note can
+    /// land inside another test's captured pipe, breaking its
+    /// NOT-CONTAINS pins. Held for the whole capture window (install
+    /// through asserts) / whole note-emitting test body.
+    static STDERR_NOTE_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Poison-tolerant acquisition: a prior holder's panic must not
+    /// cascade into every later stderr-pinning test.
+    fn lock_stderr_notes() -> MutexGuard<'static, ()> {
+        STDERR_NOTE_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
 
     /// Test fingerprints: the real `fingerprint()` over a JSON scalar of
     /// the label — production always digests the stripped-argument object,
@@ -1436,6 +1457,9 @@ mod tests {
 
     #[test]
     fn corrupt_or_absent_ledger_starts_unrecorded() {
+        // Startup-note emitter (the corrupt arm writes the raw
+        // `load_ledger` note): serialized against fd-2 captures.
+        let _stderr_notes = lock_stderr_notes();
         let dir = tempfile::tempdir().unwrap();
         // Absent: the first-run case.
         let mut missing = load_ledger(&dir.path().join(LEDGER_FILE), unix_now());
@@ -1992,6 +2016,8 @@ mod tests {
     #[cfg(unix)]
     fn persist_after_io_read_error_refuses_the_write() {
         use std::os::unix::fs::PermissionsExt;
+        // Streak-note emitter: serialized against fd-2 captures.
+        let _stderr_notes = lock_stderr_notes();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(LEDGER_FILE);
         let now = unix_now();
@@ -2052,6 +2078,9 @@ mod tests {
     #[cfg(unix)]
     fn unreadable_note_fires_once_per_failure_streak() {
         use std::os::unix::fs::PermissionsExt;
+        // Streak-note emitter (this test's whole subject): serialized
+        // against fd-2 captures.
+        let _stderr_notes = lock_stderr_notes();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(LEDGER_FILE);
         // A valid ledger made I/O-unreadable (chmod 000): every read
@@ -2097,6 +2126,8 @@ mod tests {
     #[cfg(unix)]
     fn refused_on_read_persist_notes_the_streak_itself() {
         use std::os::unix::fs::PermissionsExt;
+        // Streak-note emitter: serialized against fd-2 captures.
+        let _stderr_notes = lock_stderr_notes();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(LEDGER_FILE);
         // A ledger that turns I/O-unreadable BETWEEN the reserve and the
@@ -2242,6 +2273,10 @@ mod tests {
     #[cfg(unix)]
     fn refused_persist_keeps_best_effort_callers_silent() {
         use std::os::unix::fs::PermissionsExt;
+        // fd-2 capture: the lock spans install → drive → captured →
+        // asserts, so no second capture (or raw-note sibling) can
+        // interleave with this one's process-wide fd-2 swap.
+        let _stderr_notes = lock_stderr_notes();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(LEDGER_FILE);
         std::fs::write(&path, b"{\"v\":1,\"entries\":[]}").unwrap();
@@ -2296,6 +2331,10 @@ mod tests {
     #[cfg(unix)]
     fn write_failed_persist_notes_each_best_effort_caller() {
         use std::os::unix::fs::PermissionsExt;
+        // fd-2 capture: the lock spans install → drive → captured →
+        // asserts, so no second capture (or raw-note sibling) can
+        // interleave with this one's process-wide fd-2 swap.
+        let _stderr_notes = lock_stderr_notes();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(LEDGER_FILE);
         std::fs::write(&path, b"{\"v\":1,\"entries\":[]}").unwrap();
@@ -2402,6 +2441,11 @@ mod tests {
 
     #[test]
     fn failed_ledger_read_preserves_unowned_pins() {
+        // Streak-note emitter: the truncated-ledger reads note the
+        // unreadable streak (`merge_disk_row`'s Unparseable arm and the
+        // persist's own Unparseable arm) — serialized against fd-2
+        // captures.
+        let _stderr_notes = lock_stderr_notes();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(LEDGER_FILE);
 
