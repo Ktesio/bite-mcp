@@ -210,13 +210,11 @@ pub fn ingest_staged(
     // already emitted or superseded and leaves only dead data behind —
     // nothing still needed is overwritten.
     let mut unique = all_records;
-    let mut slot = 0usize;
-    for &src in &sources {
+    for (slot, &src) in sources.iter().enumerate() {
         debug_assert!(src >= slot, "survivor before its first-seen slot");
         if src != slot {
             unique.swap(slot, src);
         }
-        slot += 1;
     }
     unique.truncate(sources.len());
     if dedup_dropped > 0 {
