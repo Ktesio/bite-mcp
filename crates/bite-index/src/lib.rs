@@ -486,9 +486,10 @@ mod tests {
 
     #[test]
     fn dedup_keep_last_reads_single_keys_after_earlier_swaps() {
-        // `x` fills slots 0 and 1 by swaps before the single `y` at index
-        // 3 is read for slot 2, and the first swap moves a dead `x` into
-        // index 2 — slot 2 must read its own source, never the slot.
+        // Sources are [2, 3] — two keys, two slots. Slot 0 is filled by
+        // swap(0, 2), which leaves a dead `x` at index 2; the single `y`
+        // at index 3 is then read for slot 1 and must come from its
+        // source, not the slot (index 1 still holds `x middle`).
         let (survivors, dropped) = dedup_keep_last(vec![
             mail_record("x", Some("Work"), "x first"),
             mail_record("x", Some("Work"), "x middle"),
