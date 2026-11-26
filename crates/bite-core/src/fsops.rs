@@ -106,13 +106,15 @@ pub fn enforce_private_data_dir(data_dir: &Path) -> io::Result<()> {
     ensure_private_dir(data_dir)?;
     tighten_file(&data_dir.join("config.toml")).ok();
     tighten_file(&data_dir.join(".writer.lock")).ok();
-    // Root-level state files. crawl-state.json is written by the Swift
-    // helper in the crawl-first lifecycle (FileManager defaults are
-    // world-readable until this sweep runs); purge-scopes.json and
-    // idempotency-ledger.json are created 0600 by `write_private` but can
-    // drift like any restored backup or moved dir. `tighten_file` is a
-    // no-op while a file does not exist (fresh installs, and the ledger
-    // before its introducing change lands).
+    // Root-level state files. crawl-state.json is written 0600 by the
+    // Swift helper (`writeState` sets posixPermissions on the tmp file),
+    // but a copy left loose by a restored backup or a moved data dir
+    // stays loose: `atomicReplace` swaps via `replaceItemAt`, which
+    // keeps the existing destination's mode, so crawls alone never
+    // repair it. purge-scopes.json and idempotency-ledger.json are
+    // created 0600 by `write_private` but can drift the same way.
+    // `tighten_file` is a no-op while a file does not exist (fresh
+    // installs, and the ledger before its introducing change lands).
     tighten_file(&data_dir.join("crawl-state.json")).ok();
     tighten_file(&data_dir.join("purge-scopes.json")).ok();
     tighten_file(&data_dir.join("idempotency-ledger.json")).ok();
