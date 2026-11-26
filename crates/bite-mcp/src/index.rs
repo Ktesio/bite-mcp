@@ -308,8 +308,10 @@ fn refresh_fts_if_crawl_settled(index: &bite_index::EntityIndex) {
     match index.refresh_fts() {
         Ok(()) => {
             // mark exactly the state we optimized for — if a new crawl
-            // started meanwhile, its state text differs and stays pending
-            std::fs::write(fts_refresh_marker_path(), raw).ok();
+            // started meanwhile, its state text differs and stays pending.
+            // 0600 from creation: the marker is a verbatim copy of the
+            // crawl-state text.
+            bite_core::fsops::write_private(&fts_refresh_marker_path(), raw.as_bytes()).ok();
         }
         Err(e) => {
             eprintln!("bite-index: post-crawl FTS refresh failed: {e}");

@@ -103,8 +103,12 @@ it can ship.
   them. Both are now tightened to 0600 alongside `config.toml`, and
   `idempotency-ledger.json` (the durable idempotency-key ledger) is
   swept too, so the file is covered from the moment its introducing
-  change lands rather than after a later fix. Missing files remain a
-  no-op, keeping fresh installs and the pre-ledger tree quiet.
+  change lands rather than after a later fix. `fts-refresh.json` joins
+  the list: it holds a verbatim copy of the crawl-state text and was
+  written with a plain `std::fs::write` (0644 under the usual umask), so
+  it is now written through `write_private` (0600 from creation) and the
+  sweep repairs a marker left behind by an earlier build. Missing files
+  remain a no-op, keeping fresh installs and the pre-ledger tree quiet.
 - The `msrv` CI lane never tested the declared floor: the rust-toolchain
   action carried no `toolchain` input and the repo has no
   `rust-toolchain.toml`, so the lane resolved `stable` — which is how the
