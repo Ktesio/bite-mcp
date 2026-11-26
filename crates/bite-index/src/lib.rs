@@ -406,12 +406,15 @@ mod tests {
     }
 
     #[test]
-    fn dedup_gather_keeps_last_of_interleaved_keys_in_first_seen_order() {
+    fn dedup_gather_keeps_last_of_interleaved_keys() {
         // The survivors are gathered in place from source indices, so pin
         // a permutation whose sources are NOT ascending: `a` is first seen
         // at 0 and last at 5, `b` first at 1 and last at 3, with singles in
         // between. A gather that read a slot after overwriting it, or kept
         // a stale first occurrence, shows up here as a wrong title.
+        // Keep-last and no-loss only: the hits come back through `search`
+        // and are sorted below, so the survivors' first-seen order is NOT
+        // observable here.
         let staging = temp_staging("gather");
         let idx = EntityIndex::open(&staging.join("index.lance")).unwrap();
         write_batch(
