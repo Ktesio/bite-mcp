@@ -118,7 +118,7 @@ pub fn enforce_private_data_dir(data_dir: &Path) -> io::Result<()> {
     // left behind by a build that wrote it with plain `std::fs::write`
     // (0644 under the usual umask).
     // `tighten_file` is a no-op while a file does not exist (fresh
-    // installs, and the ledger before its introducing change lands).
+    // installs, or before the first keyed `mail_send` writes the ledger).
     tighten_file(&data_dir.join("crawl-state.json")).ok();
     tighten_file(&data_dir.join("purge-scopes.json")).ok();
     tighten_file(&data_dir.join("idempotency-ledger.json")).ok();
