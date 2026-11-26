@@ -137,6 +137,16 @@ it can ship.
   entry can never outlive its TTL. The authoritative fold under the
   writer lock keeps the fresh read, so the fold marker is only ever
   written for state text that was actually optimized for.
+- A full-crawl ingest no longer holds two copies of every parsed
+  message: `ingest_staged`'s cross-batch dedup recorded the keep-last
+  survivor of each `(app, account, id)` by deep-cloning it into a
+  second vector that stayed alive beside the full parsed set until the
+  ingest returned, so the peak was twice the crawl's bodies (with
+  bodies stored) inside the `bite-mcp` server process. The dedup now
+  records source indices and gathers the survivors in place — the same
+  keep-last pick, first-seen order and purge-scope handling. The write
+  path is unchanged: the store already upserts in 512-row
+  `merge_insert` chunks.
 
 ### Fixed
 

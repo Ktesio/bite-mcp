@@ -181,24 +181,44 @@ pub fn ingest_staged(
     // cross-account mail into one row. "Last" is the NEWEST batch because
     // files are ordered by numeric seq above. First-seen order is preserved
     // for determinism.
+    // The map's keys BORROW from `all_records`, so the survivors are
+    // recorded as source INDICES, never cloned: a deep copy of every
+    // survivor used to sit beside the full parsed set until this function
+    // returned, doubling the crawl's bodies in memory at the ingest peak.
     let mut key_index: std::collections::HashMap<(&str, &str, &str), usize> =
         std::collections::HashMap::new();
-    let mut unique: Vec<Record> = Vec::with_capacity(all_records.len());
-    for r in &all_records {
+    let mut sources: Vec<usize> = Vec::with_capacity(all_records.len());
+    for (i, r) in all_records.iter().enumerate() {
         let key = (
             r.app.as_str(),
             r.account.as_deref().unwrap_or(""),
             r.id.as_str(),
         );
         match key_index.get(&key) {
-            Some(&i) => unique[i] = r.clone(),
+            Some(&slot) => sources[slot] = i,
             None => {
-                key_index.insert(key, unique.len());
-                unique.push(r.clone());
+                key_index.insert(key, sources.len());
+                sources.push(i);
             }
         }
     }
-    let dedup_dropped = all_records.len() - unique.len();
+    let dedup_dropped = all_records.len() - sources.len();
+    // In-place gather: move each survivor down to its first-seen slot. A
+    // survivor's index is never below its slot (it is the LAST occurrence
+    // of a key first seen at or after that slot), and no two survivors
+    // share an index, so every swap lands a survivor in a slot that was
+    // already emitted or superseded and leaves only dead data behind —
+    // nothing still needed is overwritten.
+    let mut unique = all_records;
+    let mut slot = 0usize;
+    for &src in &sources {
+        debug_assert!(src >= slot, "survivor before its first-seen slot");
+        if src != slot {
+            unique.swap(slot, src);
+        }
+        slot += 1;
+    }
+    unique.truncate(sources.len());
     if dedup_dropped > 0 {
         eprintln!(
             "bite-index: deduplicated {dedup_dropped} duplicate (app,account,id) rows across batches"
@@ -385,6 +405,48 @@ mod tests {
         assert_eq!(idx.count(Some("app = 'mail'")).unwrap(), 1);
         let got = mail_hits(&idx);
         assert_eq!(got, vec![("Work".to_string(), "live job".to_string())]);
+    }
+
+    #[test]
+    fn dedup_gather_keeps_last_of_interleaved_keys_in_first_seen_order() {
+        // The survivors are gathered in place from source indices, so pin
+        // a permutation whose sources are NOT ascending: `a` is first seen
+        // at 0 and last at 5, `b` first at 1 and last at 3, with singles in
+        // between. A gather that read a slot after overwriting it, or kept
+        // a stale first occurrence, shows up here as a wrong title.
+        let staging = temp_staging("gather");
+        let idx = EntityIndex::open(&staging.join("index.lance")).unwrap();
+        write_batch(
+            &staging,
+            "crawl-1-0.jsonl",
+            &[
+                mail_record("a", Some("Work"), "a first"),
+                mail_record("b", Some("Work"), "b first"),
+                mail_record("c", Some("Work"), "c only"),
+                mail_record("b", Some("Work"), "b last"),
+            ],
+        );
+        write_batch(
+            &staging,
+            "crawl-1-1.jsonl",
+            &[
+                mail_record("d", Some("Work"), "d only"),
+                mail_record("a", Some("Work"), "a last"),
+            ],
+        );
+        let (batches, rows, quarantined, skipped) = ingest_staged(&idx, &staging, &[]).unwrap();
+        assert_eq!((batches, rows, quarantined, skipped), (2, 4, 0, 0));
+        let mut got = mail_hits(&idx);
+        got.sort();
+        assert_eq!(
+            got,
+            vec![
+                ("Work".to_string(), "a last".to_string()),
+                ("Work".to_string(), "b last".to_string()),
+                ("Work".to_string(), "c only".to_string()),
+                ("Work".to_string(), "d only".to_string()),
+            ]
+        );
     }
 
     #[test]
