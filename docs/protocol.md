@@ -164,8 +164,9 @@ messages: `send {to, text}` (recipient must exist in Messages) ·
 Server-plane note — MCP `mail_send` additionally accepts an optional
 `idempotency_key` string. It is consumed by the Rust control plane (stripped
 before the bridge; the helper contract above is unchanged): the first
-attempt's outcome is recorded against the key for the server process's
-lifetime, and a repeated call with the same key replays that recorded
+attempt's outcome is recorded against the key — durably, in a 0600 ledger
+inside the private data dir — and a repeated call with the same key replays
+that recorded
 outcome verbatim instead of dispatching a second send. A replay requires
 identical arguments: each key records a fingerprint of the stripped
 arguments it was claimed with, and a repeat whose arguments differ is
@@ -180,9 +181,36 @@ call with the key is still in flight, concurrent same-key calls are refused
 with `idempotency_in_flight` — the claim happens atomically, so two
 same-key calls can never both dispatch. Clean failures, failed helper
 spawns (no request was ever written), and provably-unsent calls do not pin
-the key. At most 128 keys are retained per
-server process (settled outcomes evicted oldest-first, completed sends
-before unknown pins); keys do not survive a server restart.
+the key. At most 128 keys are retained (settled outcomes evicted
+oldest-first, completed sends before unknown pins; the same cap applies to
+the on-disk set), and entries expire after 7 days — enforced when the
+ledger loads, when a key is reserved, and on every ledger write, so a
+long-lived server sheds expired rows as it goes. Records persist across
+server restarts in the ledger: the file stores SHA-256 hashes of the keys,
+never the key text. In-flight claims are durable too — the claim is
+written before dispatch, so a server that dies mid-send leaves a row the
+next start loads as an unknown pin (`interrupted`); the retry is refused,
+never re-dispatched. Several servers sharing one data dir merge: each
+ledger write re-writes rows it does not own, and a key absent from a
+server's memory is checked against the disk before it is claimed fresh.
+(Without an OS-level lock, two servers claiming the same free key in the
+same instant can still both dispatch — do not run concurrent servers
+against one data dir when strictness matters.) A completed send's stored
+outcome carries its subject and recipients for replay; the file is 0600
+in the private data dir, covered by `bite index wipe`, and documented in
+PRIVACY.md. A missing, corrupt, or unreadable ledger starts the server
+unrecorded (one stderr note for the latter two), trading a lost
+replay/refusal surface for availability. Mid-run the failure modes
+split: a file that fails to PARSE keeps this process's rows in memory
+and writes them back (one note per failure streak), while a file that
+fails to READ (permissions, I/O error) refuses the next write and
+leaves the bytes untouched — the unreadable file may be a valid ledger
+this process cannot see, and neither mode ever treats a missing row as
+a released key. The refused write prints nothing itself: no write was
+attempted, so the streak note is the only operator line. An in-server
+`index_wipe` keeps the claims of sends
+still in flight: their pins are re-written to the wiped file and their
+outcomes are recorded when they settle.
 
 ## Result shapes (contract)
 

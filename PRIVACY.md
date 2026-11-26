@@ -88,6 +88,23 @@ with your data. bite itself adds no network hop; choose agents you trust.
   fresh rebuild. Rebuilds can also be run body-off (`index_rebuild` with
   `no_body`, CLI `bite index rebuild --no-body`): the index stores mail
   metadata only and message bodies never enter the local store.
+- **The idempotency ledger, and how to purge it.** Sends made through
+  `mail_send` with a client-supplied `idempotency_key` are recorded in a
+  0600 `idempotency-ledger.json` in the same 0700 data dir so a retried
+  call replays instead of double-sending. Keys are stored as SHA-256
+  hashes (never the key text), but a COMPLETED send's stored outcome
+  carries its subject line and recipient addresses — up to 128 recent
+  keyed sends, expiring 7 days after they settle. `bite index wipe`
+  removes this file along with the index; deleting the file while the
+  server is stopped has the same effect. A wipe issued through the
+  server itself (`index_wipe`) also clears that server's in-memory
+  records — sends still in flight when the wipe lands keep their claim
+  (so a concurrent same-key retry cannot double-send), and their
+  outcome is recorded when they settle — but a wipe from the CLI (or
+  the file deleted by hand) does
+  not reach a RUNNING server's memory: any other bite-mcp server still
+  alive re-creates the file from memory on its next keyed send, so stop
+  or restart running servers for the purge to be complete.
 
 ## Intended use
 

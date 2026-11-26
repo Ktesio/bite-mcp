@@ -13,6 +13,38 @@ it can ship.
 
 ### Added
 
+- Settled `idempotency_key` records (replayable outcomes and unknown pins)
+  are now durable: they persist to a 0600 `idempotency-ledger.json` in the
+  private data dir and reload on startup, so a server restart between a
+  client's ambiguous `mail_send` failure and its same-key retry no longer
+  drops the double-send guard. The ledger stores SHA-256 hashes of keys
+  (never key text), expires entries after 7 days (at load, at reserve, and
+  on every write), honors the same 128-key cap as memory, and merges
+  across servers sharing a data dir — a memory-fresh key is checked
+  against the disk before it is claimed, and a write never drops rows the
+  writing process does not own. In-flight claims are durable too: the
+  claim is pinned to disk before dispatch, so a server that dies mid-send
+  leaves a row the next start loads as an unknown pin (`interrupted`) and
+  the same-key retry is refused instead of re-dispatched. A missing,
+  corrupt, or unreadable ledger starts the server unrecorded (one stderr
+  note for the latter two). Mid-run, a ledger that fails to parse keeps
+  the process's rows in memory and writes them back (one note per
+  failure streak), while one that fails to read (permissions, I/O
+  error) refuses the write instead of replacing a file it could not
+  see — silently, so the streak note stays the only operator line for
+  a bad read. The stored outcome of a completed send carries
+  its subject and recipients: documented in PRIVACY.md and removed by
+  `bite index wipe`. The smoke harness now runs every server process in an
+  isolated data dir, so keyed tests never touch a developer's real ledger.
+  Cross-process merges follow the DISK row for keys a process loaded but
+  never claimed itself (a newer row written by the claiming server wins;
+  a row that vanished because its writer released the key frees it here
+  too), the on-disk 128-key cap is enforced on every write with the same
+  done-before-unknown victim rule as memory, an in-server `index_wipe`
+  clears that server's in-memory records along with the file (sends
+  still in flight keep their claim, and their outcome is recorded when
+  they settle), and
+  reserving a disk-backed key no longer duplicates its retention slot.
 - The 16 MiB stdio request-line rejection is now logged server-side:
   `serve()` writes one stderr line per rejected oversized request (naming
   the cap value only — client bytes never enter the log) alongside the

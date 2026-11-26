@@ -37,5 +37,10 @@ sha2 = "0.11"
 [dev-dependencies]
 # self-cleaning test scratch dirs/files (Drop guard — panics can't leak them)
 tempfile = "3"
+# dup2-based fd-2 swap for the idempotency stderr-note tests: std exposes
+# no dup2, and libtest's macro-level capture never sees `writeln!(stderr())`
+# (raw fd writes), so the fd swap is the only in-process way to pin the
+# operator notes. Already in the graph (fs2/tokio) — zero added compile.
+libc = "0.2"
 
 [build-dependencies]

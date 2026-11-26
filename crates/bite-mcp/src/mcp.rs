@@ -26,7 +26,12 @@ struct ServerState {
 pub fn serve() -> i32 {
     let state = std::sync::Arc::new(ServerState {
         handle: BridgeHandle::new(),
-        idempotency: std::sync::Mutex::new(idempotency::Idempotency::default()),
+        // Durable ledger: settled idempotency records survive restarts, so
+        // the double-send guard outlives the server process.
+        idempotency: std::sync::Mutex::new(idempotency::load_ledger(
+            &idempotency::ledger_path(),
+            idempotency::unix_now(),
+        )),
     });
     let stdout = std::sync::Arc::new(std::io::stdout());
     let stdin = std::io::stdin();
@@ -365,6 +370,38 @@ fn handle_request(state: &ServerState, method: &str, params: &Value) -> Result<V
             if crate::index::is_local_tool(name) {
                 let value = crate::index::run_local_unwrapped(name, &args, Some(&state.handle))
                     .map_err(|e| err(-32000, e.render()))?;
+                if name == "index_wipe" {
+                    // The wipe deleted the ledger file, but THIS server's
+                    // in-memory table still holds every prior record —
+                    // the next keyed send would write them straight back,
+                    // un-purging the wipe. Reset the table so the wipe is
+                    // complete for this server too — but KEEP live
+                    // claims: each request runs on its own thread, so a
+                    // keyed send can be in flight right now; dropping its
+                    // claim would let a concurrent same-key retry
+                    // dispatch a second send. The immediate re-persist
+                    // returns the surviving in-flight pins to the wiped
+                    // file, DISCARDING whatever the file holds: the
+                    // delete raced any persist that re-created it, and
+                    // merging would resurrect the rows the wipe removed.
+                    // (A CLI wipe from another process cannot reach
+                    // this table: PRIVACY.md tells those users to
+                    // restart running servers.)
+                    if let Ok(mut idem) = state.idempotency.lock() {
+                        idem.wipe_settled();
+                        // The discarding variant never reads the disk, so
+                        // every failure here is a genuine write failure.
+                        if let Err(idempotency::PersistError::Write(error)) =
+                            idem.persist_ledger_discarding_disk(&idempotency::ledger_path())
+                        {
+                            let _ = writeln!(
+                                std::io::stderr(),
+                                "bite-mcp: idempotency ledger write failed ({error}); \
+                                 surviving in-flight pins are memory-only until the next write"
+                            );
+                        }
+                    }
+                }
                 return Ok(json!({
                     "content": [ { "type": "text", "text": serde_json::to_string_pretty(&value).unwrap_or_default() } ],
                     "structuredContent": value,
@@ -457,6 +494,8 @@ fn run_tool_idempotent(
     let Some(key) = key else {
         return run_tool_retrying(state, name, args).outcome;
     };
+    // The ledger stores SHA-256 of the key, never the client's text.
+    let key = idempotency::key_hash(&key);
     // Fingerprint the stripped arguments this call would dispatch with: a
     // replay must return the recorded outcome for the SAME call, so a key
     // reused with different arguments is refused outright instead of
@@ -464,12 +503,17 @@ fn run_tool_idempotent(
     let fingerprint = idempotency::fingerprint(&args);
     // Claim the key and read any prior state in ONE lock hold: requests are
     // served one thread per call, so a separate lookup and dispatch would
-    // let two concurrent same-key calls both reach the helper.
+    // let two concurrent same-key calls both reach the helper. The durable
+    // form also consults the on-disk ledger on a memory-fresh key (another
+    // server sharing the data dir may have recorded it) and persists the
+    // fresh claim's in-flight pin BEFORE dispatch — a crash mid-send then
+    // leaves a row the next start refuses the retry from.
+    let ledger = idempotency::ledger_path();
     match state
         .idempotency
         .lock()
         .unwrap()
-        .reserve(&key, &fingerprint)
+        .reserve_durable(&key, &fingerprint, &ledger)
     {
         idempotency::Reserved::Done(value) => return Ok(value),
         idempotency::Reserved::Reused => {
@@ -525,25 +569,35 @@ fn run_tool_idempotent(
         idempotency::Reserved::Fresh => {}
     }
     let run = run_tool_retrying(state, name, args);
+    // Settled records persist best-effort under the same lock hold: a
+    // failed ledger write must never turn a completed send into a
+    // client-visible failure (the client's retry would double-send).
     match &run.outcome {
-        Ok(value) => state
-            .idempotency
-            .lock()
-            .unwrap()
-            .settle(&key, idempotency::Settled::Done(value.clone())),
+        Ok(value) => state.idempotency.lock().unwrap().settle_and_persist(
+            &key,
+            idempotency::Settled::Done(value.clone()),
+            &ledger,
+        ),
         // Pin only when a request write actually landed: the ambiguous
         // codes are also produced by a failed spawn/handshake (and by a
         // failed respawn after an unsent attempt), where provably nothing
         // was written — those release below so an immediate retry with
         // the same key stays possible.
-        Err(e) if run.request_written && idempotency::ambiguous(e.code()) => state
+        Err(e) if run.request_written && idempotency::ambiguous(e.code()) => {
+            state.idempotency.lock().unwrap().settle_and_persist(
+                &key,
+                idempotency::Settled::Unknown(e.code().to_string()),
+                &ledger,
+            )
+        }
+        // Clean failures provably did not send — release the claim so the
+        // key stays free for an immediate retry, and persist so the
+        // durable in-flight row written at claim time leaves the ledger.
+        _ => state
             .idempotency
             .lock()
             .unwrap()
-            .settle(&key, idempotency::Settled::Unknown(e.code().to_string())),
-        // Clean failures provably did not send — release the claim so the
-        // key stays free for an immediate retry.
-        _ => state.idempotency.lock().unwrap().release(&key),
+            .release_and_persist(&key, &ledger),
     }
     run.outcome
 }

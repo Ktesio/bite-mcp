@@ -1227,6 +1227,12 @@ pub fn wipe(confirm: bool) -> Result<Value, BiteError> {
         // wiped-then-rebuilt index whose rows never come back (because an old
         // tombstone still skips them) would look exactly like a broken crawl.
         let _ = std::fs::remove_file(purge_scopes_path());
+        // The durable idempotency ledger as well: it carries the subjects
+        // and recipients of recent keyed sends (PRIVACY.md), and a wipe
+        // that leaves send metadata behind is not a complete reset.
+        let _ = std::fs::remove_file(
+            bite_core::config::data_dir().join(crate::idempotency::LEDGER_FILE),
+        );
         Ok(json!({ "wiped": true }))
     })
 }

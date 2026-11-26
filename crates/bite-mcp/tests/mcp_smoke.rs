@@ -89,6 +89,9 @@ struct McpProc {
     _scenario: Option<tempfile::NamedTempFile>,
     /// Same file as `_scenario`, addressable for mid-test rewrites.
     scenario_path: std::path::PathBuf,
+    /// Per-proc isolated data dir (HOME + XDG_DATA_HOME) — held for its
+    /// Drop; see `start_scenario`.
+    _data_dir: tempfile::TempDir,
 }
 
 impl McpProc {
@@ -106,9 +109,20 @@ impl McpProc {
             .expect("scenario temp file");
         write!(scenario_file, "{}", scenario).unwrap();
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_bite"));
+        // Isolated data dir: the durable idempotency ledger lives under
+        // the data dir (HOME on macOS, XDG_DATA_HOME on Linux), and keyed
+        // smoke tests must never read or write the developer's real
+        // ledger — a shared one also fails on a second run (the first
+        // run's pins are still on disk).
+        let data_dir = tempfile::Builder::new()
+            .prefix("bite-mcp-smoke-data-")
+            .tempdir()
+            .expect("isolated data dir");
         cmd.args(["mcp"])
             .env("BITE_HELPER_BIN", fake_helper_path())
             .env("BITE_FAKE_SCENARIO", scenario_file.path())
+            .env("HOME", data_dir.path())
+            .env("XDG_DATA_HOME", data_dir.path())
             .envs(extra_env.iter().copied())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -123,6 +137,7 @@ impl McpProc {
             reader: BufReader::new(stdout),
             next_id: 0,
             _scenario: Some(scenario_file),
+            _data_dir: data_dir,
         }
     }
 
