@@ -472,7 +472,7 @@ pub fn ingest_pending() -> Result<Value, BiteError> {
             }
             Ok(_guard) => {}
         }
-        let (batches, rows, quarantined, skipped_purged) =
+        let (batches, rows, quarantined, skipped_purged, skipped_malformed) =
             bite_index::ingest_staged(index, &staging, &read_purge_scopes(&purge_scopes_path()))
                 .map_err(|e| BridgeError::new("index_ingest_failed", e.to_string()))?;
         if batches > 0 {
@@ -488,6 +488,9 @@ pub fn ingest_pending() -> Result<Value, BiteError> {
         // healthy poll is noise an agent has to read past
         if skipped_purged > 0 {
             out["skipped_purged"] = json!(skipped_purged);
+        }
+        if skipped_malformed > 0 {
+            out["skipped_malformed"] = json!(skipped_malformed);
         }
         Ok(out)
     })
