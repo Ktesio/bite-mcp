@@ -939,20 +939,27 @@ async fn hits_from_stream(
     Ok(hits)
 }
 
+/// Parse each non-empty line of a JSONL batch file's text as one `Record`.
+/// Both passes of `ingest_staged` read a batch through here, so they always
+/// agree on which lines are records and on what a malformed line is.
+pub(crate) fn parse_jsonl_text<'a>(
+    text: &'a str,
+    path: &Path,
+) -> impl Iterator<Item = Result<Record, IndexError>> + 'a {
+    let path = path.display().to_string();
+    text.lines()
+        .enumerate()
+        .filter(|(_, line)| !line.trim().is_empty())
+        .map(move |(i, line)| {
+            serde_json::from_str::<Record>(line)
+                .map_err(|e| IndexError::Other(format!("{path}:{}: {e}", i + 1)))
+        })
+}
+
 /// Parse a JSONL batch file (one Record per line) written by a Swift crawler.
 pub fn parse_jsonl(path: &Path) -> Result<Vec<Record>, IndexError> {
     let text = std::fs::read_to_string(path)?;
-    let mut records = Vec::new();
-    for (i, line) in text.lines().enumerate() {
-        if line.trim().is_empty() {
-            continue;
-        }
-        records.push(
-            serde_json::from_str::<Record>(line)
-                .map_err(|e| IndexError::Other(format!("{}:{}: {e}", path.display(), i + 1)))?,
-        );
-    }
-    Ok(records)
+    parse_jsonl_text(&text, path).collect()
 }
 
 #[cfg(test)]
