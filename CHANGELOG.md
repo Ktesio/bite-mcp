@@ -150,6 +150,23 @@ it can ship.
 
 ### Fixed
 
+- The privacy sweep missed the data dir's root-level state files:
+  `crawl-state.json` (written 0600 by the Swift helper, but a copy left
+  loose by a restored backup or a moved data dir stays loose —
+  `replaceItemAt` keeps the existing file's mode, so crawls alone never
+  repair it) and `purge-scopes.json` never appeared in
+  `enforce_private_data_dir`'s
+  fixed list, so a loose file stayed loose until something else
+  rewrote it — the sweep's retroactive-repair promise did not cover
+  them. Both are now tightened to 0600 alongside `config.toml`, and
+  `idempotency-ledger.json` (the durable idempotency-key ledger, created
+  0600 by `write_private`) is swept too: it can drift the same way
+  through a restored backup or a moved data dir. `fts-refresh.json` joins
+  the list: it holds a verbatim copy of the crawl-state text and was
+  written with a plain `std::fs::write` (0644 under the usual umask), so
+  it is now written through `write_private` (0600 from creation) and the
+  sweep repairs a marker left behind by an earlier build. Missing files
+  remain a no-op, keeping fresh installs quiet.
 - The `msrv` CI lane never tested the declared floor: the rust-toolchain
   action carried no `toolchain` input and the repo has no
   `rust-toolchain.toml`, so the lane resolved `stable` — which is how the
