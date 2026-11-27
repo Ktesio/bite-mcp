@@ -80,56 +80,96 @@ fn batch_order_key(path: &Path) -> (u64, u64, std::path::PathBuf) {
     (job_ts, seq, path.to_path_buf())
 }
 
-/// Cross-batch dedup by (app, account, id), keeping the LAST occurrence:
-/// the crawler legitimately produces duplicate keys across batch files
-/// WITHIN one account (overlapping windows, restarts), and merge-insert
-/// PROHIBITS two source rows matching the same target key — without
-/// this, one duplicated message wedges the entire ingest forever. The
-/// account is part of the key: two accounts holding id "4127" are two
-/// distinct messages, and the old (app, id) key silently collapsed
-/// cross-account mail into one row. "Last" is the NEWEST batch because
-/// the caller orders the batch files by numeric seq before parsing them.
-/// Survivors keep their FIRST-seen order, for determinism.
+/// Cross-batch keep-last by (app, account, id): the crawler legitimately
+/// produces duplicate keys across batch files WITHIN one account
+/// (overlapping windows, restarts), and merge-insert PROHIBITS two source
+/// rows matching the same target key — without this, one duplicated message
+/// wedges the entire ingest forever. The account is part of the key: two
+/// accounts holding id "4127" are two distinct messages, and the old
+/// (app, id) key silently collapsed cross-account mail into one row.
+/// "Last" is the NEWEST batch because the caller orders the batch files by
+/// numeric seq before the key pass.
 ///
-/// The map's keys BORROW from the input, so the survivors are recorded
-/// as source INDICES, never cloned: a deep copy of every survivor used
-/// to sit beside the full parsed set until the caller returned, doubling
-/// the crawl's bodies in memory at the ingest peak. Returns the
-/// survivors and the number of dropped duplicates.
-fn dedup_keep_last(all_records: Vec<Record>) -> (Vec<Record>, usize) {
-    let mut key_index: std::collections::HashMap<(&str, &str, &str), usize> =
-        std::collections::HashMap::new();
-    let mut sources: Vec<usize> = Vec::with_capacity(all_records.len());
-    for (i, r) in all_records.iter().enumerate() {
-        let key = (
-            r.app.as_str(),
-            r.account.as_deref().unwrap_or(""),
-            r.id.as_str(),
-        );
-        match key_index.get(&key) {
-            Some(&slot) => sources[slot] = i,
-            None => {
-                key_index.insert(key, sources.len());
-                sources.push(i);
+/// Returns the POSITIONS of the surviving occurrences among `keys` (the
+/// last occurrence of each key). Positions, not records: the write pass
+/// filters by them, so neither pass ever holds a record's body beyond the
+/// file it is reading. What this replaces held every parsed record of the
+/// whole crawl in memory until the first write — and, before that, a deep
+/// clone of every survivor beside it.
+fn keep_last_positions(keys: &[DedupKey]) -> std::collections::HashSet<usize> {
+    let mut last_seen: std::collections::HashMap<&DedupKey, usize> =
+        std::collections::HashMap::with_capacity(keys.len());
+    for (i, key) in keys.iter().enumerate() {
+        last_seen.insert(key, i);
+    }
+    last_seen.into_values().collect()
+}
+
+/// Dedup key of one staged record: `(app, account, id)`, a missing account
+/// normalized to `""` exactly as the write normalizes it.
+type DedupKey = (String, String, String);
+
+/// Rows carried between staged files before one write. Equal to the
+/// `merge_insert` chunk inside `EntityIndex::ingest`, and always flushed in
+/// exact multiples, so a crawl costs the same number of write transactions
+/// as the single whole-crawl `ingest` call it replaces.
+const FLUSH_ROWS: usize = 512;
+
+/// The key pass for ONE staged file: parse every non-empty line (validating
+/// it exactly as the write pass will) and keep only each record's
+/// [`DedupKey`]. A parse failure surfaces before any of the file's keys is
+/// used, so a poison batch can never stand as the newest occurrence of a
+/// key — quarantining it must not take the good row of an earlier batch
+/// along with it.
+fn key_pass(file: &Path) -> Result<Vec<DedupKey>, store::IndexError> {
+    let text = std::fs::read_to_string(file)?;
+    store::parse_jsonl_text(&text, file)
+        .map(|record| {
+            let r = record?;
+            Ok((r.app, r.account.unwrap_or_default(), r.id))
+        })
+        .collect()
+}
+
+/// Move one unreadable batch to `<staging>/quarantine/` (created 0700) and
+/// enforce the 200-file retention cap there. Returns whether the file was
+/// moved.
+fn quarantine_batch(file: &Path, quarantine: &Path) -> bool {
+    let mut moved = false;
+    if std::fs::create_dir_all(quarantine).is_ok() {
+        // creation-time privacy: the MCP server process may long outlive
+        // its startup enforcement pass, so a quarantine/ first created
+        // mid-session must not sit at umask defaults until the next startup
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(quarantine, std::fs::Permissions::from_mode(0o700));
+        let dest = quarantine.join(file.file_name().unwrap_or_default());
+        match std::fs::rename(file, dest) {
+            Ok(_) => moved = true,
+            Err(re) => {
+                // leave the file in place — it will be retried
+                // (and re-fail visibly) on the next ingest
+                eprintln!("bite-index: could not quarantine {}: {re}", file.display());
             }
         }
     }
-    let dedup_dropped = all_records.len() - sources.len();
-    // In-place gather: move each survivor down to its first-seen slot. A
-    // survivor's index is never below its slot (it is the LAST occurrence
-    // of a key first seen at or after that slot), and no two survivors
-    // share an index, so every swap lands a survivor in a slot that was
-    // already emitted or superseded and leaves only dead data behind —
-    // nothing still needed is overwritten.
-    let mut unique = all_records;
-    for (slot, &src) in sources.iter().enumerate() {
-        debug_assert!(src >= slot, "survivor before its first-seen slot");
-        if src != slot {
-            unique.swap(slot, src);
+    // retention cap: keep quarantine/ bounded at 200 files, deleting the
+    // OLDEST first by modification time (filename order lies once seq >= 10:
+    // "-10" sorts before "-9")
+    let mut qfiles: Vec<_> = std::fs::read_dir(quarantine)
+        .map(|it| {
+            it.filter_map(|e| e.ok())
+                .map(|e| e.path())
+                .filter(|p| p.extension().map(|x| x == "jsonl").unwrap_or(false))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    qfiles.sort_by_key(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok());
+    if qfiles.len() > 200 {
+        for p in &qfiles[..qfiles.len() - 200] {
+            std::fs::remove_file(p).ok();
         }
     }
-    unique.truncate(sources.len());
-    (unique, dedup_dropped)
+    moved
 }
 
 /// Ingest every un-ingested `*.jsonl` batch in the staging dir (deleting each
@@ -138,6 +178,21 @@ fn dedup_keep_last(all_records: Vec<Record>) -> (Vec<Record>, usize) {
 /// unreadable batches quarantined (moved to `<staging>/quarantine/`), and the
 /// rows dropped because they matched a recorded purge scope (`index_forget`)
 /// — purged scopes must not come back with the next full crawl.
+///
+/// Two passes over the staged files keep memory bounded by ONE staged file
+/// plus [`FLUSH_ROWS`] records, however large the crawl is:
+///
+/// 1. **Key pass** — every line is parsed (so validated) and reduced to its
+///    [`DedupKey`]; `keep_last_positions` then settles WHICH occurrence of
+///    each key survives. Keys hold no bodies, so this pass costs a second
+///    parse of every line in the write pass, not memory.
+/// 2. **Write pass** — each file is parsed again and only the surviving
+///    occurrences are written, [`FLUSH_ROWS`] at a time.
+///
+/// Both passes see the same records in the same order, so the dedup,
+/// purge-scope and quarantine outcomes are exactly those of the former
+/// parse-everything-then-write shape — which held every parsed record of
+/// the whole crawl in memory before the first write.
 pub fn ingest_staged(
     index: &EntityIndex,
     staging: &Path,
@@ -156,107 +211,87 @@ pub fn ingest_staged(
     // Oldest batch first: by job timestamp, then numeric seq within the
     // job (see `batch_order_key` for why both matter).
     files.sort_by_key(|p| batch_order_key(p));
+    let quarantine = staging.join("quarantine");
+    let mut readable: Vec<std::path::PathBuf> = Vec::new();
+    let mut all_keys: Vec<DedupKey> = Vec::new();
+    let mut quarantined = 0usize;
     // a single poison batch must not wedge the whole pipeline forever:
     // quarantine unreadable files and keep ingesting the rest
-    let quarantine = staging.join("quarantine");
-    let mut staged_files: Vec<std::path::PathBuf> = Vec::new();
-    let mut all_records: Vec<Record> = Vec::new();
-    let mut quarantined = 0usize;
     for file in files {
-        match store::parse_jsonl(&file) {
-            Ok(records) => {
-                staged_files.push(file.clone());
-                all_records.extend(records);
+        match key_pass(&file) {
+            Ok(keys) => {
+                all_keys.extend(keys);
+                readable.push(file);
             }
             Err(e) => {
                 eprintln!(
                     "bite-index: quarantining unreadable batch {}: {e}",
                     file.display()
                 );
-                if std::fs::create_dir_all(&quarantine).is_ok() {
-                    // creation-time privacy: the MCP server process may long
-                    // outlive its startup enforcement pass, so a quarantine/
-                    // first created mid-session must not sit at umask
-                    // defaults until the next startup
-                    use std::os::unix::fs::PermissionsExt;
-                    let _ = std::fs::set_permissions(
-                        &quarantine,
-                        std::fs::Permissions::from_mode(0o700),
-                    );
-                    let dest = quarantine.join(file.file_name().unwrap_or_default());
-                    match std::fs::rename(&file, dest) {
-                        Ok(_) => quarantined += 1,
-                        Err(re) => {
-                            // leave the file in place — it will be retried
-                            // (and re-fail visibly) on the next ingest
-                            eprintln!("bite-index: could not quarantine {}: {re}", file.display());
-                        }
-                    }
-                }
-                // retention cap: keep quarantine/ bounded at 200 files,
-                // deleting the OLDEST first by modification time (filename
-                // order lies once seq >= 10: "-10" sorts before "-9")
-                let mut qfiles: Vec<_> = std::fs::read_dir(&quarantine)
-                    .map(|it| {
-                        it.filter_map(|e| e.ok())
-                            .map(|e| e.path())
-                            .filter(|p| p.extension().map(|x| x == "jsonl").unwrap_or(false))
-                            .collect::<Vec<_>>()
-                    })
-                    .unwrap_or_default();
-                qfiles.sort_by_key(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok());
-                if qfiles.len() > 200 {
-                    for p in &qfiles[..qfiles.len() - 200] {
-                        std::fs::remove_file(p).ok();
-                    }
-                }
+                quarantined += usize::from(quarantine_batch(&file, &quarantine));
             }
         }
     }
-    // Normalize `account` before dedup/merge: Mail message ids are
-    // ACCOUNT-scoped integers, so the merge key must include the account.
-    // The JSONL contract keeps `account` optional, but a missing account is
-    // normalized to "" (never NULL) here — NULL values in a merge-insert
-    // key column never match, so a NULL-account row could never be upserted.
-    for r in &mut all_records {
-        if r.account.is_none() {
-            r.account = Some(String::new());
-        }
-    }
-    let (mut unique, dedup_dropped) = dedup_keep_last(all_records);
+    let survivors = keep_last_positions(&all_keys);
+    let dedup_dropped = all_keys.len() - survivors.len();
+    drop(all_keys);
     if dedup_dropped > 0 {
         eprintln!(
             "bite-index: deduplicated {dedup_dropped} duplicate (app,account,id) rows across batches"
         );
     }
     // Purge-scope tombstones: drop rows inside a recorded `index_forget`
-    // scope BEFORE the upsert. Applied after dedup (fewer comparisons) and
-    // to the dedup SURVIVOR so a newer batch can never resurrect a purged
-    // key through keep-last. Empty slice = no tombstones recorded = the
+    // scope BEFORE the upsert. Applied to the dedup SURVIVOR alone (the
+    // superseded occurrences are never written) so a newer batch can
+    // never resurrect a purged key, and an older batch's copy of a purged
+    // message is dropped too. Empty slice = no tombstones recorded = the
     // historical behavior (everything ingests).
-    let skipped_purged = if purge_scopes.is_empty() {
-        0
-    } else {
-        let before = unique.len();
-        unique.retain(|r| {
-            !purge_scopes
-                .iter()
-                .any(|s| s.matches(&r.app, r.container.as_deref()))
-        });
-        let skipped = before - unique.len();
-        if skipped > 0 {
-            eprintln!(
-                "bite-index: skipped {skipped} rows matching recorded purge scopes (index_forget)"
-            );
+    let mut skipped_purged = 0usize;
+    let mut rows = 0usize;
+    let mut buffered: Vec<Record> = Vec::with_capacity(FLUSH_ROWS);
+    // running occurrence position — the same numbering the key pass saw
+    let mut pos = 0usize;
+    for file in &readable {
+        for mut r in store::parse_jsonl(file)? {
+            // Only the surviving occurrence of a key is written. The account
+            // is normalized before the merge: Mail message ids are
+            // ACCOUNT-scoped integers, and NULL values in a merge-insert
+            // key column never match (a NULL-account row could never be
+            // upserted).
+            if survivors.contains(&pos) {
+                if r.account.is_none() {
+                    r.account = Some(String::new());
+                }
+                if purge_scopes
+                    .iter()
+                    .any(|s| s.matches(&r.app, r.container.as_deref()))
+                {
+                    skipped_purged += 1;
+                } else {
+                    buffered.push(r);
+                }
+            }
+            pos += 1;
         }
-        skipped
-    };
-    let stats = index.ingest(&unique)?;
-    for file in &staged_files {
+        while buffered.len() >= FLUSH_ROWS {
+            let tail = buffered.split_off(FLUSH_ROWS);
+            rows += index.ingest(&buffered)?.rows;
+            buffered = tail;
+        }
+    }
+    if !buffered.is_empty() {
+        rows += index.ingest(&buffered)?.rows;
+    }
+    if skipped_purged > 0 {
+        eprintln!(
+            "bite-index: skipped {skipped_purged} rows matching recorded purge scopes (index_forget)"
+        );
+    }
+    for file in &readable {
         std::fs::remove_file(file).ok();
     }
-    let batches = staged_files.len();
-    Ok((batches, stats.rows, quarantined, skipped_purged))
+    let batches = readable.len();
+    Ok((batches, rows, quarantined, skipped_purged))
 }
 
 #[cfg(test)]
@@ -457,64 +492,6 @@ mod tests {
         );
     }
 
-    fn survivor_titles(survivors: &[Record]) -> Vec<&str> {
-        survivors
-            .iter()
-            .map(|r| r.title.as_deref().unwrap_or_default())
-            .collect()
-    }
-
-    #[test]
-    fn dedup_keep_last_emits_survivors_in_first_seen_order() {
-        // Source indices [5, 3, 2, 4] — NOT ascending, so a gather that
-        // walked the sources in sorted order, or filled a slot with
-        // `swap_remove`, emits a different order here.
-        let (survivors, dropped) = dedup_keep_last(vec![
-            mail_record("a", Some("Work"), "a first"),
-            mail_record("b", Some("Work"), "b first"),
-            mail_record("c", Some("Work"), "c only"),
-            mail_record("b", Some("Work"), "b last"),
-            mail_record("d", Some("Work"), "d only"),
-            mail_record("a", Some("Work"), "a last"),
-        ]);
-        assert_eq!(
-            survivor_titles(&survivors),
-            ["a last", "b last", "c only", "d only"]
-        );
-        assert_eq!(dropped, 2);
-    }
-
-    #[test]
-    fn dedup_keep_last_reads_single_keys_after_earlier_swaps() {
-        // Sources are [2, 3] — two keys, two slots. Slot 0 is filled by
-        // swap(0, 2), which leaves a dead `x` at index 2; the single `y`
-        // at index 3 is then read for slot 1 and must come from its
-        // source, not the slot (index 1 still holds `x middle`).
-        let (survivors, dropped) = dedup_keep_last(vec![
-            mail_record("x", Some("Work"), "x first"),
-            mail_record("x", Some("Work"), "x middle"),
-            mail_record("x", Some("Work"), "x last"),
-            mail_record("y", Some("Work"), "y only"),
-        ]);
-        assert_eq!(survivor_titles(&survivors), ["x last", "y only"]);
-        assert_eq!(dropped, 2);
-    }
-
-    #[test]
-    fn dedup_keep_last_passes_unique_records_through() {
-        // Same id in two accounts is two keys, and both survive in order.
-        let (survivors, dropped) = dedup_keep_last(vec![
-            mail_record("a", Some("Work"), "a work"),
-            mail_record("a", Some("Home"), "a home"),
-        ]);
-        assert_eq!(survivor_titles(&survivors), ["a work", "a home"]);
-        assert_eq!(dropped, 0);
-
-        let (survivors, dropped) = dedup_keep_last(Vec::new());
-        assert!(survivors.is_empty());
-        assert_eq!(dropped, 0);
-    }
-
     #[test]
     fn malformed_batch_names_no_panic_and_sort_last() {
         // A hand-crafted name with a non-numeric tail (`-2zz`) must not be
@@ -659,5 +636,120 @@ mod tests {
         write_batch(&staging, "crawl-3-0.jsonl", &[junk_record("11", "back")]);
         let _ = ingest_staged(&idx, &staging, &[]).unwrap();
         assert_eq!(idx.count(Some("container = 'Junk'")).unwrap(), 1);
+    }
+
+    /// A staged file whose first line is a valid record and whose second
+    /// line fails to parse — a poison batch that still carries a good key.
+    fn write_poison_batch(staging: &Path, name: &str, head: &Record) {
+        std::fs::write(
+            staging.join(name),
+            format!(
+                "{}\n{{\"app\":\"mail\",\"id\":\"12\",\"read\":\"yes\"}}\n",
+                serde_json::to_string(head).unwrap()
+            ),
+        )
+        .unwrap();
+    }
+
+    /// Staged `*.jsonl` files left at the top level of the staging dir.
+    fn staged_batches(staging: &Path) -> usize {
+        std::fs::read_dir(staging)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().map(|x| x == "jsonl").unwrap_or(false))
+            .count()
+    }
+
+    #[test]
+    fn write_pass_keeps_only_survivors_across_the_flush_boundary() {
+        // More rows than one write chunk, and the newest occurrence of key
+        // a0000 sits in the SECOND file. Keep-last is settled for the whole
+        // crawl before the first write, so file one's superseded row is
+        // never written even though file two is only parsed after file
+        // one's rows have left the buffer.
+        let staging = temp_staging("flush");
+        let idx = EntityIndex::open(&staging.join("index.lance")).unwrap();
+        let ids: Vec<String> = (0..FLUSH_ROWS).map(|i| format!("a{i:04}")).collect();
+        let first: Vec<Record> = ids
+            .iter()
+            .map(|id| mail_record(id, Some("Work"), "older"))
+            .collect();
+        write_batch(&staging, "crawl-1-0.jsonl", &first);
+        write_batch(
+            &staging,
+            "crawl-1-1.jsonl",
+            &[
+                mail_record("a0000", Some("Work"), "newer"),
+                mail_record("b0000", Some("Work"), "only in the second file"),
+            ],
+        );
+        let (batches, rows, quarantined, skipped) = ingest_staged(&idx, &staging, &[]).unwrap();
+        assert_eq!(
+            (batches, rows, quarantined, skipped),
+            (2, FLUSH_ROWS + 1, 0, 0)
+        );
+        assert_eq!(idx.count(Some("app = 'mail'")).unwrap(), FLUSH_ROWS + 1);
+        assert_eq!(
+            idx.count(Some("id = 'a0000' AND title = 'newer'")).unwrap(),
+            1
+        );
+        assert_eq!(idx.count(Some("title = 'older'")).unwrap(), FLUSH_ROWS - 1);
+        assert_eq!(staged_batches(&staging), 0, "both files consumed");
+    }
+
+    #[test]
+    fn poisoned_batch_never_supersedes_an_earlier_batch_key() {
+        // The third batch repeats key 10 with a newer title and THEN fails
+        // to parse. It is quarantined whole, so its keys must not stand as
+        // the newest occurrences: batch two's row survives and the
+        // never-written "third" title is absent.
+        let staging = temp_staging("poison");
+        let idx = EntityIndex::open(&staging.join("index.lance")).unwrap();
+        write_batch(
+            &staging,
+            "crawl-1-0.jsonl",
+            &[mail_record("10", Some("Work"), "first")],
+        );
+        write_batch(
+            &staging,
+            "crawl-2-0.jsonl",
+            &[mail_record("10", Some("Work"), "second")],
+        );
+        write_poison_batch(
+            &staging,
+            "crawl-3-0.jsonl",
+            &mail_record("10", Some("Work"), "third"),
+        );
+        let (batches, rows, quarantined, skipped) = ingest_staged(&idx, &staging, &[]).unwrap();
+        assert_eq!((batches, rows, quarantined, skipped), (2, 1, 1, 0));
+        assert_eq!(idx.count(Some("app = 'mail'")).unwrap(), 1);
+        assert!(mail_hits(&idx)[0].1.contains("second"));
+        assert_eq!(idx.count(Some("title = 'third'")).unwrap(), 0);
+        assert!(staging.join("quarantine").join("crawl-3-0.jsonl").is_file());
+        assert_eq!(staged_batches(&staging), 0);
+    }
+
+    #[test]
+    fn keep_last_positions_keeps_the_last_occurrence_of_each_key() {
+        let key = |id: &str| ("mail".to_string(), "Work".to_string(), id.to_string());
+        // a, b, a, c, b — the survivors are positions 2 (a), 3 (c) and 4 (b)
+        let keys = [key("a"), key("b"), key("a"), key("c"), key("b")];
+        let survivors = keep_last_positions(&keys);
+        let set = |positions: &[usize]| {
+            positions
+                .iter()
+                .copied()
+                .collect::<std::collections::HashSet<usize>>()
+        };
+        assert_eq!(survivors, set(&[2, 3, 4]));
+        assert_eq!(keys.len() - survivors.len(), 2, "two occurrences dropped");
+
+        // Same id in two accounts is two keys: both survive.
+        let keys = [
+            key("x"),
+            ("mail".to_string(), "Home".to_string(), "x".to_string()),
+        ];
+        assert_eq!(keep_last_positions(&keys), set(&[0, 1]));
+        assert!(keep_last_positions(&[]).is_empty());
     }
 }

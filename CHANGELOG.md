@@ -124,6 +124,20 @@ it can ship.
 
 ### Changed
 
+- Staged batch ingest no longer holds every parsed record of the crawl in
+  memory before the first write. `ingest_staged` makes two passes over the
+  staged `*.jsonl` files: a key pass that parses each line (so a malformed
+  batch is still quarantined whole, before any write) and keeps only its
+  `(app, account, id)` key, then a write pass that re-reads each file and
+  writes just the keep-last survivors, 512 rows at a time. Peak memory is
+  bounded by one staged file plus one write chunk instead of the whole
+  crawl: the indexed-mail tool call that trips the MCP server's
+  opportunistic auto-ingest, and `index_rebuild`, no longer carry a full
+  copy of the crawl's bodies. Dedup, purge-scope (`index_forget`) and
+  quarantine outcomes are unchanged — keep-last is settled for the whole
+  crawl before the first write, so a superseded occurrence is never
+  written and an older batch's copy of a purged message is still dropped.
+  The trade is CPU: every line is parsed twice, once per pass.
 - Indexed mail searches no longer re-read or re-parse `crawl-state.json`
   on every tool call: the read-only post-settle FTS gate — `with_index`
   runs it after every index touch — now serves the crawl-state text AND
