@@ -137,6 +137,19 @@ fn key_pass(file: &Path) -> Result<(Vec<DedupKey>, Vec<usize>), store::IndexErro
 /// numbers that were skipped (the first few). Line CONTENT is never printed
 /// — a malformed mail record is still mail.
 fn note_malformed(file: &Path, bad_lines: &[usize]) {
+    eprintln!(
+        "bite-index: skipped {} malformed line(s) in {}: lines {}",
+        bad_lines.len(),
+        file.display(),
+        fmt_lines(bad_lines)
+    );
+}
+
+/// The first few malformed line numbers, comma-separated, ending in "…"
+/// when the list was cut short. One formatter for the skipped-line note
+/// and the all-malformed quarantine note, so both read the same for the
+/// same lines.
+fn fmt_lines(bad_lines: &[usize]) -> String {
     const SHOWN: usize = 5;
     let mut listed: Vec<String> = bad_lines
         .iter()
@@ -146,12 +159,7 @@ fn note_malformed(file: &Path, bad_lines: &[usize]) {
     if bad_lines.len() > SHOWN {
         listed.push("…".to_string());
     }
-    eprintln!(
-        "bite-index: skipped {} malformed line(s) in {}: lines {}",
-        bad_lines.len(),
-        file.display(),
-        listed.join(", ")
-    );
+    listed.join(", ")
 }
 
 /// Move one unreadable batch to `<staging>/quarantine/` (created 0700) and
@@ -255,14 +263,10 @@ pub fn ingest_staged(
                     // nothing in this batch is ingestable: keep the file
                     // for inspection, exactly like an unreadable one
                     eprintln!(
-                        "bite-index: quarantining malformed batch {}: lines {}",
+                        "bite-index: quarantining batch {}: all {} non-empty line(s) malformed (lines {})",
                         file.display(),
-                        bad_lines
-                            .iter()
-                            .take(5)
-                            .map(std::string::ToString::to_string)
-                            .collect::<Vec<_>>()
-                            .join(", ")
+                        bad_lines.len(),
+                        fmt_lines(&bad_lines)
                     );
                     quarantined += usize::from(quarantine_batch(&file, &quarantine));
                     continue;
@@ -829,11 +833,18 @@ mod tests {
     fn batch_of_only_malformed_lines_is_quarantined() {
         // nothing ingestable: the file is kept for inspection like an
         // unreadable one, and its lines are not counted as skipped rows of
-        // an ingested batch. Blank lines are not malformed.
+        // an ingested batch. Blank lines are not malformed. The batch names
+        // key 9 only on lines that do not parse, so it adds no key to the
+        // keep-last dedup and the earlier batch's row for that key stays.
         let staging = temp_staging("allbad");
         let idx = EntityIndex::open(&staging.join("index.lance")).unwrap();
+        write_batch(
+            &staging,
+            "crawl-1-0.jsonl",
+            &[mail_record("9", Some("Work"), "earlier")],
+        );
         std::fs::write(
-            staging.join("crawl-1-0.jsonl"),
+            staging.join("crawl-2-0.jsonl"),
             "{\"app\":\"mail\",\"id\":\"9\",\"read\":\"not-a-bool\"}\n\n   \nnot json at all\n",
         )
         .unwrap();
@@ -841,11 +852,68 @@ mod tests {
             ingest_staged(&idx, &staging, &[]).unwrap();
         assert_eq!(
             (batches, rows, quarantined, skipped, malformed),
-            (0, 0, 1, 0, 0)
+            (1, 1, 1, 0, 0)
         );
-        assert_eq!(idx.count(Some("app = 'mail'")).unwrap(), 0);
-        assert!(staging.join("quarantine").join("crawl-1-0.jsonl").is_file());
+        assert_eq!(idx.count(Some("app = 'mail'")).unwrap(), 1);
+        assert_eq!(
+            idx.count(Some("id = '9' AND title = 'earlier'")).unwrap(),
+            1,
+            "the earlier batch's row survives the quarantined repeat"
+        );
+        assert!(staging.join("quarantine").join("crawl-2-0.jsonl").is_file());
         assert_eq!(staged_batches(&staging), 0);
+    }
+
+    #[test]
+    fn unreadable_batch_never_supersedes_an_earlier_batch_key() {
+        // A batch that cannot be read as a whole (here: one raw 0xFF byte,
+        // so not valid UTF-8) is quarantined BEFORE any of its keys is
+        // used. Its valid line names key 10 as the newest occurrence: if
+        // that key still won the keep-last dedup, the write pass would drop
+        // the earlier batch's row and the quarantined file would never
+        // replace it — the message would be gone from search.
+        let staging = temp_staging("unreadable");
+        let idx = EntityIndex::open(&staging.join("index.lance")).unwrap();
+        write_batch(
+            &staging,
+            "crawl-1-0.jsonl",
+            &[mail_record("10", Some("Work"), "second")],
+        );
+        let mut bytes: Vec<u8> = serde_json::to_string(&mail_record("10", Some("Work"), "third"))
+            .unwrap()
+            .into_bytes();
+        bytes.push(b'\n');
+        bytes.push(0xFF);
+        bytes.push(b'\n');
+        std::fs::write(staging.join("crawl-2-0.jsonl"), &bytes).unwrap();
+        let (batches, rows, quarantined, skipped, malformed) =
+            ingest_staged(&idx, &staging, &[]).unwrap();
+        assert_eq!(
+            (batches, rows, quarantined, skipped, malformed),
+            (1, 1, 1, 0, 0)
+        );
+        assert_eq!(
+            idx.count(Some("app = 'mail' AND title = 'second'"))
+                .unwrap(),
+            1,
+            "the earlier batch's row survives"
+        );
+        assert_eq!(
+            idx.count(Some("app = 'mail' AND title = 'third'")).unwrap(),
+            0,
+            "a quarantined batch writes nothing"
+        );
+        assert!(staging.join("quarantine").join("crawl-2-0.jsonl").is_file());
+        assert_eq!(staged_batches(&staging), 0);
+    }
+
+    #[test]
+    fn fmt_lines_cuts_a_long_list_short_and_says_so() {
+        let lines = |range: std::ops::RangeInclusive<usize>| -> Vec<usize> { range.collect() };
+        assert_eq!(fmt_lines(&lines(1..=5)), "1, 2, 3, 4, 5");
+        assert_eq!(fmt_lines(&lines(1..=6)), "1, 2, 3, 4, 5, …");
+        assert_eq!(fmt_lines(&lines(1..=3)), "1, 2, 3");
+        assert_eq!(fmt_lines(&[]), "");
     }
 
     #[test]

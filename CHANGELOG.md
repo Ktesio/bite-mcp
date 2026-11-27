@@ -126,15 +126,15 @@ it can ship.
 
 - Staged batch ingest no longer holds every parsed record of the crawl in
   memory before the first write. `ingest_staged` makes two passes over the
-  staged `*.jsonl` files: a key pass that parses each line (so a malformed
-  batch is still quarantined whole, before any write) and keeps only its
+  staged `*.jsonl` files: a key pass that parses each line (so malformed
+  lines are found before any write) and keeps only its
   `(app, account, id)` key, then a write pass that re-reads each file and
   writes just the keep-last survivors, 512 rows at a time. Peak memory is
   bounded by one staged file plus one write chunk instead of the whole
   crawl: the indexed-mail tool call that trips the MCP server's
   opportunistic auto-ingest, and `index_rebuild`, no longer carry a full
-  copy of the crawl's bodies. Dedup, purge-scope (`index_forget`) and
-  quarantine outcomes are unchanged — keep-last is settled for the whole
+  copy of the crawl's bodies. Dedup and purge-scope (`index_forget`)
+  outcomes are unchanged — keep-last is settled for the whole
   crawl before the first write, so a superseded occurrence is never
   written and an older batch's copy of a purged message is still dropped.
   The trade is CPU: every line is parsed twice, once per pass.
@@ -165,7 +165,7 @@ it can ship.
 ### Fixed
 
 - One malformed line no longer quarantines the whole staged batch. Ingest
-  skipped the first line that failed to parse as a record and moved the
+  stopped at the first line that failed to parse as a record and moved the
   entire batch file to `batches/quarantine/`, so every other valid record
   in it never reached the index — and because the crawl watermark had
   already moved past the batch, those messages were gone from search. A
