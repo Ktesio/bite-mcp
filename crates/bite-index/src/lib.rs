@@ -80,6 +80,58 @@ fn batch_order_key(path: &Path) -> (u64, u64, std::path::PathBuf) {
     (job_ts, seq, path.to_path_buf())
 }
 
+/// Cross-batch dedup by (app, account, id), keeping the LAST occurrence:
+/// the crawler legitimately produces duplicate keys across batch files
+/// WITHIN one account (overlapping windows, restarts), and merge-insert
+/// PROHIBITS two source rows matching the same target key — without
+/// this, one duplicated message wedges the entire ingest forever. The
+/// account is part of the key: two accounts holding id "4127" are two
+/// distinct messages, and the old (app, id) key silently collapsed
+/// cross-account mail into one row. "Last" is the NEWEST batch because
+/// the caller orders the batch files by numeric seq before parsing them.
+/// Survivors keep their FIRST-seen order, for determinism.
+///
+/// The map's keys BORROW from the input, so the survivors are recorded
+/// as source INDICES, never cloned: a deep copy of every survivor used
+/// to sit beside the full parsed set until the caller returned, doubling
+/// the crawl's bodies in memory at the ingest peak. Returns the
+/// survivors and the number of dropped duplicates.
+fn dedup_keep_last(all_records: Vec<Record>) -> (Vec<Record>, usize) {
+    let mut key_index: std::collections::HashMap<(&str, &str, &str), usize> =
+        std::collections::HashMap::new();
+    let mut sources: Vec<usize> = Vec::with_capacity(all_records.len());
+    for (i, r) in all_records.iter().enumerate() {
+        let key = (
+            r.app.as_str(),
+            r.account.as_deref().unwrap_or(""),
+            r.id.as_str(),
+        );
+        match key_index.get(&key) {
+            Some(&slot) => sources[slot] = i,
+            None => {
+                key_index.insert(key, sources.len());
+                sources.push(i);
+            }
+        }
+    }
+    let dedup_dropped = all_records.len() - sources.len();
+    // In-place gather: move each survivor down to its first-seen slot. A
+    // survivor's index is never below its slot (it is the LAST occurrence
+    // of a key first seen at or after that slot), and no two survivors
+    // share an index, so every swap lands a survivor in a slot that was
+    // already emitted or superseded and leaves only dead data behind —
+    // nothing still needed is overwritten.
+    let mut unique = all_records;
+    for (slot, &src) in sources.iter().enumerate() {
+        debug_assert!(src >= slot, "survivor before its first-seen slot");
+        if src != slot {
+            unique.swap(slot, src);
+        }
+    }
+    unique.truncate(sources.len());
+    (unique, dedup_dropped)
+}
+
 /// Ingest every un-ingested `*.jsonl` batch in the staging dir (deleting each
 /// file on success — merge-insert makes re-ingest idempotent). Returns the
 /// number of batches ingested, the total rows written, the number of
@@ -171,34 +223,7 @@ pub fn ingest_staged(
             r.account = Some(String::new());
         }
     }
-    // Cross-batch dedup by (app, account, id), keeping the LAST occurrence:
-    // the crawler legitimately produces duplicate keys across batch files
-    // WITHIN one account (overlapping windows, restarts), and merge-insert
-    // PROHIBITS two source rows matching the same target key — without
-    // this, one duplicated message wedges the entire ingest forever. The
-    // account is part of the key: two accounts holding id "4127" are two
-    // distinct messages, and the old (app, id) key silently collapsed
-    // cross-account mail into one row. "Last" is the NEWEST batch because
-    // files are ordered by numeric seq above. First-seen order is preserved
-    // for determinism.
-    let mut key_index: std::collections::HashMap<(&str, &str, &str), usize> =
-        std::collections::HashMap::new();
-    let mut unique: Vec<Record> = Vec::with_capacity(all_records.len());
-    for r in &all_records {
-        let key = (
-            r.app.as_str(),
-            r.account.as_deref().unwrap_or(""),
-            r.id.as_str(),
-        );
-        match key_index.get(&key) {
-            Some(&i) => unique[i] = r.clone(),
-            None => {
-                key_index.insert(key, unique.len());
-                unique.push(r.clone());
-            }
-        }
-    }
-    let dedup_dropped = all_records.len() - unique.len();
+    let (mut unique, dedup_dropped) = dedup_keep_last(all_records);
     if dedup_dropped > 0 {
         eprintln!(
             "bite-index: deduplicated {dedup_dropped} duplicate (app,account,id) rows across batches"
@@ -385,6 +410,109 @@ mod tests {
         assert_eq!(idx.count(Some("app = 'mail'")).unwrap(), 1);
         let got = mail_hits(&idx);
         assert_eq!(got, vec![("Work".to_string(), "live job".to_string())]);
+    }
+
+    #[test]
+    fn dedup_gather_keeps_last_of_interleaved_keys() {
+        // The survivors are gathered in place from source indices, so pin
+        // a permutation whose sources are NOT ascending: `a` is first seen
+        // at 0 and last at 5, `b` first at 1 and last at 3, with singles in
+        // between. A gather that read a slot after overwriting it, or kept
+        // a stale first occurrence, shows up here as a wrong title.
+        // Keep-last and no-loss only: the hits come back through `search`
+        // and are sorted below, so the survivors' first-seen order is NOT
+        // observable here.
+        let staging = temp_staging("gather");
+        let idx = EntityIndex::open(&staging.join("index.lance")).unwrap();
+        write_batch(
+            &staging,
+            "crawl-1-0.jsonl",
+            &[
+                mail_record("a", Some("Work"), "a first"),
+                mail_record("b", Some("Work"), "b first"),
+                mail_record("c", Some("Work"), "c only"),
+                mail_record("b", Some("Work"), "b last"),
+            ],
+        );
+        write_batch(
+            &staging,
+            "crawl-1-1.jsonl",
+            &[
+                mail_record("d", Some("Work"), "d only"),
+                mail_record("a", Some("Work"), "a last"),
+            ],
+        );
+        let (batches, rows, quarantined, skipped) = ingest_staged(&idx, &staging, &[]).unwrap();
+        assert_eq!((batches, rows, quarantined, skipped), (2, 4, 0, 0));
+        let mut got = mail_hits(&idx);
+        got.sort();
+        assert_eq!(
+            got,
+            vec![
+                ("Work".to_string(), "a last".to_string()),
+                ("Work".to_string(), "b last".to_string()),
+                ("Work".to_string(), "c only".to_string()),
+                ("Work".to_string(), "d only".to_string()),
+            ]
+        );
+    }
+
+    fn survivor_titles(survivors: &[Record]) -> Vec<&str> {
+        survivors
+            .iter()
+            .map(|r| r.title.as_deref().unwrap_or_default())
+            .collect()
+    }
+
+    #[test]
+    fn dedup_keep_last_emits_survivors_in_first_seen_order() {
+        // Source indices [5, 3, 2, 4] — NOT ascending, so a gather that
+        // walked the sources in sorted order, or filled a slot with
+        // `swap_remove`, emits a different order here.
+        let (survivors, dropped) = dedup_keep_last(vec![
+            mail_record("a", Some("Work"), "a first"),
+            mail_record("b", Some("Work"), "b first"),
+            mail_record("c", Some("Work"), "c only"),
+            mail_record("b", Some("Work"), "b last"),
+            mail_record("d", Some("Work"), "d only"),
+            mail_record("a", Some("Work"), "a last"),
+        ]);
+        assert_eq!(
+            survivor_titles(&survivors),
+            ["a last", "b last", "c only", "d only"]
+        );
+        assert_eq!(dropped, 2);
+    }
+
+    #[test]
+    fn dedup_keep_last_reads_single_keys_after_earlier_swaps() {
+        // Sources are [2, 3] — two keys, two slots. Slot 0 is filled by
+        // swap(0, 2), which leaves a dead `x` at index 2; the single `y`
+        // at index 3 is then read for slot 1 and must come from its
+        // source, not the slot (index 1 still holds `x middle`).
+        let (survivors, dropped) = dedup_keep_last(vec![
+            mail_record("x", Some("Work"), "x first"),
+            mail_record("x", Some("Work"), "x middle"),
+            mail_record("x", Some("Work"), "x last"),
+            mail_record("y", Some("Work"), "y only"),
+        ]);
+        assert_eq!(survivor_titles(&survivors), ["x last", "y only"]);
+        assert_eq!(dropped, 2);
+    }
+
+    #[test]
+    fn dedup_keep_last_passes_unique_records_through() {
+        // Same id in two accounts is two keys, and both survive in order.
+        let (survivors, dropped) = dedup_keep_last(vec![
+            mail_record("a", Some("Work"), "a work"),
+            mail_record("a", Some("Home"), "a home"),
+        ]);
+        assert_eq!(survivor_titles(&survivors), ["a work", "a home"]);
+        assert_eq!(dropped, 0);
+
+        let (survivors, dropped) = dedup_keep_last(Vec::new());
+        assert!(survivors.is_empty());
+        assert_eq!(dropped, 0);
     }
 
     #[test]
