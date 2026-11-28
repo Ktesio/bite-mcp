@@ -393,6 +393,15 @@ it can ship.
   degrade attempt outlast the ceiling `timeout_secs` is documented to
   enforce.
 
+- `bite-bridge`, `bite-core` and `bite-index` published without a
+  `repository` link: the three crates inherited `version`, `edition`,
+  `license` and `rust-version` from `[workspace.package]` but not
+  `repository`, so their crates.io pages linked to no source (only
+  `bite-mcp` did). Each now sets `repository.workspace = true`. Manifest
+  metadata only: no code, feature or dependency change. The README's
+  Documentation section also notes that docs.rs cannot build `bite-mcp`,
+  a binary-only package.
+
 ## [v0.5.0] - 2026-10-22
 
 This release adds scoped, durable index purges (index_forget MCP tool and bite index forget CLI), an opt-in skip of the exact-total count scan, and safer helper-death replay semantics. It also enforces data-dir privacy at startup, resolves kill from absolute paths, dispatches requests concurrently, and updates dependencies including rustls-webpki for RUSTSEC-2026-0382.
