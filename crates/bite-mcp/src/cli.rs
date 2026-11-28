@@ -98,7 +98,7 @@ pub enum Cmd {
         cmd: MessagesCmd,
     },
     // ── Entity index ──
-    /// Local search index: rebuild, status, cancel, forget, wipe
+    /// Local search index: rebuild, status, cancel, forget, unforget, wipe
     Index {
         #[command(subcommand)]
         cmd: IndexCmd,
