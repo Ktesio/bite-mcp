@@ -83,8 +83,10 @@ with your data. bite itself adds no network hop; choose agents you trust.
   A scoped `index_forget` is durable: the scope is
   recorded and later crawls skip
   it, so a full re-crawl does not re-import what you deliberately purged
-  (`index_status` lists the recorded scopes). To re-include a purged
-  scope, `bite index wipe` gives a clean slate with no purge records and a
+  (`index_status` lists the recorded scopes). To re-include one purged
+  scope, `bite index unforget` (CLI only, so no MCP client can lift a
+  purge) drops its record and the next full crawl imports that scope again;
+  `bite index wipe` gives a clean slate with no purge records and a
   fresh rebuild. Rebuilds can also be run body-off (`index_rebuild` with
   `no_body`, CLI `bite index rebuild --no-body`): the index stores mail
   metadata only and message bodies never enter the local store.

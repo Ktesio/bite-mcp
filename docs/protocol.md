@@ -369,6 +369,21 @@ stays on `index_wipe`, which also clears the watermark, the staging dir and
 the recorded purge scopes — a wiped-and-rebuilt index starts with no
 tombstones.
 
+Lifting ONE scope is `bite index unforget --app <name> [--container <name>]`
+(add `--yes`; without it the call only prints a `would_unforget` preview).
+The arguments must match a recorded scope exactly — the identity
+`index_forget` dedupes on — so lifting one scope never widens into a
+neighbour: an app-wide
+request leaves `{mail, Junk}` recorded and reports 0 together with the
+recorded list. Afterwards the scope is no longer skipped at ingest, but
+rows already crawled do not return on their own (the delta watermark has
+moved past them): the next `full: true` crawl imports them, scoped to one
+mailbox with `bite index rebuild --full --mailbox <name>`. The command is
+CLI-only on purpose — no MCP tool can re-include a scope the user purged;
+lifting every record at once stays on `index_wipe`. The read-modify-write
+runs under the store's writer lock, the lock a confirmed `index_forget`
+records its scope under, so the two cannot drop each other's entry.
+
 Unparseable batches are quarantined to `batches/quarantine/` — ingest
 continues; the quarantine keeps at most 200 files (evicted oldest-by-mtime).
 Quarantined files are counted as `quarantined` in the ingest output and

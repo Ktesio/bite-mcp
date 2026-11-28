@@ -1252,6 +1252,18 @@ fn forget_filter(app: Option<&str>, container: Option<&str>) -> String {
     parts.join(" AND ")
 }
 
+/// One scope argument of `index_forget` / `unforget` (`app` or `container`).
+/// Empty strings count as absent: a JSON `"app": ""` must be refused like a
+/// missing one, not become a filter matching nothing-but-still-scanned.
+fn scope_arg(params: &Value, key: &str) -> Option<String> {
+    params
+        .get(key)
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+}
+
 // ── purge-scope tombstones ──────────────────────────────────────────────────
 
 /// Recorded `index_forget` scopes. Consulted at every ingest so rows inside
@@ -1374,20 +1386,8 @@ fn finish_purge(
 /// DIFFERENT index all leave the scope out. `index_wipe` clears the
 /// tombstone set too — it stays the one true complete reset.
 pub fn forget(params: &Value) -> Result<Value, BiteError> {
-    // Empty strings count as absent: a JSON `"app": ""` must be refused like
-    // a missing one, not become a filter matching nothing-but-still-scanned.
-    let app = params
-        .get("app")
-        .and_then(|v| v.as_str())
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_owned);
-    let container = params
-        .get("container")
-        .and_then(|v| v.as_str())
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_owned);
+    let app = scope_arg(params, "app");
+    let container = scope_arg(params, "container");
     let confirm = params
         .get("confirm")
         .and_then(|v| v.as_bool())
@@ -1473,6 +1473,129 @@ pub fn forget(params: &Value) -> Result<Value, BiteError> {
                 },
             ],
         ))
+    })
+}
+
+/// Preview of a confirmed-`unforget` scope: how many recorded tombstones
+/// (0 or 1 — `record_purge_scope` dedupes on the same identity) the exact
+/// app+container names, plus the recorded list when the answer is none, so
+/// the caller can see which scopes ARE recorded instead of guessing.
+fn unforget_preview(path: &std::path::Path, app: Option<&str>, container: Option<&str>) -> Value {
+    let recorded = read_purge_scopes(path);
+    let matches = recorded
+        .iter()
+        .filter(|s| s.same_scope(app, container))
+        .count();
+    let mut out = json!({
+        "would_unforget": matches,
+        "scope": { "app": app, "container": container },
+        "confirm_required": true,
+    });
+    if matches == 0 {
+        out["recorded"] = json!(recorded);
+    }
+    out
+}
+
+/// Remove the tombstone whose app+container match EXACTLY from the recorded
+/// set: the remaining entries are rewritten 0600, or the file is deleted
+/// when the last one goes (the fresh-install shape — no file = no scopes).
+/// Returns how many entries were removed (0 or 1) and the set as it stands
+/// after the call. A call that matches nothing writes nothing.
+fn unforget_scope(
+    path: &std::path::Path,
+    app: Option<&str>,
+    container: Option<&str>,
+) -> std::io::Result<(usize, Vec<bite_index::PurgeScope>)> {
+    let mut scopes = read_purge_scopes(path);
+    let before = scopes.len();
+    scopes.retain(|s| !s.same_scope(app, container));
+    let removed = before - scopes.len();
+    if removed == 0 {
+        return Ok((0, scopes));
+    }
+    if scopes.is_empty() {
+        match std::fs::remove_file(path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+    } else {
+        let bytes = serde_json::to_vec_pretty(&scopes)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        bite_core::fsops::write_private(path, &bytes)?;
+    }
+    Ok((removed, scopes))
+}
+
+/// CLI-only undo of ONE recorded purge scope (`bite index unforget --app
+/// <name> [--container <name>]`; without `confirm` it only previews).
+///
+/// The arguments must match a recorded scope exactly — the identity
+/// `record_purge_scope` dedupes on — so lifting one scope can never widen
+/// into a neighbour: an app-wide request does not touch `{mail, Junk}`, and
+/// a miss removes nothing and reports what IS recorded. Afterwards the scope
+/// is no longer skipped at ingest, but rows already crawled do not return
+/// by themselves (the delta watermark has moved past them): the next
+/// `full: true` crawl imports them — `bite index rebuild --full --mailbox
+/// <name>` for one mailbox.
+///
+/// CLI-only on purpose: an MCP client must not be able to re-include a
+/// mailbox the user deliberately purged. The complete reset stays on
+/// `index_wipe`.
+pub fn unforget(params: &Value) -> Result<Value, BiteError> {
+    let app = scope_arg(params, "app");
+    let container = scope_arg(params, "container");
+    let confirm = params
+        .get("confirm")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    if app.is_none() && container.is_none() {
+        return Ok(json!({
+            "error": "unforget requires a scope: pass app and/or container naming a recorded purge scope exactly (bite index status lists them). For a complete reset use index_wipe (CLI: bite index wipe).",
+        }));
+    }
+    let path = purge_scopes_path();
+    if !confirm {
+        return Ok(unforget_preview(
+            &path,
+            app.as_deref(),
+            container.as_deref(),
+        ));
+    }
+    // Writer lock across the read-modify-write, the same lock a confirmed
+    // `index_forget` records its tombstone under: an un-forget racing a
+    // purge then either goes first (the purge re-reads the file and keeps
+    // its own entry) or second (it sees the new entry). An unlocked rewrite
+    // could drop a tombstone the user has just confirmed, silently ending
+    // that purge's durability. Busy is an explicit retry error, as for the
+    // purge.
+    with_index(|index| {
+        let _writer = index.lock_writer().map_err(|e| {
+            BridgeError::new(
+                "index_lock_error",
+                format!(
+                    "index is being written by another bite process — retry bite index unforget shortly ({e})"
+                ),
+            )
+        })?;
+        let (removed, remaining) = unforget_scope(&path, app.as_deref(), container.as_deref())
+            .map_err(|e| BridgeError::new("index_error", e.to_string()))?;
+        let mut out = json!({
+            "unforgotten": removed,
+            "scope": { "app": app, "container": container },
+        });
+        if removed == 0 {
+            out["recorded"] = json!(remaining);
+            out["note"] = json!(
+                "no recorded purge scope matches exactly — nothing changed (bite index status lists the recorded scopes)"
+            );
+        } else {
+            out["note"] = json!(
+                "the scope is no longer skipped at ingest; its rows return with the next full crawl (bite index rebuild --full, or --mailbox <name> for one mailbox)"
+            );
+        }
+        Ok(out)
     })
 }
 
@@ -1903,6 +2026,95 @@ mod tests {
         // and recording again over the corrupt file heals it
         record_purge_scope(&path, Some("mail"), Some("Junk")).unwrap();
         assert_eq!(read_purge_scopes(&path).len(), 1);
+    }
+
+    #[test]
+    fn unforget_lifts_exactly_the_matching_tombstone_and_keeps_the_rest() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("purge-scopes.json");
+        record_purge_scope(&path, Some("mail"), Some("Junk")).unwrap();
+        record_purge_scope(&path, None, Some("Spam")).unwrap();
+        record_purge_scope(&path, Some("calendar"), None).unwrap();
+
+        // A wider or narrower ask is NOT the recorded identity: nothing
+        // moves, and the preview says so while listing what is recorded.
+        let preview = unforget_preview(&path, Some("mail"), None);
+        assert_eq!(
+            preview["would_unforget"],
+            json!(0),
+            "app-wide ask must not name (mail, Junk)"
+        );
+        assert_eq!(preview["confirm_required"], json!(true));
+        assert_eq!(
+            preview["recorded"].as_array().map(Vec::len),
+            Some(3),
+            "a miss lists the recorded scopes"
+        );
+        let (n, left) = unforget_scope(&path, Some("mail"), None).unwrap();
+        assert_eq!(n, 0, "an app-wide request must not lift (mail, Junk)");
+        assert_eq!(left.len(), 3, "a miss removes nothing");
+        let (n, _) = unforget_scope(&path, None, Some("Junk")).unwrap();
+        assert_eq!(n, 0, "a container-only request must not lift (mail, Junk)");
+        assert_eq!(read_purge_scopes(&path).len(), 3);
+
+        // The exact identity goes, its neighbours stay, the file stays 0600.
+        let preview = unforget_preview(&path, Some("mail"), Some("Junk"));
+        assert_eq!(preview["would_unforget"], json!(1));
+        assert!(
+            preview.get("recorded").is_none(),
+            "a hit needs no recorded list"
+        );
+        let bytes_before = std::fs::read(&path).unwrap();
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            bytes_before,
+            "the preview must not write"
+        );
+        let (n, left) = unforget_scope(&path, Some("mail"), Some("Junk")).unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(left.len(), 2);
+        assert!(left.iter().any(|s| s.same_scope(None, Some("Spam"))));
+        assert!(left.iter().any(|s| s.same_scope(Some("calendar"), None)));
+        let after = read_purge_scopes(&path);
+        assert_eq!(after, left, "the rewrite must round-trip what remains");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "tombstone file must stay 0600");
+        }
+
+        // The last tombstone takes the file with it: the fresh-install shape.
+        assert_eq!(unforget_scope(&path, None, Some("Spam")).unwrap().0, 1);
+        let (n, left) = unforget_scope(&path, Some("calendar"), None).unwrap();
+        assert_eq!(n, 1);
+        assert!(left.is_empty());
+        assert!(
+            !path.exists(),
+            "no tombstones left = no file, as on a fresh install"
+        );
+        assert!(read_purge_scopes(&path).is_empty());
+        // and a repeat against the missing file is a clean no-op
+        assert_eq!(unforget_scope(&path, Some("calendar"), None).unwrap().0, 0);
+    }
+
+    #[test]
+    fn unforget_without_scope_is_refused_before_touching_anything() {
+        // No scope: refused up front, before the data dir is read — a bare
+        // `--yes` must never mean "lift every tombstone" (that is wipe).
+        for params in [
+            json!({}),
+            json!({ "confirm": true }),
+            json!({ "app": "  ", "container": "", "confirm": true }),
+        ] {
+            let out = unforget(&params).expect("refusal is a normal result");
+            let err = out["error"].as_str().expect("refusal names the reason");
+            assert!(err.contains("requires a scope"), "got: {err}");
+            assert!(
+                err.contains("index_wipe"),
+                "refusal points at the complete reset"
+            );
+        }
     }
 
     #[test]

@@ -13,6 +13,18 @@ it can ship.
 
 ### Added
 
+- `bite index unforget --app <name> [--container <name>]` lifts the purge
+  record of ONE scope, so a deliberately purged mailbox or container can
+  be indexed again without `bite index wipe` dropping every other purge
+  record along with the crawl watermark. Without `--yes` it prints a
+  `would_unforget` preview. The scope must match a recorded one exactly,
+  so lifting it never widens into a neighbour: a miss removes nothing and
+  lists the recorded scopes. Rows already crawled return with the next
+  full crawl (`bite index rebuild --full`, or `--mailbox <name>` for one
+  mailbox) — a delta crawl does not go back for them. CLI-only by design:
+  no MCP tool can re-include a purged scope. The `bite index forget` help
+  text still promised that a full crawl re-imports purged rows, which
+  stopped being true when purges became durable; it now matches.
 - Settled `idempotency_key` records (replayable outcomes and unknown pins)
   are now durable: they persist to a 0600 `idempotency-ledger.json` in the
   private data dir and reload on startup, so a server restart between a
