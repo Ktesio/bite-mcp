@@ -170,9 +170,13 @@ it can ship.
   in it never reached the index — and because the crawl watermark had
   already moved past the batch, those messages were gone from search. A
   malformed line is now skipped and counted (`skipped_malformed` in the
-  ingest output, one stderr note naming the file and line numbers), and a
+  ingest output; one stderr note naming the file and line numbers), and a
   batch is quarantined only when it cannot be read as a whole or when every
-  non-blank line in it is malformed.
+  non-blank line in it is malformed. The count is also recorded in
+  `index_status`'s `last_errors` (`ingest: skipped N malformed line(s) …`),
+  since the batch file is deleted once ingested and the callers discard the
+  ingest output — without it a skipped record left no trace a client could
+  see.
 - The privacy sweep missed the data dir's root-level state files:
   `crawl-state.json` (written 0600 by the Swift helper, but a copy left
   loose by a restored backup or a moved data dir stays loose —

@@ -230,11 +230,13 @@ fn ingest_pending_if_due(index: &bite_index::EntityIndex) {
     let Ok(_writer) = index.lock_writer() else {
         return;
     };
-    let _ = bite_index::ingest_staged(index, &staging(), &read_purge_scopes(&purge_scopes_path()))
-        .map_err(|e| {
+    match bite_index::ingest_staged(index, &staging(), &read_purge_scopes(&purge_scopes_path())) {
+        Ok((_, _, _, _, skipped_malformed)) => note_skipped_malformed(skipped_malformed),
+        Err(e) => {
             eprintln!("bite auto-ingest error: {e}");
             record_index_error("auto-ingest", &e.to_string());
-        });
+        }
+    }
     let _ = fs2::FileExt::unlock(&lock);
     // writer lock still held here (guard `_writer` lives to fn end), so the
     // optimize serializes against concurrent ingests
@@ -257,6 +259,27 @@ fn record_index_error(source: &str, err: &str) {
     if overflow > 0 {
         errs.drain(0..overflow);
     }
+}
+
+/// Surface a malformed-line skip where clients look. The batch file is
+/// deleted once ingested and the crawl watermark has already moved past
+/// it, so the stderr note alone leaves no trace `index_status` (or a
+/// later session) can see — records silently missing from the index.
+/// ONE entry per ingest, never one per batch: the tail is capped at
+/// `LAST_ERRORS_MAX`, and a crawler bug that breaks a field in every
+/// batch would otherwise evict the real failures. File names and line
+/// numbers stay on stderr (the note never carries line content).
+fn note_skipped_malformed(skipped_malformed: usize) {
+    if skipped_malformed == 0 {
+        return;
+    }
+    record_index_error(
+        "ingest",
+        &format!(
+            "skipped {skipped_malformed} malformed line(s) from staged batches; \
+             those records are not in the index (files and line numbers are noted on stderr)"
+        ),
+    );
 }
 
 /// Raw `crawl-state.json` text — the signature for "which crawl state has
@@ -492,6 +515,9 @@ pub fn ingest_pending() -> Result<Value, BiteError> {
         if skipped_malformed > 0 {
             out["skipped_malformed"] = json!(skipped_malformed);
         }
+        // the callers discard this output (`let _ =` / `.ok()`), so the
+        // skip must ALSO reach `index_status` `last_errors`
+        note_skipped_malformed(skipped_malformed);
         Ok(out)
     })
 }
@@ -2541,8 +2567,14 @@ mod tests {
         );
     }
 
+    /// Serializes the tests that touch the global `LAST_INDEX_ERRORS`:
+    /// libtest runs tests in parallel, and one test's push landing between
+    /// another's two reads reads as a wrong count or a wrong tail.
+    static LAST_ERRORS_TEST_LOCK: Mutex<()> = Mutex::new(());
+
     #[test]
     fn index_error_record_dedupes_repeats_and_caps_length() {
+        let _serial = LAST_ERRORS_TEST_LOCK.lock().unwrap();
         // NOTE: global static — tolerates entries left by other tests
         let before = LAST_INDEX_ERRORS.lock().unwrap().len();
         record_index_error("auto-ingest", "boom");
@@ -2563,6 +2595,35 @@ mod tests {
                 .unwrap()
                 .ends_with(&format!("e{}", LAST_ERRORS_MAX * 2 - 1)),
             "the newest failure survives the cap: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn skipped_malformed_lines_reach_index_status_last_errors() {
+        let _serial = LAST_ERRORS_TEST_LOCK.lock().unwrap();
+        // NOTE: global static — the tail may already be full from the
+        // dedupe test, so every assertion is on the NEWEST entry, which
+        // the cap always keeps
+        let (before_len, before_last) = {
+            let errs = LAST_INDEX_ERRORS.lock().unwrap();
+            (errs.len(), errs.last().cloned())
+        };
+        // a clean ingest records nothing: no standing noise on healthy polls
+        note_skipped_malformed(0);
+        {
+            let errs = LAST_INDEX_ERRORS.lock().unwrap();
+            assert_eq!(errs.len(), before_len);
+            assert_eq!(errs.last().cloned(), before_last);
+        }
+        note_skipped_malformed(3);
+        let last = LAST_INDEX_ERRORS.lock().unwrap().last().cloned();
+        assert_eq!(
+            last.as_deref(),
+            Some(
+                "ingest: skipped 3 malformed line(s) from staged batches; \
+                 those records are not in the index (files and line numbers are noted on stderr)"
+            ),
+            "the entry must name the source, the count and the consequence"
         );
     }
 

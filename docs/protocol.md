@@ -375,8 +375,12 @@ Quarantined files are counted as `quarantined` in the ingest output and
 toward `pending_batches`. A batch is quarantined only when it cannot be read
 as a whole or when every non-blank line in it is malformed. A batch whose
 malformed lines sit among valid ones is ingested without them (one stderr
-note naming the file and the line numbers, never their content); the count
-appears as `skipped_malformed` in the ingest output when it is non-zero.
+note naming the file and the line numbers, never their content). Because
+the batch file is deleted once ingested and the crawl watermark has moved
+past it, the skip count is recorded where clients look: `index_status`
+carries `ingest: skipped N malformed line(s) …` in `last_errors` (one
+entry per ingest), and the count appears as `skipped_malformed` in the
+ingest output when it is non-zero.
 
 ### Worker lifecycle
 
