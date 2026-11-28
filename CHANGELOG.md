@@ -172,11 +172,15 @@ it can ship.
   malformed line is now skipped and counted (`skipped_malformed` in the
   ingest output; one stderr note naming the file and line numbers), and a
   batch is quarantined only when it cannot be read as a whole or when every
-  non-blank line in it is malformed. The count is also recorded in
-  `index_status`'s `last_errors` (`ingest: skipped N malformed line(s) …`),
-  since the batch file is deleted once ingested and the callers discard the
-  ingest output — without it a skipped record left no trace a client could
-  see.
+  non-blank line in it is malformed. The skip is also recorded in
+  `index_status`'s `last_errors` as ONE `ingest: skipped N malformed
+  line(s) …` entry whose N is the running total since the server process
+  started (a later skip replaces the entry, so a streak of same-sized
+  skips does not read as a single missing record), since the batch file
+  is deleted once ingested and the callers discard the ingest output —
+  without it a skipped record left no trace a client of the same process
+  could see. The note is not persisted: it is gone after a restart, while
+  the missing records are not.
 - The privacy sweep missed the data dir's root-level state files:
   `crawl-state.json` (written 0600 by the Swift helper, but a copy left
   loose by a restored backup or a moved data dir stays loose —

@@ -2,7 +2,7 @@
 //! staged-batch ingester, the local (non-helper) index tools, and the
 //! index-backed fast path for Mail search.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
@@ -67,11 +67,21 @@ static CRAWL_STATE_CACHE: Mutex<Option<CrawlStateHit>> = Mutex::new(None);
 /// Last background index failures (auto-ingest, post-crawl FTS refresh).
 /// Those paths deliberately never fail the tool call that carried them —
 /// without this record the failure is visible only on this process's
-/// stderr. `index_status` surfaces the tail as `last_errors`.
+/// stderr. `index_status` surfaces the tail as `last_errors`. The list is
+/// process-local and never written to disk: a restarted server starts
+/// with an empty list, whatever the previous process recorded.
 static LAST_INDEX_ERRORS: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
 /// Cap so a repeating failure can't grow the status payload unboundedly.
 const LAST_ERRORS_MAX: usize = 8;
+
+/// `last_errors` prefix of the malformed-line skip note — the note finds
+/// its own previous entry by it, so it can replace that entry.
+const SKIPPED_NOTE_PREFIX: &str = "ingest: skipped ";
+
+/// Malformed lines skipped by staged ingests since THIS process started:
+/// the running total the skip note carries.
+static SKIPPED_MALFORMED_TOTAL: AtomicUsize = AtomicUsize::new(0);
 
 /// RAII guard for `IN_INGEST_PENDING`: set on acquire, cleared on drop —
 /// panic-safe, so a panicking ingest can never wedge this process's
@@ -261,25 +271,39 @@ fn record_index_error(source: &str, err: &str) {
     }
 }
 
-/// Surface a malformed-line skip where clients look. The batch file is
-/// deleted once ingested and the crawl watermark has already moved past
-/// it, so the stderr note alone leaves no trace `index_status` (or a
-/// later session) can see — records silently missing from the index.
-/// ONE entry per ingest, never one per batch: the tail is capped at
-/// `LAST_ERRORS_MAX`, and a crawler bug that breaks a field in every
-/// batch would otherwise evict the real failures. File names and line
+/// Surface a malformed-line skip where the clients of THIS process look.
+/// The batch file is deleted once ingested and the crawl watermark has
+/// already moved past it, so the stderr note alone leaves no trace
+/// `index_status` can see — records silently missing from the index.
+/// The note lasts as long as the process that ran the ingest: it is not
+/// persisted, while the missing records are.
+/// ONE entry carrying a RUNNING TOTAL since process start, never one per
+/// ingest: `record_index_error` drops an entry identical to the last one,
+/// so a streak of same-sized skips (a crawler bug breaking one field in
+/// each batch) would collapse into a single line that understates the
+/// loss. The refreshed note replaces the previous one at the tail, where
+/// the newest event belongs, so it takes one slot and can never evict the
+/// real failures from the `LAST_ERRORS_MAX` tail. File names and line
 /// numbers stay on stderr (the note never carries line content).
 fn note_skipped_malformed(skipped_malformed: usize) {
     if skipped_malformed == 0 {
         return;
     }
-    record_index_error(
-        "ingest",
-        &format!(
-            "skipped {skipped_malformed} malformed line(s) from staged batches; \
-             those records are not in the index (files and line numbers are noted on stderr)"
-        ),
+    let total =
+        SKIPPED_MALFORMED_TOTAL.fetch_add(skipped_malformed, Ordering::Relaxed) + skipped_malformed;
+    let entry = format!(
+        "{SKIPPED_NOTE_PREFIX}{total} malformed line(s) from staged batches so far in this process; \
+         those records are not in the index (files and line numbers are noted on stderr)"
     );
+    let mut errs = LAST_INDEX_ERRORS.lock().unwrap();
+    if let Some(i) = errs.iter().position(|e| e.starts_with(SKIPPED_NOTE_PREFIX)) {
+        errs.remove(i);
+    }
+    errs.push(entry);
+    let overflow = errs.len().saturating_sub(LAST_ERRORS_MAX);
+    if overflow > 0 {
+        errs.drain(0..overflow);
+    }
 }
 
 /// Raw `crawl-state.json` text — the signature for "which crawl state has
@@ -2604,6 +2628,7 @@ mod tests {
         // NOTE: global static — the tail may already be full from the
         // dedupe test, so every assertion is on the NEWEST entry, which
         // the cap always keeps
+        let total_before = SKIPPED_MALFORMED_TOTAL.load(Ordering::Relaxed);
         let (before_len, before_last) = {
             let errs = LAST_INDEX_ERRORS.lock().unwrap();
             (errs.len(), errs.last().cloned())
@@ -2617,13 +2642,76 @@ mod tests {
         }
         note_skipped_malformed(3);
         let last = LAST_INDEX_ERRORS.lock().unwrap().last().cloned();
+        // NOTE: the total is process-wide, so the pin is on the DELTA
+        let expected = format!(
+            "{SKIPPED_NOTE_PREFIX}{} malformed line(s) from staged batches so far in this process; \
+             those records are not in the index (files and line numbers are noted on stderr)",
+            total_before + 3
+        );
         assert_eq!(
             last.as_deref(),
-            Some(
-                "ingest: skipped 3 malformed line(s) from staged batches; \
-                 those records are not in the index (files and line numbers are noted on stderr)"
-            ),
-            "the entry must name the source, the count and the consequence"
+            Some(expected.as_str()),
+            "the entry must name the source, the running total and the consequence"
+        );
+    }
+
+    #[test]
+    fn repeated_skips_keep_one_entry_carrying_the_running_total() {
+        let _serial = LAST_ERRORS_TEST_LOCK.lock().unwrap();
+        // NOTE: global statics — pins are on the DELTA and on the number of
+        // skip entries, never on an absolute total
+        let total_before = SKIPPED_MALFORMED_TOTAL.load(Ordering::Relaxed);
+        // a crawler bug breaking one field in each batch: three ingests,
+        // each skipping a single line
+        note_skipped_malformed(1);
+        note_skipped_malformed(1);
+        note_skipped_malformed(1);
+        let errs = LAST_INDEX_ERRORS.lock().unwrap();
+        let notes: Vec<&str> = errs
+            .iter()
+            .map(String::as_str)
+            .filter(|e| e.starts_with(SKIPPED_NOTE_PREFIX))
+            .collect();
+        assert_eq!(
+            notes.len(),
+            1,
+            "same-sized skips must neither collapse into one stale line nor stack up: {errs:?}"
+        );
+        assert!(
+            notes[0].starts_with(&format!(
+                "{SKIPPED_NOTE_PREFIX}{} malformed line(s)",
+                total_before + 3
+            )),
+            "the entry carries the running total, not the last ingest's count: {}",
+            notes[0]
+        );
+        assert_eq!(
+            errs.last().map(String::as_str),
+            Some(notes[0]),
+            "the refreshed note is the newest event, at the tail"
+        );
+        drop(errs);
+        // a real failure between two skips keeps its slot: the refreshed
+        // note replaces only its own earlier entry
+        record_index_error("auto-ingest", "real failure between skips");
+        note_skipped_malformed(2);
+        let errs = LAST_INDEX_ERRORS.lock().unwrap();
+        assert_eq!(
+            errs.iter()
+                .filter(|e| e.starts_with(SKIPPED_NOTE_PREFIX))
+                .count(),
+            1,
+            "still one skip entry: {errs:?}"
+        );
+        assert!(
+            errs.iter()
+                .any(|e| e == "auto-ingest: real failure between skips"),
+            "the real failure survives the refresh: {errs:?}"
+        );
+        assert_eq!(
+            SKIPPED_MALFORMED_TOTAL.load(Ordering::Relaxed),
+            total_before + 5,
+            "the counter adds every skip"
         );
     }
 
