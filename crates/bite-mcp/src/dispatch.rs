@@ -648,6 +648,19 @@ fn dispatch(cli: crate::cli::Cli) -> Result<i32, BiteError> {
                         Some(&h),
                     )?)
                 }
+                // CLI-only on purpose: unforget lifts a deliberate purge, so
+                // it has no MCP tool to route through (see index::unforget).
+                IndexCmd::Unforget {
+                    app,
+                    container,
+                    yes,
+                } => {
+                    let mut p = Map::new();
+                    insert_opt(&mut p, "app", app);
+                    insert_opt(&mut p, "container", container);
+                    p.insert("confirm".into(), json!(yes));
+                    finish(crate::index::unforget(&Value::Object(p))?)
+                }
                 IndexCmd::Wipe { yes } => finish(crate::index::wipe(yes)?),
             }
         }

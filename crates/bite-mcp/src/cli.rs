@@ -98,7 +98,7 @@ pub enum Cmd {
         cmd: MessagesCmd,
     },
     // ── Entity index ──
-    /// Local search index: rebuild, status, cancel, forget, wipe
+    /// Local search index: rebuild, status, cancel, forget, unforget, wipe
     Index {
         #[command(subcommand)]
         cmd: IndexCmd,
@@ -192,9 +192,21 @@ pub enum IndexCmd {
     Cancel,
     /// Purge indexed rows scoped by --app and/or --container (local index
     /// only; Apple data is never touched). Without --yes prints a
-    /// would_delete preview. The delta watermark survives, so a delta
-    /// crawl does not resurrect purged rows — a full crawl re-imports them.
+    /// would_delete preview. The scope is recorded, so later crawls skip it
+    /// — full ones included; `bite index unforget` lifts that for one scope.
     Forget {
+        #[arg(long)]
+        app: Option<String>,
+        #[arg(long)]
+        container: Option<String>,
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Lift the purge record of ONE scope so a full crawl can import it
+    /// again (--app/--container must match a recorded scope exactly;
+    /// `bite index status` lists them). Without --yes prints a preview.
+    /// CLI only: no MCP tool can re-include a purged scope.
+    Unforget {
         #[arg(long)]
         app: Option<String>,
         #[arg(long)]
