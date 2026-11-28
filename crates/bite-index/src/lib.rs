@@ -117,18 +117,49 @@ const FLUSH_ROWS: usize = 512;
 
 /// The key pass for ONE staged file: parse every non-empty line (validating
 /// it exactly as the write pass will) and keep only each record's
-/// [`DedupKey`]. A parse failure surfaces before any of the file's keys is
-/// used, so a poison batch can never stand as the newest occurrence of a
-/// key — quarantining it must not take the good row of an earlier batch
-/// along with it.
-fn key_pass(file: &Path) -> Result<Vec<DedupKey>, store::IndexError> {
-    let text = std::fs::read_to_string(file)?;
-    store::parse_jsonl_text(&text, file)
-        .map(|record| {
-            let r = record?;
-            Ok((r.app, r.account.unwrap_or_default(), r.id))
-        })
-        .collect()
+/// [`DedupKey`]. A malformed line yields no key and is reported by line
+/// number instead of failing the file; a read failure surfaces before any
+/// of the file's keys is used, so a poison batch can never stand as the
+/// newest occurrence of a key — quarantining it must not take the good row
+/// of an earlier batch along with it.
+fn key_pass(file: &Path) -> Result<(Vec<DedupKey>, Vec<usize>), store::IndexError> {
+    let parsed = store::parse_jsonl(file)?;
+    let lines = parsed.bad_lines.iter().map(|bad| bad.line).collect();
+    let keys = parsed
+        .records
+        .into_iter()
+        .map(|r| (r.app, r.account.unwrap_or_default(), r.id))
+        .collect();
+    Ok((keys, lines))
+}
+
+/// One stderr note per partially malformed batch: the file and the line
+/// numbers that were skipped (the first few). Line CONTENT is never printed
+/// — a malformed mail record is still mail.
+fn note_malformed(file: &Path, bad_lines: &[usize]) {
+    eprintln!(
+        "bite-index: skipped {} malformed line(s) in {}: lines {}",
+        bad_lines.len(),
+        file.display(),
+        fmt_lines(bad_lines)
+    );
+}
+
+/// The first few malformed line numbers, comma-separated, ending in "…"
+/// when the list was cut short. One formatter for the skipped-line note
+/// and the all-malformed quarantine note, so both read the same for the
+/// same lines.
+fn fmt_lines(bad_lines: &[usize]) -> String {
+    const SHOWN: usize = 5;
+    let mut listed: Vec<String> = bad_lines
+        .iter()
+        .take(SHOWN)
+        .map(std::string::ToString::to_string)
+        .collect();
+    if bad_lines.len() > SHOWN {
+        listed.push("…".to_string());
+    }
+    listed.join(", ")
 }
 
 /// Move one unreadable batch to `<staging>/quarantine/` (created 0700) and
@@ -175,9 +206,16 @@ fn quarantine_batch(file: &Path, quarantine: &Path) -> bool {
 /// Ingest every un-ingested `*.jsonl` batch in the staging dir (deleting each
 /// file on success — merge-insert makes re-ingest idempotent). Returns the
 /// number of batches ingested, the total rows written, the number of
-/// unreadable batches quarantined (moved to `<staging>/quarantine/`), and the
-/// rows dropped because they matched a recorded purge scope (`index_forget`)
-/// — purged scopes must not come back with the next full crawl.
+/// batches quarantined (moved to `<staging>/quarantine/`), the rows dropped
+/// because they matched a recorded purge scope (`index_forget`) — purged
+/// scopes must not come back with the next full crawl — and the lines
+/// skipped because they did not parse as a record.
+///
+/// A batch is quarantined only when it cannot be read as a whole (missing,
+/// unreadable, not valid UTF-8) or when EVERY non-empty line is malformed.
+/// A batch with malformed lines among valid ones is ingested without them:
+/// the crawl watermark has already moved past it, so quarantining it whole
+/// would drop its valid records from search for good.
 ///
 /// Two passes over the staged files keep memory bounded by ONE staged file
 /// plus [`FLUSH_ROWS`] records, however large the crawl is:
@@ -197,7 +235,7 @@ pub fn ingest_staged(
     index: &EntityIndex,
     staging: &Path,
     purge_scopes: &[PurgeScope],
-) -> Result<(usize, usize, usize, usize), store::IndexError> {
+) -> Result<(usize, usize, usize, usize, usize), store::IndexError> {
     let mut files: Vec<_> = std::fs::read_dir(staging)
         .map(|it| {
             it.filter_map(|e| e.ok())
@@ -215,11 +253,28 @@ pub fn ingest_staged(
     let mut readable: Vec<std::path::PathBuf> = Vec::new();
     let mut all_keys: Vec<DedupKey> = Vec::new();
     let mut quarantined = 0usize;
+    let mut skipped_malformed = 0usize;
     // a single poison batch must not wedge the whole pipeline forever:
     // quarantine unreadable files and keep ingesting the rest
     for file in files {
         match key_pass(&file) {
-            Ok(keys) => {
+            Ok((keys, bad_lines)) => {
+                if keys.is_empty() && !bad_lines.is_empty() {
+                    // nothing in this batch is ingestable: keep the file
+                    // for inspection, exactly like an unreadable one
+                    eprintln!(
+                        "bite-index: quarantining batch {}: all {} non-empty line(s) malformed (lines {})",
+                        file.display(),
+                        bad_lines.len(),
+                        fmt_lines(&bad_lines)
+                    );
+                    quarantined += usize::from(quarantine_batch(&file, &quarantine));
+                    continue;
+                }
+                if !bad_lines.is_empty() {
+                    skipped_malformed += bad_lines.len();
+                    note_malformed(&file, &bad_lines);
+                }
                 all_keys.extend(keys);
                 readable.push(file);
             }
@@ -252,7 +307,7 @@ pub fn ingest_staged(
     // running occurrence position — the same numbering the key pass saw
     let mut pos = 0usize;
     for file in &readable {
-        for mut r in store::parse_jsonl(file)? {
+        for mut r in store::parse_jsonl(file)?.records {
             // Only the surviving occurrence of a key is written. The account
             // is normalized before the merge: Mail message ids are
             // ACCOUNT-scoped integers, and NULL values in a merge-insert
@@ -291,7 +346,13 @@ pub fn ingest_staged(
         std::fs::remove_file(file).ok();
     }
     let batches = readable.len();
-    Ok((batches, rows, quarantined, skipped_purged))
+    Ok((
+        batches,
+        rows,
+        quarantined,
+        skipped_purged,
+        skipped_malformed,
+    ))
 }
 
 #[cfg(test)]
@@ -368,7 +429,8 @@ mod tests {
                 mail_record("4127", Some("iCloud"), "from iCloud"),
             ],
         );
-        let (batches, _rows, quarantined, _skipped) = ingest_staged(&idx, &staging, &[]).unwrap();
+        let (batches, _rows, quarantined, _skipped, _malformed) =
+            ingest_staged(&idx, &staging, &[]).unwrap();
         assert_eq!((batches, quarantined), (1, 0));
         assert_eq!(idx.count(Some("app = 'mail'")).unwrap(), 2);
 
@@ -477,7 +539,8 @@ mod tests {
                 mail_record("a", Some("Work"), "a last"),
             ],
         );
-        let (batches, rows, quarantined, skipped) = ingest_staged(&idx, &staging, &[]).unwrap();
+        let (batches, rows, quarantined, skipped, _malformed) =
+            ingest_staged(&idx, &staging, &[]).unwrap();
         assert_eq!((batches, rows, quarantined, skipped), (2, 4, 0, 0));
         let mut got = mail_hits(&idx);
         got.sort();
@@ -517,7 +580,8 @@ mod tests {
             "notes.jsonl",
             &[mail_record("6", Some("Work"), "no seq at all")],
         );
-        let (batches, _rows, _quarantined, _skipped) = ingest_staged(&idx, &staging, &[]).unwrap();
+        let (batches, _rows, _quarantined, _skipped, _malformed) =
+            ingest_staged(&idx, &staging, &[]).unwrap();
         assert_eq!(batches, 3);
         assert_eq!(idx.count(Some("app = 'mail'")).unwrap(), 2);
         let mut got = mail_hits(&idx);
@@ -552,7 +616,8 @@ mod tests {
         let staging = temp_staging("dir");
         let idx = EntityIndex::open(&staging.join("index.lance")).unwrap();
         std::fs::create_dir_all(staging.join("weird.jsonl")).unwrap();
-        let (batches, _rows, quarantined, _skipped) = ingest_staged(&idx, &staging, &[]).unwrap();
+        let (batches, _rows, quarantined, _skipped, _malformed) =
+            ingest_staged(&idx, &staging, &[]).unwrap();
         assert_eq!((batches, quarantined), (0, 0));
         assert!(staging.join("weird.jsonl").is_dir(), "directory untouched");
     }
@@ -610,7 +675,8 @@ mod tests {
             container: Some("Junk".into()),
             recorded_ms: None,
         }];
-        let (batches, rows, quarantined, skipped) = ingest_staged(&idx, &staging, &scopes).unwrap();
+        let (batches, rows, quarantined, skipped, _malformed) =
+            ingest_staged(&idx, &staging, &scopes).unwrap();
         assert_eq!((batches, quarantined, skipped), (1, 0, 1));
         assert_eq!(rows, 1, "only the inbox row was written");
         assert_eq!(idx.count(Some("app = 'mail'")).unwrap(), 1);
@@ -627,7 +693,7 @@ mod tests {
                 mail_record("10", Some("Work"), "kept inbox v2"),
             ],
         );
-        let (_b, rows2, _q, skipped2) = ingest_staged(&idx, &staging, &scopes).unwrap();
+        let (_b, rows2, _q, skipped2, _malformed) = ingest_staged(&idx, &staging, &scopes).unwrap();
         assert_eq!((rows2, skipped2), (1, 1));
         assert_eq!(idx.count(Some("app = 'mail'")).unwrap(), 1);
         assert!(mail_hits(&idx)[0].1.contains("v2"), "kept row refreshed");
@@ -683,7 +749,8 @@ mod tests {
                 mail_record("b0000", Some("Work"), "only in the second file"),
             ],
         );
-        let (batches, rows, quarantined, skipped) = ingest_staged(&idx, &staging, &[]).unwrap();
+        let (batches, rows, quarantined, skipped, _malformed) =
+            ingest_staged(&idx, &staging, &[]).unwrap();
         assert_eq!(
             (batches, rows, quarantined, skipped),
             (2, FLUSH_ROWS + 1, 0, 0)
@@ -698,11 +765,12 @@ mod tests {
     }
 
     #[test]
-    fn poisoned_batch_never_supersedes_an_earlier_batch_key() {
+    fn partially_malformed_batch_keeps_its_valid_rows_newest_wins() {
         // The third batch repeats key 10 with a newer title and THEN fails
-        // to parse. It is quarantined whole, so its keys must not stand as
-        // the newest occurrences: batch two's row survives and the
-        // never-written "third" title is absent.
+        // to parse. Its valid line is a real record of a newer crawl: it is
+        // written (the newest occurrence wins) and only the torn line is
+        // skipped and counted. Quarantining the batch whole, as ingest used
+        // to, dropped that record for good.
         let staging = temp_staging("poison");
         let idx = EntityIndex::open(&staging.join("index.lance")).unwrap();
         write_batch(
@@ -720,13 +788,132 @@ mod tests {
             "crawl-3-0.jsonl",
             &mail_record("10", Some("Work"), "third"),
         );
-        let (batches, rows, quarantined, skipped) = ingest_staged(&idx, &staging, &[]).unwrap();
-        assert_eq!((batches, rows, quarantined, skipped), (2, 1, 1, 0));
+        let (batches, rows, quarantined, skipped, malformed) =
+            ingest_staged(&idx, &staging, &[]).unwrap();
+        assert_eq!(
+            (batches, rows, quarantined, skipped, malformed),
+            (3, 1, 0, 0, 1)
+        );
         assert_eq!(idx.count(Some("app = 'mail'")).unwrap(), 1);
-        assert!(mail_hits(&idx)[0].1.contains("second"));
-        assert_eq!(idx.count(Some("title = 'third'")).unwrap(), 0);
-        assert!(staging.join("quarantine").join("crawl-3-0.jsonl").is_file());
+        assert!(mail_hits(&idx)[0].1.contains("third"));
+        assert!(!staging.join("quarantine").join("crawl-3-0.jsonl").exists());
+        assert_eq!(staged_batches(&staging), 0, "all three files consumed");
+    }
+
+    #[test]
+    fn a_torn_line_drops_only_itself() {
+        // good, torn, good in ONE batch: both good rows are indexed and the
+        // torn one is counted — the shape a truncated or type-mismatched
+        // record has in a real batch.
+        let staging = temp_staging("torn");
+        let idx = EntityIndex::open(&staging.join("index.lance")).unwrap();
+        let before = serde_json::to_string(&mail_record("7", Some("Work"), "before")).unwrap();
+        let after = serde_json::to_string(&mail_record("8", Some("Work"), "after")).unwrap();
+        std::fs::write(
+            staging.join("crawl-1-0.jsonl"),
+            format!(
+                "{before}\n{{\"app\":\"mail\",\"id\":\"9\",\"read\":\"not-a-bool\"}}\n{after}\n"
+            ),
+        )
+        .unwrap();
+        let (batches, rows, quarantined, skipped, malformed) =
+            ingest_staged(&idx, &staging, &[]).unwrap();
+        assert_eq!(
+            (batches, rows, quarantined, skipped, malformed),
+            (1, 2, 0, 0, 1)
+        );
+        let mut titles: Vec<String> = mail_hits(&idx).into_iter().map(|(_, t)| t).collect();
+        titles.sort();
+        assert_eq!(titles, vec!["after".to_string(), "before".to_string()]);
+        assert!(!staging.join("quarantine").join("crawl-1-0.jsonl").exists());
         assert_eq!(staged_batches(&staging), 0);
+    }
+
+    #[test]
+    fn batch_of_only_malformed_lines_is_quarantined() {
+        // nothing ingestable: the file is kept for inspection like an
+        // unreadable one, and its lines are not counted as skipped rows of
+        // an ingested batch. Blank lines are not malformed. The batch names
+        // key 9 only on lines that do not parse, so it adds no key to the
+        // keep-last dedup and the earlier batch's row for that key stays.
+        let staging = temp_staging("allbad");
+        let idx = EntityIndex::open(&staging.join("index.lance")).unwrap();
+        write_batch(
+            &staging,
+            "crawl-1-0.jsonl",
+            &[mail_record("9", Some("Work"), "earlier")],
+        );
+        std::fs::write(
+            staging.join("crawl-2-0.jsonl"),
+            "{\"app\":\"mail\",\"id\":\"9\",\"read\":\"not-a-bool\"}\n\n   \nnot json at all\n",
+        )
+        .unwrap();
+        let (batches, rows, quarantined, skipped, malformed) =
+            ingest_staged(&idx, &staging, &[]).unwrap();
+        assert_eq!(
+            (batches, rows, quarantined, skipped, malformed),
+            (1, 1, 1, 0, 0)
+        );
+        assert_eq!(idx.count(Some("app = 'mail'")).unwrap(), 1);
+        assert_eq!(
+            idx.count(Some("id = '9' AND title = 'earlier'")).unwrap(),
+            1,
+            "the earlier batch's row survives the quarantined repeat"
+        );
+        assert!(staging.join("quarantine").join("crawl-2-0.jsonl").is_file());
+        assert_eq!(staged_batches(&staging), 0);
+    }
+
+    #[test]
+    fn unreadable_batch_never_supersedes_an_earlier_batch_key() {
+        // A batch that cannot be read as a whole (here: one raw 0xFF byte,
+        // so not valid UTF-8) is quarantined BEFORE any of its keys is
+        // used. Its valid line names key 10 as the newest occurrence: if
+        // that key still won the keep-last dedup, the write pass would drop
+        // the earlier batch's row and the quarantined file would never
+        // replace it — the message would be gone from search.
+        let staging = temp_staging("unreadable");
+        let idx = EntityIndex::open(&staging.join("index.lance")).unwrap();
+        write_batch(
+            &staging,
+            "crawl-1-0.jsonl",
+            &[mail_record("10", Some("Work"), "second")],
+        );
+        let mut bytes: Vec<u8> = serde_json::to_string(&mail_record("10", Some("Work"), "third"))
+            .unwrap()
+            .into_bytes();
+        bytes.push(b'\n');
+        bytes.push(0xFF);
+        bytes.push(b'\n');
+        std::fs::write(staging.join("crawl-2-0.jsonl"), &bytes).unwrap();
+        let (batches, rows, quarantined, skipped, malformed) =
+            ingest_staged(&idx, &staging, &[]).unwrap();
+        assert_eq!(
+            (batches, rows, quarantined, skipped, malformed),
+            (1, 1, 1, 0, 0)
+        );
+        assert_eq!(
+            idx.count(Some("app = 'mail' AND title = 'second'"))
+                .unwrap(),
+            1,
+            "the earlier batch's row survives"
+        );
+        assert_eq!(
+            idx.count(Some("app = 'mail' AND title = 'third'")).unwrap(),
+            0,
+            "a quarantined batch writes nothing"
+        );
+        assert!(staging.join("quarantine").join("crawl-2-0.jsonl").is_file());
+        assert_eq!(staged_batches(&staging), 0);
+    }
+
+    #[test]
+    fn fmt_lines_cuts_a_long_list_short_and_says_so() {
+        let lines = |range: std::ops::RangeInclusive<usize>| -> Vec<usize> { range.collect() };
+        assert_eq!(fmt_lines(&lines(1..=5)), "1, 2, 3, 4, 5");
+        assert_eq!(fmt_lines(&lines(1..=6)), "1, 2, 3, 4, 5, …");
+        assert_eq!(fmt_lines(&lines(1..=3)), "1, 2, 3");
+        assert_eq!(fmt_lines(&[]), "");
     }
 
     #[test]

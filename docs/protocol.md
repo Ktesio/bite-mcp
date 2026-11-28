@@ -372,7 +372,20 @@ tombstones.
 Unparseable batches are quarantined to `batches/quarantine/` — ingest
 continues; the quarantine keeps at most 200 files (evicted oldest-by-mtime).
 Quarantined files are counted as `quarantined` in the ingest output and
-toward `pending_batches`.
+toward `pending_batches`. A batch is quarantined only when it cannot be read
+as a whole or when every non-blank line in it is malformed. A batch whose
+malformed lines sit among valid ones is ingested without them (one stderr
+note naming the file and the line numbers, never their content). Because
+the batch file is deleted once ingested and the crawl watermark has moved
+past it, the skip is also recorded for the process that ran the ingest:
+`index_status` carries ONE `ingest: skipped N malformed line(s) …` entry
+in `last_errors`, where N is the running total of skipped lines since the
+server process started (a later skip replaces the entry with the new
+total, so a streak of same-sized skips never collapses into a line that
+understates the loss), and the per-ingest count appears as
+`skipped_malformed` in the ingest output when it is non-zero. Neither is
+persisted: after a server restart the note is gone while the missing
+records are not.
 
 ### Worker lifecycle
 

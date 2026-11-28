@@ -939,27 +939,48 @@ async fn hits_from_stream(
     Ok(hits)
 }
 
+/// One non-empty line of a JSONL batch that does not parse as a `Record`:
+/// its 1-based line number.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BadLine {
+    pub line: usize,
+}
+
+/// A JSONL batch split into the records its well-formed lines parse to and
+/// the lines that failed, each in file order.
+#[derive(Debug, Default)]
+pub struct ParsedBatch {
+    pub records: Vec<Record>,
+    pub bad_lines: Vec<BadLine>,
+}
+
 /// Parse each non-empty line of a JSONL batch file's text as one `Record`.
 /// Both passes of `ingest_staged` read a batch through here, so they always
 /// agree on which lines are records and on what a malformed line is.
-pub(crate) fn parse_jsonl_text<'a>(
-    text: &'a str,
-    path: &Path,
-) -> impl Iterator<Item = Result<Record, IndexError>> + 'a {
-    let path = path.display().to_string();
-    text.lines()
-        .enumerate()
-        .filter(|(_, line)| !line.trim().is_empty())
-        .map(move |(i, line)| {
-            serde_json::from_str::<Record>(line)
-                .map_err(|e| IndexError::Other(format!("{path}:{}: {e}", i + 1)))
-        })
+///
+/// A line that fails to parse is reported in `bad_lines` rather than failing
+/// the whole batch: one malformed record must not cost the index every other
+/// record of the batch it rides in.
+pub fn parse_jsonl_text(text: &str) -> ParsedBatch {
+    let mut out = ParsedBatch::default();
+    for (i, line) in text.lines().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        match serde_json::from_str::<Record>(line) {
+            Ok(record) => out.records.push(record),
+            Err(_) => out.bad_lines.push(BadLine { line: i + 1 }),
+        }
+    }
+    out
 }
 
-/// Parse a JSONL batch file (one Record per line) written by a Swift crawler.
-pub fn parse_jsonl(path: &Path) -> Result<Vec<Record>, IndexError> {
+/// Read and parse a JSONL batch file (one Record per line) written by a Swift
+/// crawler. Fails only when the file cannot be read as a whole (missing,
+/// unreadable, or not valid UTF-8).
+pub fn parse_jsonl(path: &Path) -> Result<ParsedBatch, IndexError> {
     let text = std::fs::read_to_string(path)?;
-    parse_jsonl_text(&text, path).collect()
+    Ok(parse_jsonl_text(&text))
 }
 
 #[cfg(test)]
@@ -1848,10 +1869,19 @@ mod tests {
                 .unwrap();
         std::fs::write(&batch, format!("{line1}\n{line2}\n")).unwrap();
 
-        let records = parse_jsonl(&batch).unwrap();
-        assert_eq!(records.len(), 2);
-        idx.ingest(&records).unwrap();
+        let parsed = parse_jsonl(&batch).unwrap();
+        assert!(parsed.bad_lines.is_empty());
+        idx.ingest(&parsed.records).unwrap();
         assert_eq!(idx.count(Some("app = 'notes'")).unwrap(), 2);
+
+        // A line that fails to parse is reported by line number, not fatal:
+        // line 1 parses, 2 is blank, 3 is torn, 4 is whitespace only, 5
+        // parses. Blank lines are neither records nor malformed.
+        let torn = format!("{line1}\n\n{{\"app\": \"mail\", \"id\": \"tor\n   \n{line2}\n");
+        let parsed = parse_jsonl_text(&torn);
+        assert_eq!(parsed.records.len(), 2);
+        assert_eq!(parsed.records[1].id, "n2");
+        assert_eq!(parsed.bad_lines, vec![BadLine { line: 3 }]);
 
         idx.wipe().unwrap();
         assert_eq!(idx.count(None).unwrap(), 0);
