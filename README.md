@@ -186,6 +186,10 @@ current size — the number that tells you when `cargo clean` is worth it.
 - [docs/permissions.md](docs/permissions.md) — every TCC prompt and how to recover
 - [docs/adding-an-app.md](docs/adding-an-app.md) — add Music/Finder/anything
 - [docs/ROADMAP.md](docs/ROADMAP.md) — Phase 2 surface
+- [crates.io](https://crates.io/crates/bite-mcp) — published releases.
+  `bite-mcp` is a binary-only package, so [docs.rs](https://docs.rs/bite-mcp)
+  cannot build it (docs.rs documents library targets only); this README and
+  the pages above are its documentation
 
 ## License
 
