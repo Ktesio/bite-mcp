@@ -22,9 +22,7 @@ it can ship.
   lists the recorded scopes. Rows already crawled return with the next
   full crawl (`bite index rebuild --full`, or `--mailbox <name>` for one
   mailbox) — a delta crawl does not go back for them. CLI-only by design:
-  no MCP tool can re-include a purged scope. The `bite index forget` help
-  text still promised that a full crawl re-imports purged rows, which
-  stopped being true when purges became durable; it now matches.
+  no MCP tool can re-include a purged scope.
 - Settled `idempotency_key` records (replayable outcomes and unknown pins)
   are now durable: they persist to a 0600 `idempotency-ledger.json` in the
   private data dir and reload on startup, so a server restart between a
@@ -269,6 +267,10 @@ it can ship.
   other six verbs had descriptions. Each app verb now carries a one-line
   `about`, so the command table reads complete. Help text only: no
   behaviour, JSON or MCP output changes.
+- The `bite index forget` help text still promised that a full crawl
+  re-imports purged rows. That stopped being true when purges became
+  durable: only `bite index unforget` lifts the record. The help text
+  now matches. Help text only: no behaviour, JSON or MCP output changes.
 
 ### Security
 

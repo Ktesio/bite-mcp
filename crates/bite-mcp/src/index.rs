@@ -2038,6 +2038,9 @@ mod tests {
 
         // A wider or narrower ask is NOT the recorded identity: nothing
         // moves, and the preview says so while listing what is recorded.
+        // Each byte snapshot is taken BEFORE its preview: a guard read
+        // after the preview compares the file with itself.
+        let bytes_before = std::fs::read(&path).unwrap();
         let preview = unforget_preview(&path, Some("mail"), None);
         assert_eq!(
             preview["would_unforget"],
@@ -2050,6 +2053,11 @@ mod tests {
             Some(3),
             "a miss lists the recorded scopes"
         );
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            bytes_before,
+            "a miss preview must not write either"
+        );
         let (n, left) = unforget_scope(&path, Some("mail"), None).unwrap();
         assert_eq!(n, 0, "an app-wide request must not lift (mail, Junk)");
         assert_eq!(left.len(), 3, "a miss removes nothing");
@@ -2058,13 +2066,13 @@ mod tests {
         assert_eq!(read_purge_scopes(&path).len(), 3);
 
         // The exact identity goes, its neighbours stay, the file stays 0600.
+        let bytes_before = std::fs::read(&path).unwrap();
         let preview = unforget_preview(&path, Some("mail"), Some("Junk"));
         assert_eq!(preview["would_unforget"], json!(1));
         assert!(
             preview.get("recorded").is_none(),
             "a hit needs no recorded list"
         );
-        let bytes_before = std::fs::read(&path).unwrap();
         assert_eq!(
             std::fs::read(&path).unwrap(),
             bytes_before,
